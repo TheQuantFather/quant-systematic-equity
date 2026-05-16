@@ -1,0 +1,94 @@
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+build/
+dist/
+develop-eggs/
+eggs/
+.eggs/
+lib/
+lib64/
+sdid/
+var/
+wheels/
+
+# ── Test / lint ───────────────────────────────────────────────────────────────
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+.cache
+.hypothesis/
+.pytest_cache/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+
+# ── Environments ──────────────────────────────────────────────────────────────
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+.python-version
+
+# ── Databases (generated — rebuild from scripts) ──────────────────────────────
+*.db
+*.sqlite
+*.sqlite3
+
+# ── Data directory (all generated/downloaded files — keep locally, not in git) ──
+data/
+
+# ── Jupyter ───────────────────────────────────────────────────────────────────
+.ipynb_checkpoints
+profile_default/
+ipython_config.py
+
+# ── IDE / editor ──────────────────────────────────────────────────────────────
+.vscode/settings.json
+.idea/
+*.swp
+*.swo
+*~
+.spyderproject
+.spyproject
+.ropeproject
+
+# ── Claude Code local settings (machine-specific) ─────────────────────────────
+.claude/settings.local.json
+
+# ── OS ────────────────────────────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# ── Misc ──────────────────────────────────────────────────────────────────────
+*.log
+*.tmp
+*.temp
+*.bak
+*.backup
+logs/
+local_settings.py
+/site
+
+# ── Local utilities (not part of core pipeline) ───────────────────────────────
+degiro_orders.py
+
+# ── License files (MOSEK kept at ~/mosek/mosek.lic, not in source control) ──
+*.lic
