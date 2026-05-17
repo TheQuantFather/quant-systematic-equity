@@ -71,18 +71,20 @@ def get_alpha_models(models: dict) -> dict:
 # Factor data loading
 # ---------------------------------------------------------------------------
 
-def load_factors_zscores(date_filter: str = None) -> dict:
+def load_factors_zscores(date_filter: list[str] | str | None = None) -> dict:
     """
     Returns {data_date: {security_id: {factor_id: z_score}}}.
 
-    date_filter — if provided, only load rows for that specific date.
+    date_filter — if provided, only load rows for that specific date or list of dates.
     """
     with get_db(FACTORS_DB) as conn:
         if date_filter:
+            dates = [date_filter] if isinstance(date_filter, str) else list(date_filter)
+            placeholders = ','.join('?' * len(dates))
             rows = conn.execute(
-                "SELECT data_date, security_id, factor_id, factor_value_z "
-                "FROM factors WHERE factor_value_z IS NOT NULL AND data_date = ?",
-                (date_filter,)
+                f"SELECT data_date, security_id, factor_id, factor_value_z "
+                f"FROM factors WHERE factor_value_z IS NOT NULL AND data_date IN ({placeholders})",
+                dates
             ).fetchall()
         else:
             rows = conn.execute(
@@ -237,8 +239,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Compute model scores from factor z-scores and write to models.db"
     )
-    parser.add_argument('--date', metavar='YYYY-MM-DD',
-                        help='Process a single date only (default: all dates in factors.db)')
+    parser.add_argument('--date', metavar='YYYY-MM-DD', action='append', dest='dates',
+                        help='Process a specific date (repeatable: --date D1 --date D2); default: all dates in factors.db')
     parser.add_argument('--clean', action='store_true',
                         help='Drop and rebuild the models table before running')
     args = parser.parse_args()
@@ -253,7 +255,7 @@ def main() -> None:
     print(f"Alpha models     : {list(alpha_models.keys())}")
 
     print("\nLoading pre-computed z-scores from factors.db ...")
-    factors_data = load_factors_zscores(date_filter=args.date)
+    factors_data = load_factors_zscores(date_filter=args.dates)
     dates = sorted(factors_data.keys())
     print(f"Loaded z-scores for {len(dates)} date(s): {dates}")
 

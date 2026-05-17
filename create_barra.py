@@ -649,8 +649,8 @@ if __name__ == "__main__":
         help=f"Compute weekly snapshots from {BACKFILL_START} to today.",
     )
     grp.add_argument(
-        "--date", metavar="YYYY-MM-DD",
-        help="Compute a single snapshot for the given date.",
+        "--date", metavar="YYYY-MM-DD", action="append", dest="dates",
+        help="Compute a snapshot for the given date (repeatable: --date D1 --date D2).",
     )
     args = parser.parse_args()
 
@@ -658,8 +658,8 @@ if __name__ == "__main__":
         today = date.today().strftime("%Y-%m-%d")
         dates = _weekly_fridays(BACKFILL_START, today)
         print(f"Backfill: {len(dates)} weekly snapshots from {dates[0]} to {dates[-1]}")
-    elif args.date:
-        dates = [args.date]
+    elif args.dates:
+        dates = sorted(set(args.dates))
     else:
         dates = [_most_recent_friday()]
         print(f"Snapshot for most-recent Friday: {dates[0]}")

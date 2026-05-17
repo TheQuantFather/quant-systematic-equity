@@ -100,16 +100,16 @@ _FISCAL_PERIOD = {
 
 def load_company_map(sector_type_filter: Optional[str] = None) -> dict[int, dict]:
     """
-    Returns {simfin_id: {isin, ticker, cik, company_name, sector_type}} from universe.db companies table.
+    Returns {simfin_id: {isin, ticker, cik, company_name, sector_type, fye_month}} from universe.db companies table.
     sector_type_filter — if provided, only includes companies of that sector type.
     """
     with get_db(UNIVERSE_DB) as conn:
         rows = conn.execute(
-            "SELECT simfin_id, isin, ticker, cik, company_name, simfin_sector, simfin_industry "
+            "SELECT simfin_id, isin, ticker, cik, company_name, simfin_sector, simfin_industry, fiscal_year_end "
             "FROM companies WHERE simfin_id IS NOT NULL"
         ).fetchall()
     out: dict[int, dict] = {}
-    for simfin_id, isin, ticker, cik, company_name, sector, industry in rows:
+    for simfin_id, isin, ticker, cik, company_name, sector, industry, fye in rows:
         st = classify_sector(sector, industry)
         if sector_type_filter and st != sector_type_filter:
             continue
@@ -119,6 +119,7 @@ def load_company_map(sector_type_filter: Optional[str] = None) -> dict[int, dict
             "cik":          int(cik) if cik is not None else None,
             "company_name": company_name,
             "sector_type":  st,
+            "fye_month":    int(fye) if fye is not None else 12,
         }
     return out
 
@@ -130,11 +131,11 @@ def build_cik_universe_map(sector_type_filter: Optional[str] = None) -> dict[int
     """
     with get_db(UNIVERSE_DB) as conn:
         rows = conn.execute(
-            "SELECT simfin_id, isin, ticker, cik, company_name, simfin_sector, simfin_industry "
+            "SELECT simfin_id, isin, ticker, cik, company_name, simfin_sector, simfin_industry, fiscal_year_end "
             "FROM companies WHERE cik IS NOT NULL AND simfin_id IS NOT NULL"
         ).fetchall()
     result: dict[int, tuple[str, dict]] = {}
-    for simfin_id, isin, ticker, cik, company_name, sector, industry in rows:
+    for simfin_id, isin, ticker, cik, company_name, sector, industry, fye in rows:
         st = classify_sector(sector, industry)
         if sector_type_filter and st != sector_type_filter:
             continue
@@ -145,29 +146,53 @@ def build_cik_universe_map(sector_type_filter: Optional[str] = None) -> dict[int
             "cik":          int(cik),
             "company_name": company_name,
             "sector_type":  st,
+            "fye_month":    int(fye) if fye is not None else 12,
         }
         result[int(cik)] = (security_id, info)
     return result
 
 
-def _quarter_from_period(period: str) -> tuple[str, int] | None:
+def _quarter_from_period(period: str, fye_month: int = 12) -> tuple[str, int] | None:
     """
     Map period_of_report string to (fiscal_period, fiscal_year) for 10-Q filings.
-    Uses calendar quarter of the period end date.
-    Returns None for Q4 (Oct–Dec) — those are covered by the 10-K fetcher.
+
+    fye_month — fiscal year end calendar month (1-12); defaults to 12 (December).
+    Uses the company's fiscal year end to correctly identify which fiscal quarter
+    each period_of_report falls in, regardless of calendar alignment.
+
+    Returns None for Q4 (period ending in fye_month) — covered by the 10-K fetcher.
+    Returns None for unrecognised periods.
     """
     try:
         m = int(period[5:7])
         y = int(period[:4])
     except (ValueError, IndexError):
         return None
-    if m <= 3:
-        return ("Q1", y)
-    elif m <= 6:
-        return ("Q2", y)
-    elif m <= 9:
-        return ("Q3", y)
-    return None   # Q4 — skip, covered by 10-K
+
+    # Calendar months when each fiscal quarter ends:
+    #   Q1 ends fye_month-9, Q2 ends fye_month-6, Q3 ends fye_month-3, Q4=fye_month (skip)
+    def _qend(offset: int) -> int:
+        return ((fye_month - offset - 1) % 12) + 1
+
+    q1_end = _qend(9)
+    q2_end = _qend(6)
+    q3_end = _qend(3)
+
+    if m == fye_month:
+        return None  # Q4 — skip, covered by 10-K
+
+    # Fiscal year: if the period month falls after the FYE in the calendar year,
+    # the period belongs to the fiscal year that ends the following calendar year.
+    # Example: AAPL (FYE=Sep), Q1 ends Dec 2024 → fiscal year 2025 (ends Sep 2025).
+    fy = y + (1 if m > fye_month else 0)
+
+    if m == q1_end:
+        return ("Q1", fy)
+    if m == q2_end:
+        return ("Q2", fy)
+    if m == q3_end:
+        return ("Q3", fy)
+    return None  # period doesn't align with expected quarter ends — skip
 
 
 def get_latest_quarter_per_company(conn: sqlite3.Connection) -> dict[str, int]:
@@ -184,6 +209,26 @@ def get_latest_quarter_per_company(conn: sqlite3.Connection) -> dict[str, int]:
            GROUP BY security_id"""
     ).fetchall()
     return {r[0]: r[1] for r in rows}
+
+
+def get_stored_quarters_per_company(conn: sqlite3.Connection) -> dict[str, set[int]]:
+    """
+    Returns {security_id: {sort_key, ...}} for all stored quarterly rows.
+    sort_key = fiscal_year*10 + quarter_num (Q1=1, Q2=2, Q3=3).
+    Used for gap-aware quarterly backfill — lets the loop skip stored quarters
+    without breaking early, so missing quarters below the max are still fetched.
+    """
+    rows = conn.execute(
+        """SELECT security_id,
+                  fiscal_year * 10 + CASE fiscal_period
+                      WHEN 'Q1' THEN 1 WHEN 'Q2' THEN 2 WHEN 'Q3' THEN 3 ELSE 0 END
+           FROM constituents
+           WHERE fiscal_period IN ('Q1','Q2','Q3')"""
+    ).fetchall()
+    result: dict[str, set[int]] = {}
+    for sid, sk in rows:
+        result.setdefault(str(sid), set()).add(sk)
+    return result
 
 
 def get_latest_fy_per_company(conn: sqlite3.Connection) -> dict[str, int]:
@@ -376,6 +421,15 @@ def extract_filing_data(
                 balance_data[_ID_EQUITY] = computed_equity
 
     # ── Derived / fallback fields ────────────────────────────────────────────
+    # Gross Profit (7A1B2BB6): EDGAR XBRL rarely includes a standalone GP tag.
+    # Derive from Revenue - Cost of Revenue when both are present.
+    # abs(cor): some filers report CoR as a negative offset; abs normalises both conventions.
+    if "7A1B2BB6" not in income_data:
+        rev = income_data.get("9801FC7E")
+        cor = income_data.get("112032A1")
+        if rev is not None and cor is not None:
+            income_data["7A1B2BB6"] = rev - abs(cor)
+
     # Working capital change (5B2FCB8E) from CF components
     wc = _derive_working_capital_change(cashflow_data)
     if wc is not None:
@@ -536,8 +590,9 @@ def process_filing_quarterly(
     filing,
     security_id: str,
     ticker: str,
-    latest_sk: int | None,
+    stored_sks: set[int] | None,
     conn: sqlite3.Connection,
+    fye_month: int = 12,
     dry_run: bool = False,
 ) -> int:
     """
@@ -547,7 +602,7 @@ def process_filing_quarterly(
     period = filing.period_of_report
     if not period:
         return 0
-    qinfo = _quarter_from_period(period)
+    qinfo = _quarter_from_period(period, fye_month)
     if qinfo is None:
         return 0  # Q4 — skip, covered by 10-K
 
@@ -558,7 +613,7 @@ def process_filing_quarterly(
     min_sort_key = (date.today().year - 2) * 10 + 1
     if sort_key < min_sort_key:
         return 0
-    if latest_sk is not None and sort_key <= latest_sk:
+    if stored_sks is not None and sort_key in stored_sks:
         return 0
 
     publish_date = _publish_date(filing)
@@ -688,7 +743,7 @@ def process_company(
 def process_company_quarterly(
     simfin_id: int,
     info: dict,
-    latest_sort_key: int | None,
+    stored_sort_keys: set[int],
     conn: sqlite3.Connection,
     dry_run: bool = False,
 ) -> int:
@@ -696,7 +751,8 @@ def process_company_quarterly(
     Fetch and insert quarterly 10-Q data for one company.
 
     Stores balance sheet, income statement, and cash flow with
-    fiscal_period = 'Q1'/'Q2'/'Q3' derived from the period_of_report date.
+    fiscal_period = 'Q1'/'Q2'/'Q3' derived from the period_of_report date,
+    adjusted for the company's fiscal year end month (info['fye_month']).
 
     Note: edgartools parses the primary period context from XBRL, which for
     income statement / cash flow is typically the 3-month standalone quarter.
@@ -708,6 +764,7 @@ def process_company_quarterly(
     """
     security_id = info.get("isin") or str(simfin_id)
     ticker      = info.get("ticker", "?")
+    fye_month   = info.get("fye_month", 12)
 
     co = resolve_company(info)
     if co is None:
@@ -726,19 +783,19 @@ def process_company_quarterly(
         if not period:
             continue
 
-        qinfo = _quarter_from_period(period)
+        qinfo = _quarter_from_period(period, fye_month)
         if qinfo is None:
-            continue  # Q4 (Oct–Dec) — skip, covered by 10-K
+            continue  # FYE quarter — skip, covered by 10-K
 
         q_label, q_fy = qinfo
         period_num = {"Q1": 1, "Q2": 2, "Q3": 3}[q_label]
         sort_key = q_fy * 10 + period_num
 
         if sort_key < min_sort_key:
-            break  # too old
+            break  # too old — stop iterating (filings are sorted newest-first)
 
-        if latest_sort_key is not None and sort_key <= latest_sort_key:
-            break  # already have this quarter and everything older
+        if sort_key in stored_sort_keys:
+            continue  # already stored — skip without breaking, to fill any gaps below
 
         publish_date = str(filing.acceptance_datetime)[:10]
         report_date  = period
@@ -807,8 +864,8 @@ def main() -> None:
         print(f"Mode: index (last {args.days} days)\n")
 
         with get_db(CONSTITUENTS_DB) as conn:
-            latest_fy_map = get_latest_fy_per_company(conn)
-            latest_q_map  = get_latest_quarter_per_company(conn)
+            latest_fy_map  = get_latest_fy_per_company(conn)
+            stored_q_map_i = get_stored_quarters_per_company(conn)
 
         total_rows = 0
         total_checked = 0
@@ -855,11 +912,15 @@ def main() -> None:
             for filing, security_id, info in quarterly_matched:
                 ticker    = info.get("ticker", "?")
                 isin      = info.get("isin")
-                latest_sk = latest_q_map.get(isin) or latest_q_map.get(security_id)
+                stored_sks = (
+                    stored_q_map_i.get(isin, set()) | stored_q_map_i.get(security_id, set())
+                )
+                fye_month = info.get("fye_month", 12)
                 total_checked += 1
                 try:
                     n = process_filing_quarterly(
-                        filing, security_id, ticker, latest_sk, conn,
+                        filing, security_id, ticker, stored_sks or None, conn,
+                        fye_month=fye_month,
                         dry_run=args.dry_run,
                     )
                 except Exception as exc:
@@ -876,9 +937,10 @@ def main() -> None:
         company_map = load_company_map(sector_type_filter=args.sector_type)
 
         with get_db(CONSTITUENTS_DB) as conn:
-            latest_fy_map = get_latest_fy_per_company(conn)
-            fy_set_map    = get_fy_set_per_company(conn) if args.fill_gaps else {}
-            latest_q_map  = get_latest_quarter_per_company(conn) if args.quarterly else {}
+            latest_fy_map     = get_latest_fy_per_company(conn)
+            fy_set_map        = get_fy_set_per_company(conn) if args.fill_gaps else {}
+            latest_q_map      = get_latest_quarter_per_company(conn) if args.quarterly else {}
+            stored_q_map      = get_stored_quarters_per_company(conn) if args.quarterly else {}
 
         mode = "quarterly (10-Q)" if args.quarterly else "annual (10-K)"
         print(f"Universe: {len(company_map):,} companies  |  mode: {mode}")
@@ -961,9 +1023,11 @@ def main() -> None:
                         latest_q_map.get(isin) if isin else None
                     ) or latest_q_map.get(str(simfin_id))
                     # Skip if already have the most recent expected quarter
-                    today_d = date.today()
-                    m = today_d.month
-                    expected_q = 1 if m <= 3 else 2 if m <= 6 else 3 if m <= 9 else 3
+                    today_d   = date.today()
+                    fye_month = info.get("fye_month", 12)
+                    m_today   = today_d.month
+                    # Expected latest quarter: use Dec-FY mapping as a proxy for "up to date" check
+                    expected_q = 1 if m_today <= 3 else 2 if m_today <= 6 else 3 if m_today <= 9 else 3
                     expected_sk = today_d.year * 10 + expected_q
                     if not args.ticker and not args.cik and latest_sk is not None and latest_sk >= expected_sk:
                         continue  # already up to date for this quarter
@@ -974,8 +1038,12 @@ def main() -> None:
 
                 try:
                     if args.quarterly:
+                        # Build per-company set of already-stored sort_keys for gap-aware fetch
+                        stored_sk = (
+                            stored_q_map.get(isin, set()) | stored_q_map.get(str(simfin_id), set())
+                        )
                         n = process_company_quarterly(
-                            simfin_id, info, latest_sk, conn,
+                            simfin_id, info, stored_sk, conn,
                             dry_run=args.dry_run,
                         )
                     else:

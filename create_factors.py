@@ -80,7 +80,7 @@ def load_snapshot_isins(snapshot: date) -> set | None:
     date_str = snapshot.strftime('%Y-%m-%d')
     with get_db(UNIVERSE_DB) as conn:
         matched = conn.execute(
-            "SELECT snapshot_date FROM universe_snapshots "
+            "SELECT snapshot_date FROM universe_snapshots WHERE index_name = 'russell_1000' "
             "ORDER BY ABS(julianday(snapshot_date) - julianday(?)) LIMIT 1",
             (date_str,)
         ).fetchone()
@@ -88,7 +88,7 @@ def load_snapshot_isins(snapshot: date) -> set | None:
             return None
         matched_date = matched[0]
         rows = conn.execute(
-            "SELECT isin FROM universe_snapshots WHERE snapshot_date = ?",
+            "SELECT isin FROM universe_snapshots WHERE snapshot_date = ? AND index_name = 'russell_1000'",
             (matched_date,)
         ).fetchall()
     if matched_date != date_str:
@@ -107,7 +107,9 @@ def _fix_ytd_quarters(data: dict, name_to_kind: dict[str, str]) -> int:
         Q3_standalone = Q3_stored − Q2_stored  (Q2_stored is the YTD base)
 
     Threshold 1.65 allows genuine seasonal Q2 uplifts (up to 65% above Q1)
-    before treating the value as cumulative.
+    before treating the value as cumulative.  Q3 uses the same Q1 denominator
+    (9M/Q1 ≈ 3 for uniform distributions) — not Q2_stored/H1 ≈ 1.5 which would
+    never clear the 1.65 bar.
 
     Returns count of values corrected.
     """
@@ -133,7 +135,7 @@ def _fix_ytd_quarters(data: dict, name_to_kind: dict[str, str]) -> int:
                     fixed += 1
                     if q3_dict is not None:
                         v3 = q3_dict.get(name)
-                        if v3 is not None and v3 / q2_stored > 1.65:
+                        if v3 is not None and v3 / v1 > 1.65:
                             q3_dict[name] = v3 - q2_stored
                             fixed += 1
     return fixed
@@ -254,23 +256,23 @@ def load_constituent_data() -> dict:
         if sid not in data:
             continue
         sid_data = data[sid]
-        if (fy, 'Q4') in sid_data:
-            continue  # Q4 already present (e.g. from SimFin quarterly data)
+        name = row.constituent_name
+        if id_to_kind.get(row.constituent_id) != 'Flow':
+            continue  # Stock items not applicable
+        q4_key = (fy, 'Q4')
+        if name in sid_data.get(q4_key, {}):
+            continue  # this specific Flow constituent already in Q4 bucket
         q1 = sid_data.get((fy, 'Q1'), {})
         q2 = sid_data.get((fy, 'Q2'), {})
         q3 = sid_data.get((fy, 'Q3'), {})
         if not (q1 and q2 and q3):
             continue  # can't derive Q4 without all three prior quarters
-        name = row.constituent_name
-        if id_to_kind.get(row.constituent_id) != 'Flow':
-            continue  # Stock items not applicable
         v1 = q1.get(name)
         v2 = q2.get(name)
         v3 = q3.get(name)
         if v1 is None or v2 is None or v3 is None:
             continue  # constituent missing in at least one prior quarter
         q4_val = row.constituent_value - v1 - v2 - v3
-        q4_key = (fy, 'Q4')
         q4_sort = fy * 10 + _PERIOD_ORDER['Q4']
         bucket = sid_data.setdefault(q4_key, {
             '_publish_date': row.publish_date,
@@ -574,7 +576,7 @@ def compute_quality_factors(cdata: dict) -> dict:
         nm = net_income / revenue
         if abs(nm) <= 2:  # >200% signals bad SimFin revenue data (e.g. REITs with near-zero reported revenue)
             f['Net Margin'] = nm
-    if net_income is not None and equity is not None and equity != 0:
+    if net_income is not None and equity is not None and equity > 0:
         f['ROE'] = net_income / equity
     if net_income is not None and assets is not None and assets != 0:
         f['ROA'] = net_income / assets
@@ -586,7 +588,7 @@ def compute_quality_factors(cdata: dict) -> dict:
         f['Cash Conversion Quality'] = op_cf / revenue
     if cur_assets is not None and cur_liab is not None and cur_liab != 0:
         f['Current Ratio'] = cur_assets / cur_liab
-    if long_debt is not None and equity is not None and equity != 0:
+    if long_debt is not None and equity is not None and equity > 0:
         f['Leverage'] = (short_debt + long_debt) / equity
     if total_liab is not None and assets is not None and assets != 0:
         f['Debt-to-Assets'] = total_liab / assets
@@ -627,7 +629,7 @@ def compute_value_factors(
         f['Sales-to-Price'] = revenue / market_cap
     if op_cf is not None:
         f['Cash Yield'] = op_cf / market_cap
-    if cash is not None and op_income is not None and op_income != 0:
+    if cash is not None and op_income is not None and op_income > 0:
         ev = market_cap + (short_debt or 0) + (long_debt or 0) - cash
         if ev > 0:
             f['EV-to-EBIT'] = ev / op_income
@@ -1013,8 +1015,8 @@ def main():
         description="Compute point-in-time factor snapshots and write to factors.db"
     )
     grp = parser.add_mutually_exclusive_group()
-    grp.add_argument('--date',              metavar='YYYY-MM-DD',
-                     help='Single snapshot date (default: today)')
+    grp.add_argument('--date',              metavar='YYYY-MM-DD', action='append', dest='dates',
+                     help='Snapshot date (repeatable: --date D1 --date D2)')
     grp.add_argument('--backfill',          action='store_true',
                      help='Run all annual April-1 backfill dates')
     grp.add_argument('--quarterly-backfill', action='store_true',
@@ -1028,8 +1030,8 @@ def main():
     elif args.quarterly_backfill:
         all_dates = sorted(set(BACKFILL_DATES + QUARTERLY_BACKFILL_DATES))
         dates_to_run = [datetime.strptime(d, '%Y-%m-%d').date() for d in all_dates]
-    elif args.date:
-        dates_to_run = [datetime.strptime(args.date, '%Y-%m-%d').date()]
+    elif args.dates:
+        dates_to_run = sorted({datetime.strptime(d, '%Y-%m-%d').date() for d in args.dates})
     else:
         dates_to_run = [date.today()]
 
