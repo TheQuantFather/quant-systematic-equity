@@ -54,120 +54,106 @@ GICS_SECTOR_NORM: dict[str, str] = {
     "Utilities":              "Utilities",
 }
 
-# iShares ticker → SimFin ticker, for matching metadata only.
-# The companies table stores the iShares ticker (market standard).
-_SIMFIN_MATCH: dict[str, str] = {
-    "BRKB":  "BRK-A",
-    "BRKA":  "BRK-A",
-    "GOOGL": "GOOG",
-    "FOXA":  "FOX",
-    "NWSA":  "NWS",
-    "UAA":   "UA",
-    "LENB":  "LEN",
-    "FISV":  "FI",    # iShares uses FISV, SimFin has FI (post-rebrand ticker)
-    "CPAY":  "CCCC",  # Corpay — SimFin may not have this yet
-    "RVTY":  "PKI",   # Revvity (formerly PerkinElmer)
-    "CPAY":  "FLYW",  # Corpay (formerly Flywire? actually formerly Comdata - check)
-}
 
-# Known ISINs for companies not matched via SimFin ticker lookup.
-# Sourced from iShares Russell 1000 NPORT-P (EDGAR acc 0001004726-26-000805,
-# period 2025-12-31) and SEC EDGAR public filings.
-_ISIN_PATCH: dict[str, str] = {
-    # --- Pre-existing entries (SimFin gaps, renames, non-US incorporations) ---
-    "AS":    "US03014X1037",  # Amer Sports Inc
-    "CAVA":  "US14943H2085",  # CAVA Group Inc
-    "COHR":  "US19247G1076",  # Coherent Corp (formerly II-VI)
-    "DINO":  "US40637H1095",  # HF Sinclair Corp
-    "DRS":   "US52605T1007",  # Leonardo DRS Inc
-    "EG":    "BMG3223R1088",  # Everest Group Ltd (Bermuda)
-    "FERG":  "US31482P1003",  # Ferguson Enterprises Inc (US-listed)
-    "FLUT":  "IE00BWT6H894",  # Flutter Entertainment plc (Ireland)
-    "FRMI":  "US31488E1082",  # Fermi Inc
-    "GEHC":  "US36266G1076",  # GE HealthCare Technologies Inc
-    "GEN":   "US37290D1054",  # Gen Digital Inc
-    "KVUE":  "US49177J1025",  # Kenvue Inc
-    "LINE":  "US53567M1071",  # Lineage Inc (REIT, IPO 2024)
-    "NIQ":   "IE000S971575",  # NIQ Global Intelligence plc
-    "NTRS":  "US6658591044",  # Northern Trust Corp
-    "P":     "US30040W1018",  # Everpure Inc Class A
-    "PR":    "US71406T1079",  # Permian Resources Corp
-    "RITM":  "US77495W1027",  # Rithm Capital Corp
-    "SN":    "US82028M1018",  # SharkNinja Inc
-    "SNDK":  "US8001991010",  # SanDisk Corp (relisted 2024)
-    "FISV":  "US3377381088",  # Fiserv Inc (iShares uses FISV, SimFin uses FI)
-    "HOLX":  "US4364401012",  # Hologic Inc (iShares file has blank ticker row)
-    # --- Sourced from IWB NPORT-P (EDGAR, period 2025-12-31) ---
-    "ALAB":  "US04626A1034",  # Astera Labs Inc
-    "AM":    "US03676B1026",  # Antero Midstream Corp
-    "AMTM":  "US0239391016",  # Amentum Holdings Inc
-    "AU":    "GB00BRXH2664",  # AngloGold Ashanti plc (UK-listed)
-    "BFA":   "US1156371007",  # Brown-Forman Corp Class A
-    "BFB":   "US1156372096",  # Brown-Forman Corp Class B
-    "BIRK":  "JE00BS44BN30",  # Birkenstock Holding plc (Jersey)
-    "BLSH":  "KYG169101204",  # Bullish (Cayman)
-    "CART":  "US5653941030",  # Maplebear Inc (Instacart)
-    "CCC":   "US12510Q1004",  # CCC Intelligent Solutions Holdings Inc
-    "CHRD":  "US6742152076",  # Chord Energy Corp
-    "CNH":   "NL0010545661",  # CNH Industrial N.V. (Netherlands)
-    "CRCL":  "US1725731079",  # Circle Internet Group Inc
-    "CXT":   "US2244411052",  # Crane NXT Co
-    "DJT":   "US25400Q1058",  # Trump Media & Technology Group Corp
-    "ECG":   "US3004261034",  # Everus Construction Group Inc
-    "FBIN":  "US34964C1062",  # Fortune Brands Innovations Inc
-    "FWONA": "US5312297550",  # Liberty Formula One Group Series A
-    "FWONK": "US5312297717",  # Liberty Formula One Group Series C
-    "GAP":   "US3647601083",  # The Gap Inc
-    "GEV":   "US36828A1016",  # GE Vernova Inc
-    "GLIBA": "US36164V8000",  # GCI Liberty Inc Series A
-    "GLIBK": "US36164V8000",  # GCI Liberty Inc Series C (same ISIN)
-    "GTM":   "US98980F1049",  # ZoomInfo Technologies Inc
-    "HEIA":  "US4228061093",  # HEICO Corp Class A (same ISIN as HEICO Corp)
-    "HHH":   "US44267T1025",  # Howard Hughes Holdings Inc
-    "INGM":  "US4571521065",  # Ingram Micro Holding Corp
-    "IOT":   "US79589L1061",  # Samsara Inc Class A
-    "KRMN":  "US4859241048",  # Karman Holdings Inc
-    "LBRDK": "US5303073051",  # Liberty Broadband Corp Series C
-    "LBTYK": "BMG611881019",  # Liberty Global Ltd Class C (Bermuda)
-    "LLYVA": "US5309091008",  # Liberty Live Holdings Inc Series A
-    "LLYVK": "US5309093087",  # Liberty Live Holdings Inc Series C
-    "LOAR":  "US53947R1059",  # Loar Holdings Inc
-    "MPT":   "US58463J3041",  # Medical Properties Trust Inc
-    "MRP":   "US6011371027",  # Millrose Properties Inc
-    "MRSH":  "US5717481023",  # Marsh & McLennan Companies Inc
-    "ONTO":  "US6833441057",  # Onto Innovation Inc
-    "PRMB":  "US7416231022",  # Primo Brands Corp
-    "Q":     "US74743L1008",  # Qnity Electronics Inc
-    "QXO":   "US82846H4056",  # QXO Inc
-    "RAL":   "US7509401086",  # Ralliant Corp
-    "RBC":   "US75524B1044",  # RBC Bearings Inc
-    "RBRK":  "US7811541090",  # Rubrik Inc Class A
-    "SARO":  "US85423L1035",  # StandardAero Inc
-    "SGI":   "US88023U1016",  # Somnigroup International Inc
-    "SOLS":  "US83443Q1031",  # Solstice Advanced Materials Inc
-    "SOLV":  "US83444M1018",  # Solventum Corp
-    "SW":    "IE00028FXN24",  # Smurfit WestRock plc (Ireland)
-    "TEM":   "US88023B1035",  # Tempus AI Inc Class A
-    "TKO":   "US87256C1018",  # TKO Group Holdings Inc
-    "TLN":   "US87422Q1094",  # Talen Energy Corp
-    "UHALB": "US0235861004",  # U-Haul Holding Series N
-    "VIK":   "BMG93A5A1010",  # Viking Holdings Ltd (Bermuda)
-    "VLTO":  "US92338C1036",  # Veralto Corp
-    "XYZ":   "US8522341036",  # Block Inc Class A
-    "ZG":    "US98954M1018",  # Zillow Group Inc Class A
-}
+# ---------------------------------------------------------------------------
+# Reference table helpers
+#
+# These four tables in universe.db are the single source of truth for all
+# security/index mappings. They are never dropped on rebuild — edits made
+# directly in the DB survive full reruns.
+#
+# To populate on a fresh DB, restore universe.db from backup (Time Machine).
+# The tables are small and stable; they don't need to be reproduced from code.
+# ---------------------------------------------------------------------------
+
+def seed_isin_patch_table(conn: "sqlite3.Connection") -> None:
+    """Create isin_patch table if it doesn't exist yet."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS isin_patch (
+            ticker TEXT PRIMARY KEY,
+            isin   TEXT NOT NULL,
+            note   TEXT
+        )
+    """)
+    conn.commit()
 
 
-# Historical iShares Russell 1000 ETF N-PORT-P filings (period → EDGAR accession).
-# Each entry maps an April 1 snapshot date to the December-period filing available
-# ~Feb of that year.  Add new entries when new annual data is needed.
-_HISTORICAL_NPORT: dict[str, str] = {
-    "2021-04-01": "0001752724-21-040717",   # period 2020-12-31
-    "2022-04-01": "0001752724-22-046365",   # period 2021-12-31
-    "2023-04-01": "0001752724-23-039564",   # period 2022-12-31
-    "2024-04-01": "0001752724-24-034803",   # period 2023-12-31
-    "2025-04-01": "0001752724-25-034052",   # period 2024-12-31
-}
+def load_isin_patch() -> dict[str, str]:
+    """Return ticker→ISIN overrides from universe.db."""
+    with get_db(DB_PATH) as conn:
+        rows = conn.execute("SELECT ticker, isin FROM isin_patch").fetchall()
+    return {r[0]: r[1] for r in rows}
+
+
+def seed_ticker_alias_table(conn: "sqlite3.Connection") -> None:
+    """Create ticker_alias table if it doesn't exist yet."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS ticker_alias (
+            ticker       TEXT PRIMARY KEY,
+            alias_ticker TEXT NOT NULL,
+            note         TEXT
+        )
+    """)
+    conn.commit()
+
+
+def load_ticker_alias() -> dict[str, str]:
+    """Return iShares ticker→SimFin ticker aliases from universe.db."""
+    with get_db(DB_PATH) as conn:
+        rows = conn.execute("SELECT ticker, alias_ticker FROM ticker_alias").fetchall()
+    return {r[0]: r[1] for r in rows}
+
+
+def seed_registry_tables(conn: "sqlite3.Connection") -> None:
+    """Create index_registry and nport_accessions tables if they don't exist yet."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS index_registry (
+            index_name  TEXT PRIMARY KEY,
+            etf_ticker  TEXT NOT NULL,
+            etf_name    TEXT NOT NULL,
+            series_id   TEXT,
+            cik         TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS nport_accessions (
+            index_name    TEXT NOT NULL,
+            snapshot_date TEXT NOT NULL,
+            accession     TEXT NOT NULL,
+            period_ending TEXT,
+            PRIMARY KEY (index_name, snapshot_date),
+            FOREIGN KEY (index_name) REFERENCES index_registry(index_name)
+        )
+    """)
+    conn.commit()
+
+
+def load_index_registry() -> dict[str, dict]:
+    """Load index registry from universe.db index_registry + nport_accessions tables."""
+    with get_db(DB_PATH) as conn:
+        reg_rows = conn.execute(
+            "SELECT index_name, etf_ticker, etf_name, series_id, cik FROM index_registry"
+        ).fetchall()
+        acc_rows = conn.execute(
+            "SELECT index_name, snapshot_date, accession, period_ending FROM nport_accessions"
+        ).fetchall()
+    result: dict[str, dict] = {}
+    for r in reg_rows:
+        result[r[0]] = {
+            "etf_ticker": r[1], "etf_name": r[2],
+            "series_id": r[3], "cik": r[4], "filings": {},
+        }
+    for r in acc_rows:
+        if r[0] in result:
+            result[r[0]]["filings"][r[1]] = (r[2], r[3])
+    return result
+
+
+def seed_all_reference_tables(conn: "sqlite3.Connection") -> None:
+    """Ensure all persistent reference tables exist (schema only, no data insertion)."""
+    seed_isin_patch_table(conn)
+    seed_ticker_alias_table(conn)
+    seed_registry_tables(conn)
 
 
 # ---------------------------------------------------------------------------
@@ -206,13 +192,25 @@ def load_simfin() -> pd.DataFrame:
 
 
 def _parse_ishares_date(path: Path) -> str:
-    """Extract snapshot date string (YYYY-MM-DD) from iShares CSV header."""
+    """Extract snapshot date string (YYYY-MM-DD) from iShares CSV header.
+
+    Handles two formats:
+      iShares Russell 1000: row 2 = 'Fund Holdings as of,"May 04, 2026"'
+      iShares MSCI USA:     row 1 = 'Fund Holdings as of,"07/May/2026"'
+    """
+    _FMTS = ["%B %d %Y", "%d/%b/%Y", "%B %d, %Y"]
     with open(path, encoding="utf-8-sig") as f:
         for i, line in enumerate(f):
-            if i == 1:                          # row 2: 'Fund Holdings as of,"May 04, 2026"'
-                parts = line.strip().split(",")
-                date_str = " ".join(p.strip().strip('"') for p in parts[1:])
-                return datetime.strptime(date_str, "%B %d %Y").strftime("%Y-%m-%d")
+            if "Fund Holdings as of" not in line:
+                continue
+            parts = line.strip().split(",")
+            date_str = " ".join(p.strip().strip('"') for p in parts[1:]).strip()
+            for fmt in _FMTS:
+                try:
+                    return datetime.strptime(date_str, fmt).strftime("%Y-%m-%d")
+                except ValueError:
+                    continue
+            raise ValueError(f"Could not parse date '{date_str}' in {path}")
     raise ValueError(f"Could not parse date from {path}")
 
 
@@ -260,11 +258,18 @@ def load_ishares(path: Path) -> tuple[pd.DataFrame, str, str]:
 def build_companies(
     ishares_frames: list[tuple[pd.DataFrame, str, str]],
     simfin: pd.DataFrame,
+    patch: dict[str, str] | None = None,
+    alias: dict[str, str] | None = None,
 ) -> pd.DataFrame:
     """
     Build the companies table from all iShares snapshots merged with SimFin.
     One row per unique iShares ticker (deduped by ISIN, latest snapshot wins).
+
+    patch: ISIN overrides (ticker → ISIN). If None, load_isin_patch() is used.
+    alias: SimFin ticker aliases (iShares ticker → SimFin ticker). If None, load_ticker_alias() is used.
     """
+    _patch = patch if patch is not None else load_isin_patch()
+    _alias = alias if alias is not None else load_ticker_alias()
     today = datetime.now().date().isoformat()
 
     # SimFin lookup by ticker
@@ -282,17 +287,17 @@ def build_companies(
             if not ticker or ticker in ("NAN", "-"):
                 continue
 
-            # Match to SimFin: direct ticker, then alias
+            # Match to SimFin: direct ticker, then alias from DB
             sf = sf_by_ticker.get(ticker)
             if sf is None:
-                sf = sf_by_ticker.get(_SIMFIN_MATCH.get(ticker, ""))
+                sf = sf_by_ticker.get(_alias.get(ticker, ""))
 
             # Resolve ISIN
             isin: str | None = None
             if sf is not None and pd.notna(sf.get("isin")) and str(sf["isin"]).strip():
                 isin = str(sf["isin"]).strip()
             if not isin:
-                isin = _ISIN_PATCH.get(ticker)
+                isin = _patch.get(ticker)
             if not isin:
                 isin = f"NOISN_{ticker}"   # synthetic placeholder
 
@@ -361,8 +366,10 @@ def build_companies(
 def build_snapshots(
     ishares_frames: list[tuple[pd.DataFrame, str, str]],
     companies: pd.DataFrame,
+    alias: dict[str, str] | None = None,
 ) -> pd.DataFrame:
     """Build universe_snapshots from all iShares frames."""
+    _alias = alias if alias is not None else load_ticker_alias()
     isin_by_ticker: dict[str, str] = dict(zip(companies["ticker"], companies["isin"]))
 
     rows = []
@@ -372,9 +379,9 @@ def build_snapshots(
             ticker = str(ih["Ticker"]).upper().strip()
             isin   = isin_by_ticker.get(ticker)
             if isin is None:
-                alias = _SIMFIN_MATCH.get(ticker)
-                if alias:
-                    isin = isin_by_ticker.get(alias)
+                alias_ticker = _alias.get(ticker)
+                if alias_ticker:
+                    isin = isin_by_ticker.get(alias_ticker)
             if isin is None:
                 continue
             key = (snapshot_date, isin, index_name)
@@ -396,54 +403,77 @@ def build_snapshots(
 # Historical universe snapshots from EDGAR N-PORT-P
 # ---------------------------------------------------------------------------
 
-def build_historical_snapshots(known_isins: set[str]) -> pd.DataFrame:
-    """
-    Fetch historical IWB N-PORT-P filings from EDGAR and return a DataFrame
-    of universe_snapshots rows (one per company per snapshot date).
-
-    Only companies whose ISIN is already in the companies table are included —
-    historical-only members (since acquired / delisted) are skipped.
-    """
-    rows = []
-    for snap_date, acc in sorted(_HISTORICAL_NPORT.items()):
-        acc_clean = acc.replace('-', '')
-        xml_url = (
-            f"https://www.sec.gov/Archives/edgar/data/1100663/{acc_clean}/primary_doc.xml"
-        )
-        try:
-            xml_data = _edgar_fetch_bytes(xml_url, timeout=60)
-            root     = ET.fromstring(xml_data)
-        except Exception as e:
-            print(f"  [NPORT] {snap_date}: fetch error — {e}")
+def _fetch_nport_isins(acc: str, cik: str, known_isins: set[str]) -> list[dict]:
+    """Fetch one N-PORT-P filing and return matched equity holdings as dicts."""
+    acc_clean = acc.replace("-", "")
+    url = f"https://www.sec.gov/Archives/edgar/data/{cik}/{acc_clean}/primary_doc.xml"
+    xml_data = _edgar_fetch_bytes(url, timeout=60)
+    root = ET.fromstring(xml_data)
+    ns   = {"n": "http://www.sec.gov/edgar/nport"}
+    holdings = []
+    for inv in root.findall(".//n:invstOrSec", ns):
+        isin_el = inv.find("n:identifiers/n:isin", ns)
+        val_el  = inv.find("n:valUSD", ns)
+        pct_el  = inv.find("n:pctVal", ns)
+        cat_el  = inv.find("n:assetCat", ns)
+        isin = isin_el.get("value", "") if isin_el is not None else ""
+        if not isin or isin == "N/A":
             continue
+        if (cat_el.text if cat_el is not None else "") != "EC":
+            continue
+        if isin not in known_isins:
+            continue
+        holdings.append({
+            "isin":         isin,
+            "weight":       float(pct_el.text) if pct_el is not None else None,
+            "market_value": float(val_el.text) if val_el is not None else None,
+        })
+    return holdings
 
-        ns = {"n": "http://www.sec.gov/edgar/nport"}
-        n_matched = 0
-        for inv in root.findall(".//n:invstOrSec", ns):
-            isin_el = inv.find("n:identifiers/n:isin", ns)
-            val_el  = inv.find("n:valUSD", ns)
-            pct_el  = inv.find("n:pctVal", ns)
-            cat_el  = inv.find("n:assetCat", ns)
 
-            isin = isin_el.get("value", "") if isin_el is not None else ""
-            if not isin or isin == "N/A":
+def build_historical_snapshots(
+    known_isins: set[str],
+    registry: dict[str, dict] | None = None,
+) -> pd.DataFrame:
+    """
+    Fetch N-PORT-P filings from EDGAR for all indexes in the registry and
+    return a DataFrame of universe_snapshots rows (one per company per snapshot date).
+
+    registry: loaded from universe.db index_registry/nport_accessions tables.
+              If None, load_index_registry() is called automatically.
+    Deduplicates fetches: if multiple snapshot dates share the same accession for
+    an index, the XML is fetched once and applied to all matching dates.
+    Only companies whose ISIN is in the companies table are included.
+    """
+    _registry = registry if registry is not None else load_index_registry()
+    rows = []
+    for index_name, idx in _registry.items():
+        cik      = idx["cik"]
+        filings  = idx["filings"]  # {snapshot_date: (acc, period)}
+
+        # Deduplicate: group snapshot dates by accession
+        acc_to_dates: dict[str, list[str]] = {}
+        for snap_date, (acc, _period) in sorted(filings.items()):
+            acc_to_dates.setdefault(acc, []).append(snap_date)
+
+        print(f"\n  [{index_name}]")
+        for acc, snap_dates in sorted(acc_to_dates.items()):
+            try:
+                holdings = _fetch_nport_isins(acc, cik, known_isins)
+            except Exception as e:
+                print(f"    {snap_dates[0]}: fetch error — {e}")
                 continue
-            if (cat_el.text if cat_el is not None else "") != "EC":
-                continue
-            if isin not in known_isins:
-                continue
-
-            rows.append({
-                "snapshot_date": snap_date,
-                "isin":          isin,
-                "index_name":    "russell_1000",
-                "weight":        float(pct_el.text) if pct_el is not None else None,
-                "market_value":  float(val_el.text) if val_el is not None else None,
-            })
-            n_matched += 1
-
-        print(f"  {snap_date}: {n_matched} companies")
-        time.sleep(0.3)
+            for snap_date in snap_dates:
+                for h in holdings:
+                    rows.append({
+                        "snapshot_date": snap_date,
+                        "isin":          h["isin"],
+                        "index_name":    index_name,
+                        "weight":        h["weight"],
+                        "market_value":  h["market_value"],
+                    })
+                print(f"    {snap_date}: {len(holdings)} companies  (acc {acc})")
+            time.sleep(0.3)
 
     return pd.DataFrame(rows)
 
@@ -541,6 +571,10 @@ def enrich_edgar_metadata(companies: pd.DataFrame) -> pd.DataFrame:
 
 def write_db(companies: pd.DataFrame, snapshots: pd.DataFrame) -> None:
     with get_db(DB_PATH) as conn:
+        # Reference tables are NEVER dropped — user edits survive full rebuilds.
+        # seed_all_reference_tables uses CREATE TABLE IF NOT EXISTS + INSERT OR IGNORE.
+        seed_all_reference_tables(conn)
+
         conn.executescript("""
             DROP TABLE IF EXISTS universe_snapshots;
             DROP TABLE IF EXISTS companies;
@@ -585,9 +619,18 @@ def write_db(companies: pd.DataFrame, snapshots: pd.DataFrame) -> None:
             CREATE INDEX idx_snap_date  ON universe_snapshots(snapshot_date, index_name);
         """)
 
-        companies.to_sql("companies", conn, if_exists="append", index=False)
+        companies.to_sql("companies",         conn, if_exists="append", index=False)
         snapshots.to_sql("universe_snapshots", conn, if_exists="append", index=False)
         conn.commit()
+
+        n_alias = conn.execute("SELECT COUNT(*) FROM ticker_alias").fetchone()[0]
+        n_patch = conn.execute("SELECT COUNT(*) FROM isin_patch").fetchone()[0]
+        n_reg   = conn.execute("SELECT COUNT(*) FROM index_registry").fetchone()[0]
+        n_acc   = conn.execute("SELECT COUNT(*) FROM nport_accessions").fetchone()[0]
+        print(f"  ticker_alias:       {n_alias} aliases")
+        print(f"  isin_patch:         {n_patch} overrides")
+        print(f"  index_registry:     {n_reg} indexes")
+        print(f"  nport_accessions:   {n_acc} entries")
         print(f"  companies:          {len(companies):,} rows")
         print(f"  universe_snapshots: {len(snapshots):,} rows")
 
@@ -596,10 +639,15 @@ def write_db(companies: pd.DataFrame, snapshots: pd.DataFrame) -> None:
 # Report
 # ---------------------------------------------------------------------------
 
-def print_report(companies: pd.DataFrame, snapshots: pd.DataFrame) -> None:
+def print_report(
+    companies: pd.DataFrame,
+    snapshots: pd.DataFrame,
+    patch: dict[str, str] | None = None,
+) -> None:
+    _patch    = patch if patch is not None else load_isin_patch()
     total     = len(companies)
     synthetic = companies["isin"].str.startswith("NOISN_").sum()
-    patched   = companies["isin"].isin(_ISIN_PATCH.values()).sum()
+    patched   = companies["isin"].isin(_patch.values()).sum()
     simfin_m  = companies["simfin_id"].notna().sum()
     no_cik    = companies["cik"].isna().sum()
 
@@ -628,10 +676,101 @@ def print_report(companies: pd.DataFrame, snapshots: pd.DataFrame) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Snapshot-only rebuild  (--rebuild-snapshots flag)
+# ---------------------------------------------------------------------------
+
+def _write_snapshots_only(snapshots: pd.DataFrame) -> None:
+    """Replace universe_snapshots in place; leave companies and reference tables untouched."""
+    with get_db(DB_PATH) as conn:
+        seed_all_reference_tables(conn)
+        conn.executescript("""
+            DROP TABLE IF EXISTS universe_snapshots;
+            CREATE TABLE universe_snapshots (
+                snapshot_date  TEXT NOT NULL,
+                isin           TEXT NOT NULL,
+                index_name     TEXT NOT NULL,
+                weight         REAL,
+                market_value   REAL,
+                PRIMARY KEY (snapshot_date, isin, index_name),
+                FOREIGN KEY (isin) REFERENCES companies(isin)
+            );
+            CREATE INDEX idx_snap_date ON universe_snapshots(snapshot_date, index_name);
+        """)
+        snapshots.to_sql("universe_snapshots", conn, if_exists="append", index=False)
+        conn.commit()
+
+        n_reg = conn.execute("SELECT COUNT(*) FROM index_registry").fetchone()[0]
+        n_acc = conn.execute("SELECT COUNT(*) FROM nport_accessions").fetchone()[0]
+
+    print(f"  index_registry:     {n_reg} indexes")
+    print(f"  nport_accessions:   {n_acc} entries")
+    print(f"  universe_snapshots: {len(snapshots):,} rows")
+
+
+def rebuild_snapshots() -> None:
+    """Rebuild universe_snapshots from CSVs + EDGAR N-PORT-P. Does not touch companies."""
+    print("=" * 55)
+    print("REBUILD UNIVERSE SNAPSHOTS")
+    print("=" * 55)
+
+    with get_db(DB_PATH) as conn:
+        companies = pd.read_sql("SELECT isin, ticker FROM companies", conn)
+        seed_all_reference_tables(conn)
+    known_isins = set(companies["isin"].dropna())
+    print(f"Known ISINs from companies table: {len(known_isins)}")
+
+    registry = load_index_registry()
+
+    index_files = sorted(INDEX_DIR.glob("russell_*.csv")) if INDEX_DIR.exists() else []
+    ishares_frames: list[tuple[pd.DataFrame, str, str]] = []
+    for path in index_files:
+        eq, snapshot_date, index_name = load_ishares(path)
+        print(f"  {path.name:<45}  {len(eq):>5} holdings  ({index_name} @ {snapshot_date})")
+        ishares_frames.append((eq, snapshot_date, index_name))
+
+    snapshots_csv = build_snapshots(ishares_frames, companies) if ishares_frames else pd.DataFrame()
+    print(f"CSV snapshots: {len(snapshots_csv):,} rows")
+
+    print("\nFetching N-PORT-P snapshots from EDGAR ...")
+    hist = build_historical_snapshots(known_isins, registry=registry)
+    print(f"EDGAR snapshots: {len(hist):,} rows")
+
+    all_snapshots = pd.concat([snapshots_csv, hist], ignore_index=True)
+    all_snapshots = all_snapshots.drop_duplicates(subset=["snapshot_date", "isin", "index_name"])
+    print(f"Total unique snapshot rows: {len(all_snapshots):,}")
+
+    print(f"\nWriting to {DB_PATH} ...")
+    _write_snapshots_only(all_snapshots)
+
+    for idx_name in sorted(all_snapshots["index_name"].unique()):
+        sub = all_snapshots[all_snapshots["index_name"] == idx_name]
+        dates = sorted(sub["snapshot_date"].unique())
+        print(f"\n  [{idx_name}] {len(dates)} snapshot dates, {len(sub):,} total rows")
+        for d in dates:
+            n = (sub["snapshot_date"] == d).sum()
+            print(f"    {d}: {n} companies")
+
+    print("\nDone.")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Build or update universe.db")
+    parser.add_argument(
+        "--rebuild-snapshots", action="store_true",
+        help="Rebuild universe_snapshots from CSVs + EDGAR only (leaves companies table intact)",
+    )
+    args = parser.parse_args()
+
+    if args.rebuild_snapshots:
+        rebuild_snapshots()
+        return
+
     print("=" * 55)
     print("CREATE UNIVERSE")
     print("=" * 55)
@@ -652,25 +791,34 @@ def main() -> None:
         print(f"  {path.name:<45}  {len(eq):>5} holdings  ({index_name} @ {snapshot_date})")
         ishares_frames.append((eq, snapshot_date, index_name))
 
+    # Seed reference tables before first use, then load from DB
+    print("\nLoading reference tables from DB ...")
+    with get_db(DB_PATH) as conn:
+        seed_all_reference_tables(conn)
+    patch    = load_isin_patch()
+    alias    = load_ticker_alias()
+    registry = load_index_registry()
+    print(f"  isin_patch: {len(patch)} overrides | ticker_alias: {len(alias)} | indexes: {len(registry)}")
+
     print("\nBuilding companies table ...")
-    companies = build_companies(ishares_frames, simfin)
+    companies = build_companies(ishares_frames, simfin, patch=patch, alias=alias)
 
     print("Enriching metadata from EDGAR ...")
     companies = enrich_edgar_metadata(companies)
 
     print("Building universe_snapshots table ...")
-    snapshots = build_snapshots(ishares_frames, companies)
+    snapshots = build_snapshots(ishares_frames, companies, alias=alias)
 
     print("Fetching historical universe snapshots from EDGAR N-PORT-P ...")
     known_isins = set(companies["isin"].dropna())
-    hist = build_historical_snapshots(known_isins)
+    hist = build_historical_snapshots(known_isins, registry=registry)
     if not hist.empty:
         snapshots = pd.concat([snapshots, hist], ignore_index=True)
 
     print(f"\nWriting to {DB_PATH} ...")
     write_db(companies, snapshots)
 
-    print_report(companies, snapshots)
+    print_report(companies, snapshots, patch=patch)
 
     print("\n" + "=" * 55)
     print("Done.")

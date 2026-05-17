@@ -25,7 +25,7 @@ from pathlib import Path
 # Config
 # ---------------------------------------------------------------------------
 
-PYTHON = sys.executable
+PYTHON   = sys.executable
 REPO_DIR = Path(__file__).parent.resolve()
 LOG_DIR  = REPO_DIR / "logs"
 LOG_FILE = LOG_DIR / "daily_update.log"
