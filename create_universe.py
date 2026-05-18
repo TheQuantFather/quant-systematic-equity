@@ -24,6 +24,7 @@ Add a new index snapshot:
 
 import json
 import time
+import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
 
@@ -36,8 +37,6 @@ from config import DATA_DIR, SIMFIN_DIR, UNIVERSE_DB as DB_PATH
 from utils import get_db
 
 INDEX_DIR  = DATA_DIR / "universe_index"
-
-ISHARES_SKIPROWS = 9
 
 # iShares sector label → official GICS sector name
 GICS_SECTOR_NORM: dict[str, str] = {
@@ -191,16 +190,28 @@ def load_simfin() -> pd.DataFrame:
     return df
 
 
-def _parse_ishares_date(path: Path) -> str:
-    """Extract snapshot date string (YYYY-MM-DD) from iShares CSV header.
+# Canonical index name for known iShares ETF products.
+# Key = ETF name as it appears in the first line of the CSV (lower-cased).
+_ISHARES_ETF_TO_INDEX: dict[str, str] = {
+    "ishares russell 1000 etf": "russell_1000",
+    "ishares russell 2000 etf": "russell_2000",
+    "ishares russell 3000 etf": "russell_3000",
+    "ishares msci usa etf":     "msci_usa",
+    "ishares core s&p 500 etf": "sp_500",
+}
 
-    Handles two formats:
-      iShares Russell 1000: row 2 = 'Fund Holdings as of,"May 04, 2026"'
-      iShares MSCI USA:     row 1 = 'Fund Holdings as of,"07/May/2026"'
+
+def _parse_ishares_date(path: Path) -> str:
+    """Extract snapshot date string (YYYY-MM-DD) from an iShares holdings CSV header.
+
+    Handles multiple date formats: 'May 04, 2026'  |  '07/May/2026'
     """
-    _FMTS = ["%B %d %Y", "%d/%b/%Y", "%B %d, %Y"]
+    if path.suffix.lower() != ".csv":
+        raise ValueError(f"iShares holdings file must be CSV, got: {path.name}")
+
+    _FMTS = ["%B %d, %Y", "%B %d %Y", "%d/%b/%Y"]
     with open(path, encoding="utf-8-sig") as f:
-        for i, line in enumerate(f):
+        for line in f:
             if "Fund Holdings as of" not in line:
                 continue
             parts = line.strip().split(",")
@@ -211,20 +222,25 @@ def _parse_ishares_date(path: Path) -> str:
                 except ValueError:
                     continue
             raise ValueError(f"Could not parse date '{date_str}' in {path}")
-    raise ValueError(f"Could not parse date from {path}")
+    raise ValueError(f"'Fund Holdings as of' not found in {path}")
 
 
 def _infer_index_name(path: Path) -> str:
+    """Infer the canonical index name from an iShares holdings CSV.
+
+    Reads the ETF name from the first line of the file and maps it via
+    _ISHARES_ETF_TO_INDEX. Falls back to stripping trailing date parts
+    from the filename stem (e.g. russell_1000_2026_05_04 → russell_1000).
     """
-    Infer the index name from the filename.
-    Expects filenames like:  russell_1000_2026_05_04.csv
-    Falls back to 'unknown_index' if the pattern isn't recognised.
-    """
-    stem  = path.stem.lower()                          # russell_1000_2026_05_04
-    parts = stem.split("_")
-    # Strip trailing date parts: break on a 4-digit calendar year (>= 1900)
-    name_parts = []
-    for p in parts:
+    if path.suffix.lower() == ".csv":
+        with open(path, encoding="utf-8-sig") as f:
+            first = f.readline().strip().strip('"')
+        idx = _ISHARES_ETF_TO_INDEX.get(first.lower())
+        if idx:
+            return idx
+
+    name_parts: list[str] = []
+    for p in path.stem.lower().split("_"):
         if len(p) == 4 and p.isdigit() and int(p) >= 1900:
             break
         name_parts.append(p)
@@ -232,21 +248,34 @@ def _infer_index_name(path: Path) -> str:
 
 
 def load_ishares(path: Path) -> tuple[pd.DataFrame, str, str]:
-    """
-    Parse an iShares holdings CSV.
-    Returns (equity_df, snapshot_date_str, index_name).
-    """
+    """Parse an iShares holdings CSV.  Returns (equity_df, snapshot_date_str, index_name)."""
+    if path.suffix.lower() != ".csv":
+        raise ValueError(
+            f"iShares holdings files must be CSV (got {path.name}). "
+            "Download the holdings CSV from iShares — not the Excel/XLS version."
+        )
     snapshot_date = _parse_ishares_date(path)
     index_name    = _infer_index_name(path)
 
-    df = pd.read_csv(path, skiprows=ISHARES_SKIPROWS, encoding="utf-8-sig")
-    eq = df[df["Asset Class"] == "Equity"].copy()
+    # Find the row index of the column header (first row starting with "Ticker,").
+    # Different iShares products have different numbers of preamble rows.
+    header_row: int | None = None
+    with open(path, encoding="utf-8-sig") as fh:
+        for i, line in enumerate(fh):
+            if line.strip().startswith("Ticker,") or line.strip() == "Ticker":
+                header_row = i
+                break
+    if header_row is None:
+        raise ValueError(f"Could not find 'Ticker' column header in {path}")
+    df = pd.read_csv(path, skiprows=header_row, encoding="utf-8-sig")
 
+    eq = df[df["Asset Class"] == "Equity"].copy()
     for col in ["Market Value", "Weight (%)", "Price"]:
-        eq[col] = (
-            eq[col].astype(str).str.replace(",", "", regex=False)
-                   .apply(pd.to_numeric, errors="coerce")
-        )
+        if col in eq.columns:
+            eq[col] = (
+                eq[col].astype(str).str.replace(",", "", regex=False)
+                       .apply(pd.to_numeric, errors="coerce")
+            )
     eq["Ticker"] = eq["Ticker"].astype(str).str.strip().str.upper()
     return eq.reset_index(drop=True), snapshot_date, index_name
 
@@ -292,12 +321,10 @@ def build_companies(
             if sf is None:
                 sf = sf_by_ticker.get(_alias.get(ticker, ""))
 
-            # Resolve ISIN
-            isin: str | None = None
-            if sf is not None and pd.notna(sf.get("isin")) and str(sf["isin"]).strip():
+            # Resolve ISIN: patch always wins over SimFin (SimFin has wrong ISINs for ~39 companies)
+            isin: str | None = _patch.get(ticker)
+            if not isin and sf is not None and pd.notna(sf.get("isin")) and str(sf["isin"]).strip():
                 isin = str(sf["isin"]).strip()
-            if not isin:
-                isin = _patch.get(ticker)
             if not isin:
                 isin = f"NOISN_{ticker}"   # synthetic placeholder
 
@@ -482,7 +509,7 @@ def build_historical_snapshots(
 # EDGAR metadata enrichment
 # ---------------------------------------------------------------------------
 
-_EDGAR_HEADERS = {"User-Agent": os.getenv("EDGAR_IDENTITY", "your-name your@email.com")}
+_EDGAR_HEADERS = {"User-Agent": "universe-builder shivam3125@gmail.com"}
 
 def _edgar_fetch(url: str, timeout: int = 10) -> dict:
     req = urllib.request.Request(url, headers=_EDGAR_HEADERS)
@@ -563,6 +590,292 @@ def enrich_edgar_metadata(companies: pd.DataFrame) -> pd.DataFrame:
 
     print(f"  [EDGAR] Filled CIK for {filled} / {len(missing)} missing companies")
     return companies
+
+
+# ---------------------------------------------------------------------------
+# N-PORT helpers
+# ---------------------------------------------------------------------------
+
+def _fetch_nport_all_ec_isins(acc: str, cik: str) -> set[str]:
+    """Fetch one N-PORT-P filing and return the set of ISINs for all EC holdings."""
+    acc_clean = acc.replace("-", "")
+    url = f"https://www.sec.gov/Archives/edgar/data/{cik}/{acc_clean}/primary_doc.xml"
+    xml_data = _edgar_fetch_bytes(url, timeout=60)
+    root = ET.fromstring(xml_data)
+    ns = {"n": "http://www.sec.gov/edgar/nport"}
+    isins: set[str] = set()
+    for inv in root.findall(".//n:invstOrSec", ns):
+        cat_el = inv.find("n:assetCat", ns)
+        if (cat_el.text if cat_el is not None else "") != "EC":
+            continue
+        isin_el = inv.find("n:identifiers/n:isin", ns)
+        isin = isin_el.get("value", "") if isin_el is not None else ""
+        if isin and isin != "N/A":
+            isins.add(isin)
+    return isins
+
+
+# ---------------------------------------------------------------------------
+# FMP ISIN refresh  (--refresh-isins)
+# ---------------------------------------------------------------------------
+
+_FMP_BASE = "https://financialmodelingprep.com/stable"
+
+# Tickers whose iShares format differs from FMP's expected symbol format.
+_FMP_TICKER_ALIAS: dict[str, str] = {
+    "BFA":  "BF-A",
+    "BFB":  "BF-B",
+    "BRKA": "BRK-A",
+    "BRKB": "BRK-B",
+}
+
+
+def _load_fmp_api_key() -> str | None:
+    """Read FMP_API_KEY from .env file in the current working directory."""
+    env = Path(".env")
+    if not env.exists():
+        return None
+    for line in env.read_text().splitlines():
+        line = line.strip()
+        if line.startswith("FMP_API_KEY="):
+            return line.split("=", 1)[1].strip()
+    return None
+
+
+def _fmp_fetch_isin(ticker: str, api_key: str) -> str | None:
+    """Fetch ISIN for one ticker from FMP /stable/profile. Returns None if not found.
+
+    Raises urllib.error.HTTPError with code 429 if the account is rate-limited
+    so callers can stop early and report the issue.
+    """
+    fmp_ticker = _FMP_TICKER_ALIAS.get(ticker, ticker)
+    url = f"{_FMP_BASE}/profile?symbol={fmp_ticker}&apikey={api_key}"
+    try:
+        data = _edgar_fetch(url, timeout=10)
+        if isinstance(data, list) and data:
+            isin = data[0].get("isin", "")
+            return isin if isin else None
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            raise   # propagate rate-limit so callers can stop early
+    except Exception:
+        pass
+    return None
+
+
+def refresh_isins() -> None:
+    """
+    Fetch ISINs from FMP for all tickers found in universe_index CSV files,
+    and write them into the isin_patch table in universe.db.
+
+    isin_patch overrides SimFin ISINs in build_companies() — this is the
+    authoritative source for correct ISINs. Run once after adding new index
+    files or when ISINs need refreshing.
+
+    Requires FMP_API_KEY in .env (project root).
+    """
+    api_key = _load_fmp_api_key()
+    if not api_key:
+        raise RuntimeError(
+            "FMP_API_KEY not found in .env. "
+            "Add FMP_API_KEY=<your_key> to the .env file in the project root."
+        )
+
+    index_files = sorted(INDEX_DIR.glob("*.csv")) if INDEX_DIR.exists() else []
+    if not index_files:
+        raise RuntimeError(f"No CSV files found in {INDEX_DIR}")
+
+    tickers: set[str] = set()
+    for path in index_files:
+        eq, _, _ = load_ishares(path)
+        tickers.update(eq["Ticker"].dropna().unique())
+
+    ticker_list = sorted(tickers)
+
+    # Skip tickers already resolved in isin_patch to preserve the daily request quota.
+    with get_db(DB_PATH) as conn:
+        seed_isin_patch_table(conn)
+        existing = {r[0] for r in conn.execute("SELECT ticker FROM isin_patch").fetchall()}
+
+    pending = [t for t in ticker_list if t not in existing]
+    print(
+        f"Tickers: {len(ticker_list)} total, {len(existing)} already in isin_patch, "
+        f"{len(pending)} to fetch from FMP ..."
+    )
+
+    if not pending:
+        print("  Nothing to fetch — all tickers already resolved.")
+        return
+
+    with get_db(DB_PATH) as conn:
+        hits, misses = 0, []
+        rate_limited = False
+        for i, ticker in enumerate(pending):
+            if (i + 1) % 100 == 0:
+                print(f"  {i + 1}/{len(pending)} ...")
+            try:
+                isin = _fmp_fetch_isin(ticker, api_key)
+            except urllib.error.HTTPError as e:
+                if e.code == 429:
+                    print(f"\n[ERROR] FMP rate limit hit after {i} requests (HTTP 429).")
+                    print("        Create a new free FMP account, update FMP_API_KEY in .env, and re-run.")
+                    rate_limited = True
+                    break
+                raise
+            if isin:
+                conn.execute(
+                    "INSERT OR REPLACE INTO isin_patch (ticker, isin, note) VALUES (?, ?, ?)",
+                    (ticker, isin, "FMP /stable/profile"),
+                )
+                hits += 1
+            else:
+                misses.append(ticker)
+            time.sleep(0.05)   # ~20 req/s — stay well under FMP rate limit
+        conn.commit()
+
+    label = "rate-limited — re-run with new FMP key" if rate_limited else "not found by FMP"
+    print(f"  {hits} new ISINs written to isin_patch, {len(misses)} {label}")
+    if misses and not rate_limited:
+        print(f"  Not found: {', '.join(misses[:20])}" + (" ..." if len(misses) > 20 else ""))
+
+
+# ---------------------------------------------------------------------------
+# Fix ISINs via N-PORT + FMP validation  (--fix-isins)
+# ---------------------------------------------------------------------------
+
+def fix_isins() -> None:
+    """
+    Find companies with stale/wrong ISINs by comparing the companies table against
+    the latest N-PORT filing, then query FMP to get the authoritative ISIN and
+    write it to isin_patch.
+
+    Phase 1 (no FMP needed): identify suspect tickers whose effective ISIN is absent
+    from N-PORT's EC holdings list.
+
+    Phase 2 (FMP needed): query FMP /stable/profile for each suspect ticker;
+    accept the result only if FMP's ISIN appears in N-PORT (cross-validated).
+
+    Requires FMP_API_KEY in .env for Phase 2. Without it, Phase 1 prints the suspect
+    tickers so you can act on them manually or add a key and re-run.
+    """
+    # ---------- Phase 1: identify suspects via N-PORT comparison ----------
+    print("Loading companies table and isin_patch ...")
+    with get_db(DB_PATH) as conn:
+        seed_all_reference_tables(conn)
+        companies_rows = conn.execute("SELECT ticker, isin FROM companies").fetchall()
+        patch_rows     = conn.execute("SELECT ticker, isin FROM isin_patch").fetchall()
+
+    ticker_to_isin: dict[str, str]      = {r[0]: r[1] for r in companies_rows}
+    patched_by_ticker: dict[str, str]   = {r[0]: r[1] for r in patch_rows}
+    print(f"  {len(companies_rows)} companies, {len(patched_by_ticker)} already in isin_patch")
+
+    # Fetch N-PORT: latest accession per index (deduplicated)
+    registry = load_index_registry()
+    seen_acc: set[str] = set()
+    latest_acc_cik: list[tuple[str, str]] = []
+    for idx in registry.values():
+        cik = idx["cik"]
+        if idx["filings"]:
+            latest_date = max(idx["filings"].keys())
+            acc, _ = idx["filings"][latest_date]
+            if acc not in seen_acc:
+                seen_acc.add(acc)
+                latest_acc_cik.append((acc, cik))
+
+    if not latest_acc_cik:
+        raise RuntimeError("No N-PORT accessions found in nport_accessions table.")
+
+    print(f"\nFetching {len(latest_acc_cik)} latest N-PORT filing(s) ...")
+    nport_isins: set[str] = set()
+    for acc, cik in latest_acc_cik:
+        try:
+            isins = _fetch_nport_all_ec_isins(acc, cik)
+            nport_isins.update(isins)
+            print(f"  {acc}: {len(isins)} EC holdings")
+        except Exception as e:
+            print(f"  {acc}: fetch error — {e}")
+        time.sleep(0.3)
+
+    print(f"\nN-PORT: {len(nport_isins)} unique EC ISINs in latest filing(s)")
+
+    # Suspects: companies whose effective ISIN (patch wins over companies table) is not in N-PORT.
+    # Exclude synthetic placeholders — those are handled by --refresh-isins.
+    suspect_tickers: list[str] = []
+    for ticker, companies_isin in ticker_to_isin.items():
+        if companies_isin.startswith("NOISN_"):
+            continue
+        effective_isin = patched_by_ticker.get(ticker, companies_isin)
+        if effective_isin not in nport_isins:
+            suspect_tickers.append(ticker)
+
+    print(f"Suspect tickers (effective ISIN not in N-PORT): {len(suspect_tickers)}")
+    if not suspect_tickers:
+        print("No suspects — all company ISINs match N-PORT.")
+        return
+
+    for t in sorted(suspect_tickers):
+        eff = patched_by_ticker.get(t, ticker_to_isin[t])
+        print(f"  {t:<10} {eff}")
+
+    # ---------- Phase 2: fix via FMP, validated against N-PORT ----------
+    api_key = _load_fmp_api_key()
+    if not api_key:
+        print(
+            f"\nNo FMP_API_KEY in .env — cannot auto-fix. "
+            f"Add FMP_API_KEY=<key> to .env and re-run --fix-isins."
+        )
+        return
+
+    print(f"\nQuerying FMP for {len(suspect_tickers)} suspect ticker(s) ...")
+    resolved: dict[str, str] = {}   # ticker → FMP ISIN (N-PORT validated)
+    unresolved: list[str]    = []
+    rate_limited             = False
+
+    for i, ticker in enumerate(sorted(suspect_tickers)):
+        if (i + 1) % 5 == 0 or i == 0:
+            print(f"  {i + 1}/{len(suspect_tickers)} ...")
+        try:
+            fmp_isin = _fmp_fetch_isin(ticker, api_key)
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                print(f"\n[ERROR] FMP rate limit hit after {i} requests (HTTP 429).")
+                print("        Create a new free FMP account, update FMP_API_KEY in .env, and re-run.")
+                unresolved.extend(sorted(suspect_tickers)[i:])
+                rate_limited = True
+                break
+            raise
+        if fmp_isin and fmp_isin in nport_isins:
+            resolved[ticker] = fmp_isin
+        else:
+            unresolved.append(ticker)
+        time.sleep(0.05)
+
+    if resolved:
+        isin_by_ticker = {r[0]: r[1] for r in companies_rows}
+        print(f"\nWriting {len(resolved)} corrected ISIN(s) to isin_patch ...")
+        with get_db(DB_PATH) as conn:
+            for ticker, isin in sorted(resolved.items()):
+                conn.execute(
+                    "INSERT OR REPLACE INTO isin_patch (ticker, isin, note) VALUES (?, ?, ?)",
+                    (ticker, isin, "FMP N-PORT validated"),
+                )
+            conn.commit()
+        for ticker, isin in sorted(resolved.items()):
+            old = isin_by_ticker.get(ticker, "?")
+            print(f"  {ticker:<10}  {old}  →  {isin}")
+
+    if unresolved:
+        print(
+            f"\n{len(unresolved)} suspect ticker(s) could not be auto-fixed "
+            f"(FMP returned no ISIN present in N-PORT):"
+        )
+        for t in unresolved:
+            eff = patched_by_ticker.get(t, ticker_to_isin.get(t, "?"))
+            print(f"  {t:<10}  current={eff}")
+
+    print(f"\nDone. {len(resolved)} patched, {len(unresolved)} unresolved.")
+    if resolved:
+        print("Re-run 'python create_universe.py' to rebuild companies table with corrected ISINs.")
 
 
 # ---------------------------------------------------------------------------
@@ -654,9 +967,9 @@ def print_report(
     print(f"\n{'='*55}")
     print(f"COMPANIES TABLE  ({total:,} securities)")
     print(f"{'='*55}")
+    print(f"  ISIN from patch:     {patched:>4}  (FMP / manual override)")
     print(f"  ISIN from SimFin:    {total - synthetic - patched:>4}")
-    print(f"  ISIN from patch:     {patched:>4}  (hardcoded)")
-    print(f"  Synthetic ISIN:      {synthetic:>4}  (need lookup)")
+    print(f"  Synthetic ISIN:      {synthetic:>4}  (run --refresh-isins to resolve)")
     if synthetic:
         synt = companies[companies["isin"].str.startswith("NOISN_")][["ticker","company_name"]].values
         for t, n in synt:
@@ -765,10 +1078,36 @@ def main() -> None:
         "--rebuild-snapshots", action="store_true",
         help="Rebuild universe_snapshots from CSVs + EDGAR only (leaves companies table intact)",
     )
+    parser.add_argument(
+        "--refresh-isins", action="store_true",
+        help="Fetch ISINs from FMP for all tickers in universe_index CSVs and write to isin_patch table",
+    )
+    parser.add_argument(
+        "--fix-isins", action="store_true",
+        help=(
+            "Find companies whose ISINs differ from N-PORT, resolve correct ticker via "
+            "EDGAR EFTS CUSIP search, and write authoritative ISINs to isin_patch"
+        ),
+    )
     args = parser.parse_args()
 
     if args.rebuild_snapshots:
         rebuild_snapshots()
+        return
+
+    if args.refresh_isins:
+        print("=" * 55)
+        print("REFRESH ISINs from FMP")
+        print("=" * 55)
+        refresh_isins()
+        print("\nDone. Re-run without --refresh-isins to rebuild companies table with updated ISINs.")
+        return
+
+    if args.fix_isins:
+        print("=" * 55)
+        print("FIX ISINs via N-PORT + FMP validation")
+        print("=" * 55)
+        fix_isins()
         return
 
     print("=" * 55)
