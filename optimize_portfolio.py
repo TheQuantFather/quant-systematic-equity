@@ -67,7 +67,7 @@ def _ensure_mosek_symlink() -> None:
 _ensure_mosek_symlink()
 
 from config import (
-    OUTPUT_DIR, PARAMS_FILE, UNIVERSE_DB, MODELS_DB, RISK_DB, BARRA_DB, BENCHMARK_DIR,
+    OUTPUT_DIR, PARAMS_FILE, UNIVERSE_DB, MODELS_DB, RISK_DB, BENCHMARK_DIR,
 )
 from utils import get_db
 
@@ -204,11 +204,9 @@ def load_covariance(risk_date: str) -> tuple[np.ndarray, list[str]]:
 
 
 def _latest_barra_date() -> str | None:
-    """Return the most recent snapshot_date in barra.db, or None if unavailable."""
-    if not BARRA_DB.exists():
-        return None
+    """Return the most recent snapshot_date in risk.db (Barra tables), or None if unavailable."""
     try:
-        with get_db(BARRA_DB) as conn:
+        with get_db(RISK_DB) as conn:
             row = conn.execute(
                 "SELECT MAX(snapshot_date) FROM factor_covariance"
             ).fetchone()
@@ -224,11 +222,11 @@ def load_barra_L(barra_date: str, investable: list[str]) -> np.ndarray | None:
     Returns L_barra of shape (N, K+N) such that
         ||L_barra.T @ w||² = w' (X F X' + Δ) w = w' Σ_barra w.
     Drop-in replacement for Cholesky L in all cp.norm(L.T @ w, 2) expressions.
-    Returns None if barra.db has no snapshot for barra_date.
+    Returns None if risk.db has no Barra snapshot for barra_date.
     """
     import zlib as _zlib
     try:
-        with get_db(BARRA_DB) as conn:
+        with get_db(RISK_DB) as conn:
             row_fc = conn.execute(
                 "SELECT factor_names, cov_blob FROM factor_covariance WHERE snapshot_date=?",
                 (barra_date,),
@@ -405,7 +403,9 @@ def _ensure_mosek(strategy: dict) -> None:
 # ── Objective 1: maximize_alpha (benchmark-aware) ─────────────────────────────
 
 def _optimize_alpha(strategy, investable, alpha, b, Sigma, L,
-                    sectors, industries, B_sector, B_ind):
+                    sectors, industries, B_sector, B_ind,
+                    prev_weights_arr: np.ndarray | None = None,
+                    max_turnover: float | None = None):
     c = strategy["constraints"]
     N = len(investable)
 
@@ -447,6 +447,10 @@ def _optimize_alpha(strategy, investable, alpha, b, Sigma, L,
     # Absolute sector constraints (excluded_sectors, min/max_sector_weight)
     _add_sector_constraints(cvx, w, 1.0, sectors, B_sector, c)
 
+    # One-way turnover constraint: sum(|w - w_prev|) / 2 ≤ max_turnover
+    if prev_weights_arr is not None and max_turnover is not None:
+        cvx.append(cp.sum(cp.abs(w - prev_weights_arr)) / 2 <= max_turnover)
+
     prob = cp.Problem(cp.Maximize(alpha @ w), cvx)
     _solve(prob, strategy["solver"])
 
@@ -476,7 +480,9 @@ def _optimize_alpha(strategy, investable, alpha, b, Sigma, L,
 # ── Objective 2: maximize_sharpe (Charnes-Cooper) ────────────────────────────
 
 def _optimize_sharpe(strategy, investable, alpha, Sigma, L,
-                     sectors, industries, B_sector, B_ind):
+                     sectors, industries, B_sector, B_ind,
+                     prev_weights_arr: np.ndarray | None = None,
+                     max_turnover: float | None = None):
     """
     Charnes-Cooper: let y = w/σ_p.
     Maximize alpha @ y  s.t.  ||L.T @ y||₂ ≤ 1, y ≥ 0, per-stock/sector bounds.
@@ -526,6 +532,11 @@ def _optimize_sharpe(strategy, investable, alpha, Sigma, L,
     if max_vol is not None:
         cvx.append(cp.norm(L.T @ y, 2) <= max_vol * t)
 
+    # One-way turnover in Charnes-Cooper space:
+    # sum(|w - w_prev|)/2 ≤ T  ⟺  sum(|y - w_prev·t|) ≤ 2·T·t
+    if prev_weights_arr is not None and max_turnover is not None:
+        cvx.append(cp.sum(cp.abs(y - prev_weights_arr * t)) <= 2 * max_turnover * t)
+
     prob = cp.Problem(cp.Maximize(alpha @ y), cvx)
     _solve(prob, strategy["solver"])
 
@@ -556,7 +567,9 @@ def _optimize_sharpe(strategy, investable, alpha, Sigma, L,
 # ── Objective 3: minimize_variance ───────────────────────────────────────────
 
 def _optimize_min_variance(strategy, investable, b, Sigma, L,
-                           sectors, industries, B_sector, B_ind):
+                           sectors, industries, B_sector, B_ind,
+                           prev_weights_arr: np.ndarray | None = None,
+                           max_turnover: float | None = None):
     c = strategy["constraints"]
     N = len(investable)
 
@@ -587,6 +600,10 @@ def _optimize_min_variance(strategy, investable, b, Sigma, L,
     if max_ind is not None:
         for g in range(len(industries)):
             cvx.append(B_ind[g] @ w <= max_ind)
+
+    # One-way turnover constraint: sum(|w - w_prev|) / 2 ≤ max_turnover
+    if prev_weights_arr is not None and max_turnover is not None:
+        cvx.append(cp.sum(cp.abs(w - prev_weights_arr)) / 2 <= max_turnover)
 
     prob = cp.Problem(cp.Minimize(cp.sum_squares(L.T @ w)), cvx)
     _solve(prob, strategy["solver"])
@@ -653,6 +670,166 @@ def _solve(prob, solver_name: str):
     print(f"status={prob.status}{val}")
     if prob.status not in ("optimal", "optimal_inaccurate"):
         raise RuntimeError(f"Optimization failed: {prob.status}")
+
+
+# ── Backtest entry point ──────────────────────────────────────────────────────
+
+def optimize_for_backtest(
+    alpha_weights: dict[str, float],
+    objective: str,
+    constraints: dict,
+    alpha_date: str,
+    barra_date: str | None,
+    risk_date: str,
+    sp500_isins: list[str],
+    bm_weights: dict[str, float],
+    prev_weights: dict[str, float] | None,
+    max_turnover: float,
+    solver: str = "CLARABEL",
+    min_weight: float = 0.0,
+) -> tuple[dict[str, float], dict] | None:
+    """
+    Single-period optimizer for walk-forward backtest. No file I/O or console output.
+
+    Parameters
+    ----------
+    alpha_weights : model_id → blend weight (from Alpha_Weights sheet)
+    objective     : "maximize_alpha" | "maximize_sharpe" | "minimize_variance"
+    constraints   : dict of constraint name → value (from Constraints sheet)
+    alpha_date    : model snapshot date used to load alpha scores
+    barra_date    : Barra snapshot to use (None → Ledoit-Wolf only)
+    risk_date     : Ledoit-Wolf snapshot date (fallback / universe alignment)
+    sp500_isins   : candidate universe for this period
+    bm_weights    : {isin: weight} for benchmark vector (maximize_alpha only);
+                    pass {} for equal-weight fallback
+    prev_weights  : {isin: weight} from previous period (None → first period,
+                    no turnover constraint applied)
+    max_turnover  : one-way turnover fraction, e.g. 0.10 for 10%
+    solver        : CVXPY solver name
+    min_weight    : minimum position weight; positions below this are zeroed and
+                    the portfolio is renormalised (post-processing, no MIP required)
+
+    Returns
+    -------
+    ({isin: weight}, metrics_dict) or None on failure/infeasibility.
+    """
+    import contextlib
+    import io as _io
+
+    try:
+        # Ledoit-Wolf covariance used for dimension alignment and fallback risk
+        risk_cov, risk_isins = load_covariance(risk_date)
+        risk_isin_idx = {isin: i for i, isin in enumerate(risk_isins)}
+
+        # Investable = S&P 500 ∩ LW risk model; require at least 50 stocks
+        investable = sorted(set(sp500_isins) & set(risk_isins))
+        if len(investable) < 50:
+            return None
+
+        # Alpha scores
+        alpha_lookup = load_blended_alpha(alpha_weights, alpha_date)
+        alpha_arr    = np.array([alpha_lookup.get(isin, 0.0) for isin in investable])
+
+        # Sector metadata for sector constraints
+        meta_df = load_universe_metadata()
+        gics_df = meta_df.set_index("isin")
+
+        # Risk model: Barra (preferred) → Ledoit-Wolf
+        Sigma, L = _covariance_submatrix(risk_cov, risk_isin_idx, investable)
+        used_barra = False
+        if barra_date is not None:
+            buf = _io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                L_barra = load_barra_L(barra_date, investable)
+            if L_barra is not None:
+                L          = L_barra
+                Sigma      = None
+                used_barra = True
+
+        N = len(investable)
+
+        # Benchmark vector (only used in maximize_alpha objective)
+        if bm_weights:
+            b_raw = np.array([bm_weights.get(isin, 0.0) for isin in investable])
+            b_sum = b_raw.sum()
+            b = b_raw / b_sum if b_sum > 1e-10 else np.full(N, 1.0 / N)
+        else:
+            b = np.full(N, 1.0 / N)  # equal-weight fallback
+
+        # Previous-period weights aligned to current investable universe
+        prev_w_arr: np.ndarray | None = None
+        if prev_weights is not None:
+            raw   = np.array([prev_weights.get(isin, 0.0) for isin in investable])
+            total = raw.sum()
+            if total > 1e-10:
+                prev_w_arr = raw / total
+
+        sectors, industries, B_sector, B_ind, _sector_fn, _industry_fn = \
+            _sector_industry_matrices(investable, gics_df)
+
+        # Integer constraints (max_positions, min_position_if_held) require MOSEK and are
+        # operational construction constraints, not alpha/risk constraints.  In the backtest
+        # context the strategy is often evaluated against a different universe than it was
+        # designed for (e.g. Core Active vs S&P 500 instead of Russell 1000), which makes the
+        # MIP geometrically infeasible.  Strip them here; all continuous constraints apply.
+        _INTEGER_CONSTRAINT_KEYS = ("max_positions", "min_position_if_held")
+        relaxed_integer = any(constraints.get(k) is not None for k in _INTEGER_CONSTRAINT_KEYS)
+        effective_constraints = {k: v for k, v in constraints.items()
+                                 if k not in _INTEGER_CONSTRAINT_KEYS}
+
+        strategy = {
+            "constraints": effective_constraints,
+            "solver":      solver,
+            "objective":   objective,
+        }
+
+        # Run optimizer with stdout suppressed (internal prints not relevant in backtest)
+        buf = _io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            if objective == "maximize_sharpe":
+                weights, extra = _optimize_sharpe(
+                    strategy, investable, alpha_arr, Sigma, L,
+                    sectors, industries, B_sector, B_ind,
+                    prev_weights_arr=prev_w_arr, max_turnover=max_turnover,
+                )
+            elif objective == "minimize_variance":
+                weights, extra = _optimize_min_variance(
+                    strategy, investable, b, Sigma, L,
+                    sectors, industries, B_sector, B_ind,
+                    prev_weights_arr=prev_w_arr, max_turnover=max_turnover,
+                )
+            else:  # maximize_alpha
+                weights, extra = _optimize_alpha(
+                    strategy, investable, alpha_arr, b, Sigma, L,
+                    sectors, industries, B_sector, B_ind,
+                    prev_weights_arr=prev_w_arr, max_turnover=max_turnover,
+                )
+
+        result_weights = {
+            isin: float(w) for isin, w in zip(investable, weights) if w > 1e-5
+        }
+
+        # Drop positions below operational minimum and renormalise
+        if min_weight > 0.0:
+            result_weights = {isin: w for isin, w in result_weights.items() if w >= min_weight}
+            total = sum(result_weights.values())
+            if total > 1e-10:
+                result_weights = {isin: w / total for isin, w in result_weights.items()}
+
+        extra.update({
+            "used_barra":        used_barra,
+            "relaxed_integer":   relaxed_integer,
+            "n_positions":       len(result_weights),
+            "alpha_date":        alpha_date,
+            "barra_date":        barra_date,
+            "risk_date":         risk_date,
+        })
+        return result_weights, extra
+
+    except Exception as exc:
+        # Caller decides how to handle (e.g. carry forward previous weights)
+        print(f"  [WARN] optimize_for_backtest failed ({alpha_date}): {exc}")
+        return None
 
 
 # ── Main orchestration ────────────────────────────────────────────────────────

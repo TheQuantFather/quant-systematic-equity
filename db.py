@@ -301,3 +301,73 @@ def get_risk_metadata() -> pd.DataFrame:
             conn,
         )
     return df
+
+
+# ---------------------------------------------------------------------------
+# Benchmark returns
+# ---------------------------------------------------------------------------
+
+@st.cache_data
+def get_benchmark_returns(index_name: str) -> pd.Series:
+    """
+    Daily total_return series for one index from the benchmark_returns table.
+    Returns an empty Series if returns.db does not exist or has no data.
+    """
+    if not RETURNS_DB.exists():
+        return pd.Series(dtype=float, name=index_name)
+    with get_db(RETURNS_DB) as conn:
+        df = pd.read_sql(
+            "SELECT date, total_return FROM benchmark_returns "
+            "WHERE index_name = ? ORDER BY date",
+            conn, params=(index_name,),
+        )
+    if df.empty:
+        return pd.Series(dtype=float, name=index_name)
+    df["date"]         = pd.to_datetime(df["date"])
+    df["total_return"] = pd.to_numeric(df["total_return"], errors="coerce")
+    return df.set_index("date")["total_return"].rename(index_name)
+
+
+@st.cache_data
+def get_available_benchmark_indices() -> list[str]:
+    """Return list of index_name values present in benchmark_returns."""
+    if not RETURNS_DB.exists():
+        return []
+    with get_db(RETURNS_DB) as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT index_name FROM benchmark_returns ORDER BY index_name"
+        ).fetchall()
+    return [r[0] for r in rows]
+
+
+@st.cache_data
+def get_sp500_isins_at_date(snapshot_date: str) -> list[str]:
+    """Return ISINs in the S&P 500 universe at the given snapshot_date."""
+    with get_db(UNIVERSE_DB) as conn:
+        rows = conn.execute(
+            "SELECT isin FROM universe_snapshots "
+            "WHERE snapshot_date = ? AND index_name = 'sp500'",
+            (snapshot_date,),
+        ).fetchall()
+    return [r[0] for r in rows]
+
+
+@st.cache_data
+def get_sp500_weights_at_date(snapshot_date: str) -> dict[str, float]:
+    """
+    Return {isin: weight} for S&P 500 at snapshot_date, normalised to sum=1.
+    Weights come from universe_snapshots.weight (iShares N-PORT-P % weights).
+    """
+    with get_db(UNIVERSE_DB) as conn:
+        rows = conn.execute(
+            "SELECT isin, weight FROM universe_snapshots "
+            "WHERE snapshot_date = ? AND index_name = 'sp500' AND weight IS NOT NULL",
+            (snapshot_date,),
+        ).fetchall()
+    if not rows:
+        return {}
+    raw   = {r[0]: float(r[1]) for r in rows}
+    total = sum(raw.values())
+    if total <= 0:
+        return {}
+    return {isin: w / total for isin, w in raw.items()}

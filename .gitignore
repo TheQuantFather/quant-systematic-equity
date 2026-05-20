@@ -87,8 +87,8 @@ logs/
 local_settings.py
 /site
 
-# ── Local utilities (not part of core pipeline) ───────────────────────────────
-degiro_orders.py
+# ── Exploratory scripts (not part of core pipeline) ──────────────────────────
+exploratory/
 
 # ── License files (MOSEK kept at ~/mosek/mosek.lic, not in source control) ──
 *.lic

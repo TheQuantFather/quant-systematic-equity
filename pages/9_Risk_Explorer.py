@@ -3,7 +3,7 @@
 
 Supports two risk models selectable from the sidebar:
   • Ledoit-Wolf (risk.db)     — sample covariance with shrinkage
-  • Barra Factor Model (barra.db) — Σ = X F X' + Δ, 29-factor decomposition
+  • Barra Factor Model (risk.db) — Σ = X F X' + Δ, 29-factor decomposition
 
 Shared tabs: Market Overview, Correlation Explorer, Stock Deep Dive, Risk vs Factors
 Barra-only tab: Factor Analysis (factor vols, covariance, systematic/idio split)
@@ -21,11 +21,10 @@ import plotly.graph_objects as go
 import streamlit as st
 from utils import get_db, inject_css
 from config import (
-    RISK_DB as _RISK_DB_PATH, BARRA_DB as _BARRA_DB_PATH,
+    RISK_DB as _RISK_DB_PATH,
     UNIVERSE_DB as _UNIV_DB_PATH, MODELS_DB as _MODELS_DB_PATH,
     FACTORS_REF, MODELS_REF,
-    BARRA_GROUPS,
-    BARRA_STYLE_IDS, BARRA_FUNDAMENTAL_IDS,
+    BARRA_SECTORS,
 )
 
 st.set_page_config(page_title="Risk Explorer", layout="wide")
@@ -34,15 +33,29 @@ st.title("Risk Explorer")
 
 # String paths (this file used str() on all paths previously)
 RISK_DB   = str(_RISK_DB_PATH)
-BARRA_DB  = str(_BARRA_DB_PATH)
+BARRA_DB  = str(_RISK_DB_PATH)   # Barra tables now live in risk.db
 UNIV_DB   = str(_UNIV_DB_PATH)
 MODELS_DB = str(_MODELS_DB_PATH)
 
-# Factor group slices derived from config (avoids duplicating the numbers here)
-_SECTOR_COLS  = BARRA_GROUPS["Sector"]
-_STYLE_COLS   = BARRA_GROUPS["Style"]
-_BETA_COL     = BARRA_GROUPS["Beta"]
-_FUND_COLS    = BARRA_GROUPS["Fundamental"]
+# Load Barra factor IDs from reference CSV (single source of truth)
+_ref_csv = pd.read_csv(str(FACTORS_REF))
+_STYLE_IDS = set(
+    _ref_csv[_ref_csv["barra_factor_type"] == "style"]["factor_id"].tolist()
+)
+_FUND_IDS = set(
+    _ref_csv[_ref_csv["barra_factor_type"] == "fundamental"]["factor_id"].tolist()
+)
+_N_SECTOR = len(BARRA_SECTORS)
+_N_STYLE  = len(_STYLE_IDS)
+_N_BETA   = 1
+_N_FUND   = len(_FUND_IDS)
+
+# Factor group slices into the K-length Barra factor vector
+_SECTOR_COLS = slice(0, _N_SECTOR)
+_STYLE_COLS  = slice(_N_SECTOR, _N_SECTOR + _N_STYLE)
+_BETA_COL    = _N_SECTOR + _N_STYLE
+_FUND_COLS   = slice(_N_SECTOR + _N_STYLE + _N_BETA,
+                     _N_SECTOR + _N_STYLE + _N_BETA + _N_FUND)
 
 _GROUP_LABELS = {
     "Sector":      _SECTOR_COLS,
@@ -50,9 +63,6 @@ _GROUP_LABELS = {
     "Beta":        _BETA_COL,
     "Fundamental": _FUND_COLS,
 }
-
-_STYLE_IDS = set(BARRA_STYLE_IDS)
-_FUND_IDS  = set(BARRA_FUNDAMENTAL_IDS)
 
 def _factor_group(fid: str) -> str:
     if fid.startswith("sec_"):   return "Sector"
@@ -63,7 +73,7 @@ def _factor_group(fid: str) -> str:
 
 @st.cache_data
 def load_factor_returns() -> pd.DataFrame:
-    with get_db(_BARRA_DB_PATH) as conn:
+    with get_db(_RISK_DB_PATH) as conn:
         df = pd.read_sql(
             "SELECT trade_date, factor_id, factor_return FROM factor_returns ORDER BY trade_date",
             conn,
@@ -172,7 +182,12 @@ def lw_load_matrix(data_date: str) -> tuple[np.ndarray, list[str]]:
 # ---------------------------------------------------------------------------
 
 def barra_available() -> bool:
-    return _BARRA_DB_PATH.exists()
+    try:
+        with get_db(_RISK_DB_PATH) as conn:
+            count = conn.execute("SELECT COUNT(*) FROM factor_covariance").fetchone()[0]
+            return count > 0
+    except Exception:
+        return False
 
 
 @st.cache_data(ttl=300)
@@ -821,7 +836,7 @@ if tab_barra is not None:
 
         fr = load_factor_returns()
         if fr.empty:
-            st.info("No factor return data in barra.db.")
+            st.info("No factor return data in risk.db.")
         else:
             GROUP_COLORS = {
                 "Sector":      "#4C78A8",

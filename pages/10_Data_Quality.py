@@ -15,7 +15,7 @@ import streamlit as st
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from config import (
     UNIVERSE_DB, RETURNS_DB, FACTORS_DB, MODELS_DB,
-    CONSTITUENTS_DB, RISK_DB, BARRA_DB,
+    CONSTITUENTS_DB, RISK_DB,
     FACTORS_REF, MODELS_REF,
 )
 from utils import get_db, inject_css
@@ -39,7 +39,7 @@ def _db_meta() -> pd.DataFrame:
         "factors":      FACTORS_DB,
         "models":       MODELS_DB,
         "risk":         RISK_DB,
-        "barra":        BARRA_DB,
+        "barra":        RISK_DB,
     }
     rows = []
     for name, path in dbs.items():
@@ -71,7 +71,7 @@ def _snapshot_coverage() -> pd.DataFrame:
             "FROM models GROUP BY data_date ORDER BY data_date",
             conn,
         )
-    with get_db(BARRA_DB) as conn:
+    with get_db(RISK_DB) as conn:
         b = pd.read_sql(
             "SELECT snapshot_date AS data_date, COUNT(DISTINCT security_id) AS barra "
             "FROM factor_exposures GROUP BY snapshot_date ORDER BY snapshot_date",
@@ -162,8 +162,8 @@ def _model_coverage_by_date() -> pd.DataFrame:
 
 @st.cache_data(ttl=300)
 def _barra_snapshot_stats() -> pd.DataFrame:
-    """Per-snapshot: n_stocks, avg/max idio_var from barra.db factor snapshots."""
-    with get_db(BARRA_DB) as conn:
+    """Per-snapshot: n_stocks, avg/max idio_var from risk.db Barra factor snapshots."""
+    with get_db(RISK_DB) as conn:
         exp = pd.read_sql(
             "SELECT snapshot_date, COUNT(DISTINCT security_id) AS n_stocks "
             "FROM factor_exposures GROUP BY snapshot_date ORDER BY snapshot_date",
@@ -373,7 +373,7 @@ with tab_health:
         "factors":      (FACTORS_DB,       ["factors"]),
         "models":       (MODELS_DB,        ["models"]),
         "risk":         (RISK_DB,          ["covariance_matrix"]),
-        "barra":        (BARRA_DB,         ["factor_returns", "factor_covariance", "idiosyncratic_vars", "factor_exposures"]),
+        "barra":        (RISK_DB,         ["factor_returns", "factor_covariance", "idiosyncratic_vars", "factor_exposures"]),
     }
 
     for db_name, (db_path, tables) in db_map.items():

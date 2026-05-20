@@ -50,6 +50,15 @@ CREATE TABLE IF NOT EXISTS returns (
 CREATE INDEX IF NOT EXISTS idx_returns_isin ON returns (isin);
 CREATE INDEX IF NOT EXISTS idx_returns_date ON returns (date);
 
+CREATE TABLE IF NOT EXISTS benchmark_returns (
+    index_name   TEXT NOT NULL,
+    date         TEXT NOT NULL,
+    close        REAL,
+    total_return REAL,
+    PRIMARY KEY (index_name, date)
+);
+CREATE INDEX IF NOT EXISTS idx_bench_date ON benchmark_returns (date);
+
 CREATE TABLE IF NOT EXISTS metadata (
     key   TEXT PRIMARY KEY,
     value TEXT
@@ -178,6 +187,88 @@ def update_from_yahoo(
     )
     conn.commit()
     print(f"\nYahoo update complete — {total_inserted:,} rows | {errors} errors")
+
+
+# ---------------------------------------------------------------------------
+# Benchmark index returns
+# ---------------------------------------------------------------------------
+
+def update_benchmark_returns(
+    conn: sqlite3.Connection,
+    history_start: str = HISTORY_START,
+) -> None:
+    """
+    Pull daily total returns for benchmark ETF proxies from Yahoo Finance and
+    store in benchmark_returns keyed by index_name (not ticker).
+
+    ETF proxies are read from universe.db index_registry; entries with no
+    etf_ticker are skipped.  Uses adj_close for total return (same convention
+    as the returns table).
+    """
+    today_str = date.today().strftime("%Y-%m-%d")
+
+    if not UNIVERSE_DB.exists():
+        print("  [benchmarks] universe.db not found — skipping")
+        return
+
+    with get_db(UNIVERSE_DB) as uc:
+        registry = uc.execute(
+            "SELECT index_name, etf_ticker FROM index_registry WHERE etf_ticker IS NOT NULL"
+        ).fetchall()
+
+    if not registry:
+        print("  [benchmarks] index_registry is empty — nothing to fetch")
+        return
+
+    per_index_last: dict[str, str] = dict(conn.execute(
+        "SELECT index_name, MAX(date) FROM benchmark_returns GROUP BY index_name"
+    ).fetchall())
+
+    print(f"  Updating {len(registry)} benchmark index(es) ...")
+    total_inserted = 0
+
+    for index_name, etf_ticker in sorted(registry):
+        last     = per_index_last.get(index_name)
+        from_str = last if last else history_start
+
+        if from_str > today_str:
+            continue
+
+        raw_rows = _yahoo_ticker(etf_ticker, from_str, today_str, retries=3)
+        if raw_rows is None:
+            print(f"  [{index_name}] fetch failed for {etf_ticker}")
+            continue
+        if not raw_rows:
+            continue
+
+        rows: list[tuple] = []
+        for j, row in enumerate(raw_rows):
+            d, c, ac = row[1], row[5], row[6]
+            if j == 0:
+                tr = None   # anchor row — INSERT OR IGNORE keeps existing if present
+            else:
+                prev_ac = raw_rows[j - 1][6]
+                tr = (
+                    float(ac) / float(prev_ac) - 1
+                    if prev_ac and prev_ac > 0 and ac and ac > 0
+                    else None
+                )
+            rows.append((index_name, d, float(c) if c else None, tr))
+
+        conn.executemany(
+            "INSERT OR IGNORE INTO benchmark_returns (index_name, date, close, total_return) "
+            "VALUES (?, ?, ?, ?)",
+            rows,
+        )
+        new_count = sum(1 for r in rows if r[1] > from_str)
+        total_inserted += new_count
+        if new_count:
+            print(f"  [{index_name:30s}] {etf_ticker:6s}  +{new_count} rows")
+
+        time.sleep(YAHOO_DELAY)
+
+    conn.commit()
+    print(f"  Benchmark update complete — {total_inserted:,} new rows")
 
 
 def _wait_for_yahoo(max_wait_minutes: int = 30) -> None:
@@ -453,6 +544,8 @@ def main():
     try:
         if args.update:
             update_from_yahoo(conn, history_start=args.history_start)
+            print("\nUpdating benchmark index returns ...")
+            update_benchmark_returns(conn, history_start=args.history_start)
 
         if args.check or args.update:
             run_checks(conn)

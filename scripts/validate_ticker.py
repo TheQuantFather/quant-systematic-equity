@@ -50,6 +50,14 @@ sorted_periods = sorted(quarters.keys(), key=lambda x: (x[0], period_order.get(x
 recent_4 = sorted_periods[:4]
 latest_q = sorted_periods[0] if sorted_periods else None
 
+# Derive Operating Income (80C2558A) per quarter where absent.
+# Identity: Operating Income = Pretax Income (958D2281) − Non-Operating Income (BF18D350).
+for period in sorted_periods:
+    q = quarters[period]
+    if "80C2558A" not in q and "958D2281" in q:
+        non_op = q.get("BF18D350") or 0.0
+        q["80C2558A"] = q["958D2281"] - non_op
+
 print(f"Periods in DB: {[(fy, fp) for fy, fp in sorted_periods[:8]]}")
 print(f"LTM from:      {recent_4}\n")
 

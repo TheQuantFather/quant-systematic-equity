@@ -25,19 +25,19 @@ Optimizer integration (optimize_portfolio.py):
   Stacked-L: L_barra = vstack([L_F.T @ X.T, diag(√δ)]).T (shape N×(K+N))
   Drop-in for Ledoit-Wolf L in  cp.norm(L_barra.T @ w, 2).
 
-Output  data/barra.db:
+Output  data/risk.db (Barra tables, alongside Ledoit-Wolf covariance_matrix):
   factor_returns     trade_date  × factor_id × factor_return  (all trading days)
-  factor_covariance  snapshot_date × K×K blob  (weekly snapshots)
+  factor_covariance  snapshot_date × K×K blob
   idiosyncratic_vars snapshot_date × security_id × idio_var
   factor_exposures   snapshot_date × security_id × factor_id × exposure
 
 Update frequency:
   Estimation requires daily returns (stored permanently in factor_returns).
-  Portfolio covariance snapshot updated weekly — sufficient for quarterly
-  rebalancing. For higher-frequency strategies, re-run more often.
+  Historical snapshots align with factors/models quarterly dates.
+  Run weekly (no-arg or --date) for current-period portfolio construction.
 
 Usage:
-  python create_barra.py --backfill          # weekly snapshots from 2020-01-01
+  python create_barra.py --backfill          # all 28 quarterly snapshot dates
   python create_barra.py --date 2026-05-01   # single snapshot for given date
   python create_barra.py                     # snapshot for most-recent Friday
 """
@@ -56,15 +56,27 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).parent))
 from config import (
-    RETURNS_DB, FACTORS_DB, UNIVERSE_DB, BARRA_DB,
+    RETURNS_DB, FACTORS_DB, UNIVERSE_DB, RISK_DB, FACTORS_REF,
     HL_FACTOR_COV, HL_IDIO, NW_LAGS, VRA_WINDOW,
     SHRINK_IDIO, EIGENFLOOR, VRA_MIN, VRA_MAX, MIN_STOCKS,
-    BARRA_BACKFILL_START as BACKFILL_START,
     BARRA_SECTORS as SECTORS,
-    BARRA_STYLE_IDS as STYLE_IDS,
-    BARRA_FUNDAMENTAL_IDS as FUNDAMENTAL_IDS,
 )
 from utils import get_db, winsorized_zscore
+
+# ---------------------------------------------------------------------------
+# Load Barra factor IDs from reference CSV (order = barra_factor_order column)
+# ---------------------------------------------------------------------------
+_ref = pd.read_csv(str(FACTORS_REF))
+_style_ref = (
+    _ref[_ref["barra_factor_type"] == "style"]
+    .sort_values("barra_factor_order")
+)
+_fund_ref = (
+    _ref[_ref["barra_factor_type"] == "fundamental"]
+    .sort_values("barra_factor_order")
+)
+STYLE_IDS       = _style_ref["factor_id"].tolist()
+FUNDAMENTAL_IDS = _fund_ref["factor_id"].tolist()
 
 # Ordered list used to index all K×K matrices and exposure vectors
 FACTOR_NAMES = (
@@ -75,13 +87,35 @@ FACTOR_NAMES = (
 )
 K = len(FACTOR_NAMES)  # 29
 
+
+def _get_snapshot_dates() -> list[str]:
+    """Discover snapshot dates from factors.db — snapshot_dates table, then factors table."""
+    try:
+        with get_db(FACTORS_DB) as conn:
+            rows = conn.execute(
+                "SELECT data_date FROM snapshot_dates ORDER BY data_date"
+            ).fetchall()
+            if rows:
+                return [r[0] for r in rows]
+            # Fallback: derive from factors table itself (handles pre-snapshot_dates era)
+            rows = conn.execute(
+                "SELECT DISTINCT data_date FROM factors ORDER BY data_date"
+            ).fetchall()
+            if rows:
+                return [r[0] for r in rows]
+    except Exception:
+        pass
+    raise RuntimeError(
+        "No snapshot dates found in factors.db. Run create_factors.py first."
+    )
+
 _SECTOR_IDX = {s: i for i, s in enumerate(SECTORS)}
 
 
 # ── DB schema ──────────────────────────────────────────────────────────────────
 
 def _init_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(str(BARRA_DB))
+    conn = sqlite3.connect(str(RISK_DB))
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS factor_returns (
             trade_date    TEXT NOT NULL,
@@ -465,7 +499,7 @@ def _build_and_save_snapshot(
     betas_wide: pd.DataFrame,
     conn: sqlite3.Connection,
 ) -> None:
-    """Compute full Barra model for one snapshot date and write to barra.db."""
+    """Compute full Barra model for one snapshot date and write to risk.db."""
     snap_ts = pd.Timestamp(snap_date_str)
 
     # Slice factor returns history up to snapshot
@@ -563,18 +597,6 @@ def _most_recent_friday() -> str:
     return d.strftime("%Y-%m-%d")
 
 
-def _weekly_fridays(start_str: str, end_str: str) -> list[str]:
-    start = datetime.strptime(start_str, "%Y-%m-%d").date()
-    end   = datetime.strptime(end_str,   "%Y-%m-%d").date()
-    # Advance to first Friday ≥ start
-    d = start
-    while d.weekday() != 4:
-        d += timedelta(days=1)
-    fridays = []
-    while d <= end:
-        fridays.append(d.strftime("%Y-%m-%d"))
-        d += timedelta(weeks=1)
-    return fridays
 
 
 # ── Main entry point ───────────────────────────────────────────────────────────
@@ -646,7 +668,7 @@ if __name__ == "__main__":
     grp = parser.add_mutually_exclusive_group()
     grp.add_argument(
         "--backfill", action="store_true",
-        help=f"Compute weekly snapshots from {BACKFILL_START} to today.",
+        help="Compute snapshots for all dates in factors.db snapshot_dates table.",
     )
     grp.add_argument(
         "--date", metavar="YYYY-MM-DD", action="append", dest="dates",
@@ -655,9 +677,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.backfill:
-        today = date.today().strftime("%Y-%m-%d")
-        dates = _weekly_fridays(BACKFILL_START, today)
-        print(f"Backfill: {len(dates)} weekly snapshots from {dates[0]} to {dates[-1]}")
+        dates = _get_snapshot_dates()
+        print(f"Backfill: {len(dates)} snapshots from {dates[0]} to {dates[-1]}")
     elif args.dates:
         dates = sorted(set(args.dates))
     else:
