@@ -22,8 +22,7 @@ CONSTITUENTS_DB  = DATA_DIR / "constituents.db"
 RETURNS_DB       = DATA_DIR / "returns.db"
 FACTORS_DB       = DATA_DIR / "factors.db"
 MODELS_DB        = DATA_DIR / "models.db"
-RISK_DB          = DATA_DIR / "risk.db"
-BARRA_DB         = DATA_DIR / "barra.db"
+RISK_DB          = DATA_DIR / "risk.db"   # Ledoit-Wolf covariance + Barra tables
 
 # ---------------------------------------------------------------------------
 # Reference / mapping files
@@ -93,11 +92,12 @@ VRA_MIN       = 0.25     # lower clip for VRA bias statistic B²
 VRA_MAX       = 4.00     # upper clip for B²
 MIN_STOCKS    = 50       # minimum stocks per day to run cross-sectional regression
 
-BARRA_BACKFILL_START = "2020-01-01"
-
 # ---------------------------------------------------------------------------
-# Barra factor definitions — order determines column index in the X matrix;
-# do not reorder without rebuilding barra.db.
+# Barra sector definitions — order determines column indices 0-10 in X matrix.
+# Style and fundamental factor IDs are loaded dynamically from FACTORS_REF
+# (barra_factor_type / barra_factor_order columns) in create_barra.py and
+# pages/9_Risk_Explorer.py.  Do not reorder BARRA_SECTORS without rebuilding
+# risk.db (Barra tables).
 # ---------------------------------------------------------------------------
 
 BARRA_SECTORS = [
@@ -105,34 +105,3 @@ BARRA_SECTORS = [
     "Energy", "Financials", "Health Care", "Industrials",
     "Information Technology", "Materials", "Real Estate", "Utilities",
 ]
-
-BARRA_STYLE_IDS = ["LMC11234", "ABC11234", "XYZ77890", "RVL11234", "W52H1234"]
-
-BARRA_FUNDAMENTAL_IDS = [
-    "TUV44567",  # Earnings Yield
-    "WXY77890",  # Book-to-Price
-    "JKL44556",  # ROE
-    "ABC12345",  # Gross Margin
-    "DEF67890",  # Operating Margin
-    "BCD44567",  # Leverage
-    "EFG77890",  # Debt-to-Assets
-    "OPQ77890",  # Revenue Growth
-    "LMN44567",  # Earnings Growth
-    "KLM44567",  # Asset Turnover
-    "YZA11234",  # Current Ratio
-    "FCM11234",  # FCF Margin
-]
-
-# Derived slice indices into the K-length Barra factor vector
-_N_SECTOR = len(BARRA_SECTORS)           # 11
-_N_STYLE  = len(BARRA_STYLE_IDS)         # 5
-_N_BETA   = 1
-_N_FUND   = len(BARRA_FUNDAMENTAL_IDS)   # 12
-
-BARRA_GROUPS = {
-    "Sector":      slice(0, _N_SECTOR),
-    "Style":       slice(_N_SECTOR, _N_SECTOR + _N_STYLE),
-    "Beta":        _N_SECTOR + _N_STYLE,   # integer index — single factor
-    "Fundamental": slice(_N_SECTOR + _N_STYLE + _N_BETA,
-                         _N_SECTOR + _N_STYLE + _N_BETA + _N_FUND),
-}

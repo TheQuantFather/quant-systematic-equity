@@ -162,6 +162,13 @@ def load_constituent_data() -> dict:
         Q4 = FY − Q1 − Q2 − Q3
     Balance sheet items (Stock kind) are not derived — the 10-K already stores
     them directly as fiscal_period='Q4'.
+
+    Annual-only filers: SimFin annual-only coverage (e.g. LAZ, ELV, LH, COR)
+    stores income/CF as fiscal_period='FY' with no Q1/Q2/Q3 breakdown.  Their
+    Q4 balance-sheet rows ARE loaded.  After Q4 derivation, FY Flow values are
+    assigned directly to the Q4 bucket.  select_ltm_data() then detects the
+    annual-only pattern (consecutive Q4 sort-key gaps ≥10) and uses the single
+    most-recent annual period as the full LTM rather than summing multiple years.
     """
     ref = pd.read_csv(CONSTITUENTS_REF)
     id_to_name   = dict(zip(ref['constituent_id'], ref['constituent_name']))
@@ -267,6 +274,16 @@ def load_constituent_data() -> dict:
         q3 = sid_data.get((fy, 'Q3'), {})
         if not (q1 and q2 and q3):
             continue  # can't derive Q4 without all three prior quarters
+        # Temporal guard: Q1/Q2/Q3 must be published before the annual filing.
+        # If any were published after the annual, they belong to the next fiscal year
+        # (common for January/February fiscal-year-end companies like NVDA, WMT, HD
+        # where EDGAR labels the next FY's quarters under the same fiscal_year as the
+        # annual — e.g. NVDA FY2025 annual pub=Feb-2025 vs FY2026 Q1 pub=May-2025).
+        fy_pub = row.publish_date
+        if (q1.get('_publish_date', pd.Timestamp.max) > fy_pub or
+                q2.get('_publish_date', pd.Timestamp.max) > fy_pub or
+                q3.get('_publish_date', pd.Timestamp.max) > fy_pub):
+            continue
         v1 = q1.get(name)
         v2 = q2.get(name)
         v3 = q3.get(name)
@@ -285,6 +302,46 @@ def load_constituent_data() -> dict:
 
     if derived_q4:
         print(f"  [Q4 derivation] derived {derived_q4:,} Q4 Flow values from FY − (Q1+Q2+Q3)")
+
+    # Annual-only filers: companies whose income/cash-flow is stored only as
+    # fiscal_period='FY' (no Q1/Q2/Q3 quarterly breakdown — e.g. SimFin
+    # annual-only coverage for LAZ, ELV, LH, COR, etc.).  Their Q4 balance
+    # sheet rows ARE present in the quarterly data (data[sid][(fy, 'Q4')]),
+    # but Flow items are absent.  Assign FY Flow values directly to the Q4
+    # bucket so that select_ltm_data() can surface them.
+    #
+    # Restricted to companies with NO Q1/Q2/Q3 data in ANY year — this
+    # excludes companies that have quarterly coverage for recent years but
+    # only annual coverage for older years (mixing would overstate LTM by
+    # summing an annual Q4 bucket together with quarterly periods).
+    annual_only_sids = {
+        sid for sid, qdata in data.items()
+        if not any(fp in ('Q1', 'Q2', 'Q3') for (_, fp) in qdata)
+    }
+    annual_direct = 0
+    for row in df_fy.itertuples(index=False):
+        sid  = row.security_id
+        fy   = row.fiscal_year
+        name = row.constituent_name
+        if id_to_kind.get(row.constituent_id) != 'Flow':
+            continue
+        if sid not in annual_only_sids:
+            continue
+        sid_data = data[sid]
+        # Skip if this specific Flow constituent already present in Q4
+        if sid_data.get((fy, 'Q4'), {}).get(name) is not None:
+            continue
+        q4_key = (fy, 'Q4')
+        if q4_key not in sid_data:
+            continue  # no balance-sheet anchor year — skip
+        bucket = sid_data[q4_key]
+        bucket[name] = row.constituent_value
+        if row.publish_date > bucket['_publish_date']:
+            bucket['_publish_date'] = row.publish_date
+        annual_direct += 1
+
+    if annual_direct:
+        print(f"  [annual-only] assigned {annual_direct:,} FY Flow values to Q4 for annual-only filers")
 
     _fix_shares_units(data)
     print(f"Loaded quarterly constituent data for {len(data):,} companies")
@@ -454,10 +511,20 @@ def select_ltm_data(
     """
     snap_ts = pd.Timestamp(snapshot)
 
-    # Keep only quarters published on or before snapshot
+    def _has_flow(bucket: dict) -> bool:
+        """True if the bucket contains at least one Flow item (not BS-only)."""
+        return any(
+            not k.startswith('_') and v is not None and kind_map.get(k, 'Flow') == 'Flow'
+            for k, v in bucket.items()
+        )
+
+    # Keep only quarters published on or before snapshot that have at least one
+    # Flow item.  BS-only buckets (e.g. orphaned EDGAR annual balance-sheet rows
+    # whose Q4 derivation was skipped) are excluded so they cannot overwrite
+    # balance-sheet values from a complete prior-year quarter in build_ltm.
     available = [
         q for q in sid_data.values()
-        if q['_publish_date'] <= snap_ts
+        if q['_publish_date'] <= snap_ts and _has_flow(q)
     ]
     if not available:
         return {}, {}
@@ -465,8 +532,25 @@ def select_ltm_data(
     # Sort ascending by sort_key so tail(4) = most recent
     available.sort(key=lambda q: q['_sort_key'])
 
-    recent_4 = available[-4:]
-    prior_4  = available[-8:-4] if len(available) >= 8 else []
+    # Annual-only filers (e.g. SimFin annual coverage): all consecutive periods
+    # are spaced ≥10 sort-key units apart (one Q4 per fiscal year, gap = 10).
+    # Normal quarterly gaps are 1 (within year) or 7 (Q4→Q1 cross-year).
+    # For these, the single most-recent period already represents a full LTM;
+    # summing multiple annual Q4 periods would overstate by N×.
+    is_annual_only = (
+        len(available) >= 2 and
+        all(
+            available[i + 1]['_sort_key'] - available[i]['_sort_key'] >= 10
+            for i in range(len(available) - 1)
+        )
+    )
+
+    if is_annual_only:
+        recent_4 = available[-1:]
+        prior_4  = available[-2:-1] if len(available) >= 2 else []
+    else:
+        recent_4 = available[-4:]
+        prior_4  = available[-8:-4] if len(available) >= 8 else []
 
     def _check_consecutive(quarters: list, label: str) -> None:
         """Warn if the 4 quarters are not consecutive.
@@ -502,6 +586,16 @@ def select_ltm_data(
                     and q.get('Revenue') is not None
                     and q.get('Cost of Revenue') is not None):
                 q = {**q, 'Gross Profit': q['Revenue'] - q['Cost of Revenue']}
+
+            # Derive Operating Income when absent.
+            # Identity: Operating Income = Pretax Income − Non-Operating Income.
+            # Some XBRL filers (e.g. LLY, banks) omit the OperatingIncomeLoss tag
+            # but always report Pretax.  When Non-Operating Income is also absent we
+            # treat it as zero — a minor approximation but avoids NaN propagation.
+            if (q.get('Operating Income (Loss)') is None
+                    and q.get('Pretax Income (Loss)') is not None):
+                non_op = q.get('Non-Operating Income (Loss)') or 0.0
+                q = {**q, 'Operating Income (Loss)': q['Pretax Income (Loss)'] - non_op}
 
             for name, val in q.items():
                 if name.startswith('_') or val is None:
@@ -548,25 +642,30 @@ def get_close(
 # ---------------------------------------------------------------------------
 
 def compute_quality_factors(cdata: dict) -> dict:
-    """15 quality factors from income, balance, and cash flow data."""
+    """19 quality factors from income, balance, and cash flow data."""
     f = {}
-    revenue    = cdata.get('Revenue')
-    cost_rev   = cdata.get('Cost of Revenue')
-    gross_p    = cdata.get('Gross Profit') or (
+    revenue      = cdata.get('Revenue')
+    cost_rev     = cdata.get('Cost of Revenue')
+    gross_p      = cdata.get('Gross Profit') or (
         (revenue - cost_rev) if (revenue is not None and cost_rev is not None) else None
     )
-    op_income  = cdata.get('Operating Income (Loss)')
-    net_income = cdata.get('Net Income')
-    equity     = cdata.get('Total Equity')
-    assets     = cdata.get('Total Assets')
-    op_cf      = cdata.get('Net Cash from Operating Activities')
-    capex      = cdata.get('Change in Fixed Assets & Intangibles')
-    cur_assets = cdata.get('Total Current Assets')
-    cur_liab   = cdata.get('Total Current Liabilities')
-    short_debt = cdata.get('Short Term Debt') or 0  # many firms report no ST debt; treat as zero
-    long_debt  = cdata.get('Long Term Debt')
-    total_liab = cdata.get('Total Liabilities')
-    wc_change  = cdata.get('Change in Working Capital')
+    op_income    = cdata.get('Operating Income (Loss)')
+    net_income   = cdata.get('Net Income')
+    equity       = cdata.get('Total Equity')
+    assets       = cdata.get('Total Assets')
+    op_cf        = cdata.get('Net Cash from Operating Activities')
+    capex        = cdata.get('Change in Fixed Assets & Intangibles')
+    cur_assets   = cdata.get('Total Current Assets')
+    cur_liab     = cdata.get('Total Current Liabilities')
+    short_debt   = cdata.get('Short Term Debt') or 0  # many firms report no ST debt; treat as zero
+    long_debt    = cdata.get('Long Term Debt')
+    total_liab   = cdata.get('Total Liabilities')
+    wc_change    = cdata.get('Change in Working Capital')
+    interest_exp = cdata.get('Interest Expense, Net')
+    invest_inc   = cdata.get('Investment Income, Interest')
+    pretax       = cdata.get('Pretax Income (Loss)')
+    tax_exp      = cdata.get('Income Tax (Expense) Benefit, Net')
+    cash         = cdata.get('Cash, Cash Equivalents & Short Term Investments') or 0
 
     if revenue is not None and gross_p is not None and revenue != 0:
         f['Gross Margin'] = gross_p / revenue
@@ -583,7 +682,9 @@ def compute_quality_factors(cdata: dict) -> dict:
     if op_cf is not None and net_income is not None and net_income != 0:
         f['Operating Cash Flow Ratio'] = op_cf / net_income
     if op_cf is not None and capex is not None and revenue is not None and revenue != 0:
-        f['FCF Margin'] = (op_cf - capex) / revenue
+        # capex (Change in Fixed Assets & Intangibles) is stored as negative (cash outflow);
+        # op_cf + capex correctly subtracts it (op_cf - |capex|).
+        f['FCF Margin'] = (op_cf + capex) / revenue
     if op_cf is not None and revenue is not None and revenue != 0:
         f['Cash Conversion Quality'] = op_cf / revenue
     if cur_assets is not None and cur_liab is not None and cur_liab != 0:
@@ -600,13 +701,48 @@ def compute_quality_factors(cdata: dict) -> dict:
         f['Working Capital Efficiency'] = wc_change / revenue
     if capex is not None and revenue is not None and revenue > 0 and abs(capex) > 0:
         f['Capex Intensity'] = float(np.log(abs(capex) / revenue))  # log-transform; lower = capital-light
+
+    # Interest Coverage: edgartools stores InterestExpense as negative (expense sign, weight=-1).
+    # SimFin stores it as a positive net expense (already nets against interest income).
+    # We distinguish by sign: negative → EDGAR gross expense; positive → SimFin net expense.
+    # For EDGAR we compute net = abs(expense) − investment_income; skip if net ≤ 0 (net earner).
+    if interest_exp is not None and op_income is not None:
+        if interest_exp < 0:
+            # EDGAR path: gross expense stored negative; invest_inc is positive (or 0 if absent)
+            net_interest = abs(interest_exp) - (invest_inc or 0.0)
+        else:
+            # SimFin path: already net, positive = expense
+            net_interest = interest_exp
+        if net_interest > 0:
+            f['Interest Coverage'] = op_income / net_interest
+
+    # ROIC = NOPAT / Invested Capital; Invested Capital = equity + debt - cash
+    if (op_income is not None and equity is not None and long_debt is not None):
+        if pretax is not None and pretax > 0 and tax_exp is not None:
+            # tax_exp is negative when it's an expense; clamp effective rate to [0, 0.5]
+            t_rate = max(0.0, min(0.5, -tax_exp / pretax))
+        else:
+            t_rate = 0.21  # US statutory fallback for loss-makers or missing tax data
+        nopat = op_income * (1.0 - t_rate)
+        invested_capital = equity + short_debt + long_debt - cash
+        if invested_capital > 0:
+            f['ROIC'] = nopat / invested_capital
+
+    # Accruals Ratio (Sloan 1996): high accruals = earnings not backed by cash = lower quality
+    if net_income is not None and op_cf is not None and assets is not None and assets > 0:
+        f['Accruals Ratio'] = (net_income - op_cf) / assets
+
+    # Gross Profit to Assets (Novy-Marx 2013): gross profitability
+    if gross_p is not None and assets is not None and assets > 0:
+        f['Gross Profit to Assets'] = gross_p / assets
+
     return f
 
 
 def compute_value_factors(
     cdata: dict, isin: str, prices: dict, ref_date: date = None
 ) -> dict:
-    """5 value factors expressed as ratios to market cap, plus EV-to-EBIT."""
+    """7 value factors expressed as ratios to market cap."""
     f = {}
     shares = cdata.get('Shares (Basic)')
     price  = get_close(prices, isin, ref_date=ref_date)
@@ -621,6 +757,11 @@ def compute_value_factors(
     short_debt = cdata.get('Short Term Debt')
     long_debt  = cdata.get('Long Term Debt')
     cash       = cdata.get('Cash, Cash Equivalents & Short Term Investments')
+    # D&A may come from CF statement (+) or IS (-) depending on which was stored last;
+    # abs() makes EV/EBITDA robust to either sign convention.
+    da         = cdata.get('Depreciation & Amortization')
+    dividends  = cdata.get('Dividends Paid')
+
     if net_income is not None:
         f['Earnings Yield'] = net_income / market_cap
     if equity is not None:
@@ -633,11 +774,23 @@ def compute_value_factors(
         ev = market_cap + (short_debt or 0) + (long_debt or 0) - cash
         if ev > 0:
             f['EV-to-EBIT'] = ev / op_income
+
+    # EV/EBITDA: EBITDA = op_income + D&A; require both positive and EV > 0
+    if (cash is not None and op_income is not None and da is not None):
+        ebitda = op_income + abs(da)
+        ev     = market_cap + (short_debt or 0) + (long_debt or 0) - cash
+        if ev > 0 and ebitda > 0:
+            f['EV/EBITDA'] = ev / ebitda
+
+    # Dividend Yield: only for companies that actually paid cash dividends (Dividends Paid < 0)
+    if dividends is not None and dividends < 0:
+        f['Dividend Yield'] = abs(dividends) / market_cap
+
     return f
 
 
 def compute_growth_factors(cdata: dict, cdata_prior: dict) -> dict:
-    """5 YoY growth factors. Earnings/CF growth skipped when prior year is negative."""
+    """7 YoY growth factors. Earnings/CF growth skipped when prior year is negative."""
     f = {}
 
     def yoy(name: str, require_positive_base: bool = False):
@@ -650,15 +803,30 @@ def compute_growth_factors(cdata: dict, cdata_prior: dict) -> dict:
         return (cur - pri) / abs(pri)
 
     for name, kw in [
-        ('Revenue Growth',    {'name': 'Revenue'}),
-        ('Earnings Growth',   {'name': 'Net Income', 'require_positive_base': True}),
-        ('Cash Flow Growth',  {'name': 'Net Cash from Operating Activities', 'require_positive_base': True}),
-        ('Asset Growth',      {'name': 'Total Assets'}),
-        ('Equity Growth',     {'name': 'Total Equity'}),
+        ('Revenue Growth',            {'name': 'Revenue'}),
+        ('Earnings Growth',           {'name': 'Net Income', 'require_positive_base': True}),
+        ('Cash Flow Growth',          {'name': 'Net Cash from Operating Activities', 'require_positive_base': True}),
+        ('Asset Growth',              {'name': 'Total Assets'}),
+        ('Equity Growth',             {'name': 'Total Equity'}),
+        ('Operating Income Growth',   {'name': 'Operating Income (Loss)'}),
     ]:
         v = yoy(**kw)
         if v is not None:
             f[name] = v
+
+    # EBITDA Growth: derive EBITDA = op_income + abs(D&A) for current and prior period
+    def _ebitda(cd: dict) -> Optional[float]:
+        op = cd.get('Operating Income (Loss)')
+        da = cd.get('Depreciation & Amortization')
+        if op is not None and da is not None:
+            return op + abs(da)
+        return None
+
+    cur_ebitda = _ebitda(cdata)
+    pri_ebitda = _ebitda(cdata_prior)
+    if cur_ebitda is not None and pri_ebitda is not None and pri_ebitda != 0:
+        f['EBITDA Growth'] = (cur_ebitda - pri_ebitda) / abs(pri_ebitda)
+
     return f
 
 
@@ -903,6 +1071,12 @@ def setup_factors_db(conn: sqlite3.Connection, clean: bool = False) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_f_date_fid ON factors (data_date, factor_id)"
     )
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS snapshot_dates (
+            data_date  TEXT PRIMARY KEY,
+            created_at TEXT NOT NULL
+        )
+    """)
     conn.commit()
 
 
@@ -1059,6 +1233,12 @@ def main():
                 constituent_data, kind_map, prices, svr_data,
                 factor_name_to_id, factor_sector_types, conn,
             )
+            conn.execute(
+                "INSERT OR REPLACE INTO snapshot_dates (data_date, created_at) "
+                "VALUES (?, datetime('now'))",
+                (str(snapshot),),
+            )
+            conn.commit()
 
     print(f"\nDone — {total_rows:,} total factor rows across {len(dates_to_run)} date(s)")
 

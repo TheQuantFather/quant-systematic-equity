@@ -13,7 +13,7 @@ st.set_page_config(page_title="Database Explorer", layout="wide")
 st.title("Database Explorer")
 
 from config import (
-    UNIVERSE_DB, RETURNS_DB, FACTORS_DB, MODELS_DB, CONSTITUENTS_DB, RISK_DB, BARRA_DB,
+    UNIVERSE_DB, RETURNS_DB, FACTORS_DB, MODELS_DB, CONSTITUENTS_DB, RISK_DB,
 )
 from utils import get_db, inject_css
 inject_css()
@@ -25,7 +25,7 @@ DATABASES = {
     "models":       MODELS_DB,
     "constituents": CONSTITUENTS_DB,
     "risk":         RISK_DB,
-    "barra":        BARRA_DB,
+    "barra":        RISK_DB,
 }
 
 _VALID_TABLES: dict[str, set[str]] = {}   # populated lazily below

@@ -329,6 +329,8 @@ constituents = db.get_constituents_for_security(security_id)
 _Q_NUM = {"Q1": 1, "Q2": 2, "Q3": 3, "Q4": 4, "FY": 4}
 
 def _sort_key(fy: int, fp: str) -> int:
+    if pd.isna(fy):
+        return 0
     return int(fy) * 10 + _Q_NUM.get(str(fp), 9)
 
 def _period_label(fy: int, fp: str) -> str:
@@ -342,6 +344,62 @@ def _smart_scale(series: pd.Series) -> tuple[pd.Series, str]:
     if mx >= 1e6:
         return series / 1e6, "USD (M)"
     return series, "USD"
+
+def _derive_operating_income(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Inject derived Operating Income rows for quarters where it is absent.
+    Identity: Operating Income = Pretax Income (Loss) − Non-Operating Income (Loss).
+    Mirrors the derivation in create_factors.py build_ltm() and validate_ticker.py.
+    """
+    OI_NAME    = "Operating Income (Loss)"
+    PRETAX     = "Pretax Income (Loss)"
+    NON_OP     = "Non-Operating Income (Loss)"
+    STMT_TYPE  = "Income Statement"
+
+    is_df = df[df["statement_type"] == STMT_TYPE].copy()
+    if is_df.empty:
+        return df
+
+    periods_with_oi = set(
+        zip(is_df.loc[is_df["constituent_name"] == OI_NAME, "fiscal_year"],
+            is_df.loc[is_df["constituent_name"] == OI_NAME, "fiscal_period"])
+    )
+    # Use groupby().first() to get one scalar value per period, avoiding
+    # MultiIndex .loc scalar/Series ambiguity when there are duplicate rows.
+    pretax_by_period = (
+        is_df[is_df["constituent_name"] == PRETAX]
+        .groupby(["fiscal_year", "fiscal_period"])["constituent_value"].first()
+    )
+    nonop_by_period = (
+        is_df[is_df["constituent_name"] == NON_OP]
+        .groupby(["fiscal_year", "fiscal_period"])["constituent_value"].first()
+    )
+    # Template rows (one per period) for copying metadata
+    template_rows = (
+        is_df[is_df["constituent_name"] == PRETAX]
+        .groupby(["fiscal_year", "fiscal_period"]).first()
+    )
+
+    new_rows = []
+    for (fy, fp), pretax_val in pretax_by_period.items():
+        if (fy, fp) in periods_with_oi:
+            continue
+        if pd.isna(pretax_val):
+            continue
+        non_op_val = nonop_by_period.get((fy, fp), 0.0)
+        non_op_val = 0.0 if pd.isna(non_op_val) else float(non_op_val)
+        template = template_rows.loc[(fy, fp)].to_dict()
+        template["constituent_name"]  = OI_NAME
+        template["constituent_value"] = float(pretax_val) - non_op_val
+        template["constituent_id"]    = "80C2558A"
+        new_rows.append(template)
+
+    if not new_rows:
+        return df
+    return pd.concat([df, pd.DataFrame(new_rows)], ignore_index=True)
+
+
+constituents = _derive_operating_income(constituents)
 
 if constituents.empty:
     st.warning("No financial constituent data found for this company.")

@@ -22,7 +22,9 @@ Usage:
 
 import argparse
 import re
+import socket
 import sqlite3
+import subprocess
 import time
 from datetime import date, datetime, timedelta
 from typing import Optional
@@ -33,9 +35,9 @@ from edgar import Company, get_filings, set_identity
 from config import CONSTITUENTS_DB, UNIVERSE_DB, CONCEPT_MAP_XLSX
 from utils import classify_sector, get_db
 
-# Earliest fiscal year to fetch. The oldest backfill snapshot is 2021-04-01
-# which needs FY2020 data; one extra year of buffer covers edge cases.
-MIN_FISCAL_YEAR = 2019
+# Earliest fiscal year to fetch. Set to 2017 to support 2019-04-01 factor
+# snapshots (needs FY2018 annual data) with one extra year of LTM buffer.
+MIN_FISCAL_YEAR = 2017
 
 set_identity(os.getenv("EDGAR_IDENTITY", "your-name your@email.com"))
 
@@ -516,6 +518,114 @@ def insert_rows(conn: sqlite3.Connection, rows: list[tuple]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Pull logging — audit trail in constituents.db
+# ---------------------------------------------------------------------------
+
+def _init_pull_log(conn: sqlite3.Connection) -> None:
+    """Create the pull_log table if it doesn't exist."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS pull_log (
+            run_id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_timestamp       TEXT NOT NULL,
+            completed_at        TEXT,
+            duration_seconds    REAL,
+            mode                TEXT,
+            args_days           INTEGER,
+            args_ticker         TEXT,
+            args_cik            INTEGER,
+            args_sector_type    TEXT,
+            args_quarterly      INTEGER,
+            args_fill_gaps      INTEGER,
+            args_force          INTEGER,
+            args_limit          INTEGER,
+            args_dry_run        INTEGER,
+            universe_size       INTEGER,
+            filings_in_index    INTEGER,
+            filings_matched     INTEGER,
+            companies_checked   INTEGER,
+            companies_inserted  INTEGER,
+            companies_no_new    INTEGER,
+            companies_failed    INTEGER,
+            companies_skipped   INTEGER,
+            rows_inserted       INTEGER,
+            git_hash            TEXT,
+            host                TEXT
+        )
+    """)
+    conn.commit()
+
+
+def _get_git_hash() -> str:
+    """Return first 8 chars of current git commit hash, or 'unknown'."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short=8", "HEAD"],
+            capture_output=True, text=True, timeout=3,
+        )
+        return result.stdout.strip() if result.returncode == 0 else "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _write_pull_log(
+    conn: sqlite3.Connection,
+    args,
+    mode: str,
+    universe_size: int,
+    start_time: float,
+    rows_inserted: int,
+    companies_checked: int,
+    companies_inserted: int,
+    companies_no_new: int,
+    companies_failed: int,
+    companies_skipped: int,
+    filings_in_index: int = 0,
+    filings_matched: int = 0,
+) -> int:
+    """Initialise log table if needed, write one run-level row, return run_id."""
+    _init_pull_log(conn)
+    cur = conn.execute(
+        """INSERT INTO pull_log (
+               run_timestamp, completed_at, duration_seconds, mode,
+               args_days, args_ticker, args_cik, args_sector_type,
+               args_quarterly, args_fill_gaps, args_force, args_limit, args_dry_run,
+               universe_size, filings_in_index, filings_matched,
+               companies_checked, companies_inserted, companies_no_new,
+               companies_failed, companies_skipped, rows_inserted,
+               git_hash, host
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            datetime.fromtimestamp(start_time).isoformat(timespec="seconds"),
+            datetime.now().isoformat(timespec="seconds"),
+            round(time.time() - start_time, 1),
+            mode,
+            getattr(args, "days", None),
+            getattr(args, "ticker", None),
+            getattr(args, "cik", None),
+            getattr(args, "sector_type", None),
+            1 if getattr(args, "quarterly", False) else 0,
+            1 if getattr(args, "fill_gaps", False) else 0,
+            1 if getattr(args, "force", False) else 0,
+            getattr(args, "limit", None),
+            1 if getattr(args, "dry_run", False) else 0,
+            universe_size,
+            filings_in_index,
+            filings_matched,
+            companies_checked,
+            companies_inserted,
+            companies_no_new,
+            companies_failed,
+            companies_skipped,
+            rows_inserted,
+            _get_git_hash(),
+            socket.gethostname(),
+        ),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+# ---------------------------------------------------------------------------
 # EDGAR index-mode helpers
 # ---------------------------------------------------------------------------
 
@@ -856,6 +966,20 @@ def main() -> None:
 
     use_index_mode = not (args.ticker or args.cik or args.fill_gaps or args.force)
 
+    start_time: float = time.time()
+
+    # Determine log mode label
+    if use_index_mode:
+        log_mode = "index"
+    elif args.ticker or args.cik:
+        log_mode = "targeted_quarterly" if args.quarterly else "targeted_annual"
+    elif args.fill_gaps:
+        log_mode = "fill_gaps_quarterly" if args.quarterly else "fill_gaps"
+    elif args.force:
+        log_mode = "force_quarterly" if args.quarterly else "force"
+    else:
+        log_mode = "bulk_quarterly" if args.quarterly else "bulk_annual"
+
     if use_index_mode:
         # ── EDGAR filing index mode ─────────────────────────────────────────
         # Download the EDGAR index, filter to universe, process only actual filers.
@@ -869,6 +993,11 @@ def main() -> None:
 
         total_rows = 0
         total_checked = 0
+        co_inserted = 0
+        co_no_new   = 0
+        co_failed   = 0
+        filings_in_index = 0
+        filings_matched  = 0
 
         # ── Annual 10-K ──────────────────────────────────────────────────────
         print(f"Fetching 10-K index (last {args.days} days) ...")
@@ -878,6 +1007,8 @@ def main() -> None:
             for f in annual_filings
             if f.cik and int(f.cik) in cik_map
         ]
+        filings_in_index += len(annual_filings)
+        filings_matched  += len(annual_matched)
         print(f"  {len(annual_filings)} 10-K filings in index, "
               f"{len(annual_matched)} match universe\n")
 
@@ -892,8 +1023,13 @@ def main() -> None:
                         filing, security_id, ticker, latest_fy, conn,
                         dry_run=args.dry_run,
                     )
+                    if n > 0:
+                        co_inserted += 1
+                    else:
+                        co_no_new += 1
                 except Exception as exc:
                     print(f"  [{ticker}] skipped — {type(exc).__name__}: {exc}")
+                    co_failed += 1
                     n = 0
                 total_rows += n
 
@@ -905,6 +1041,8 @@ def main() -> None:
             for f in quarterly_filings
             if f.cik and int(f.cik) in cik_map
         ]
+        filings_in_index += len(quarterly_filings)
+        filings_matched  += len(quarterly_matched)
         print(f"  {len(quarterly_filings)} 10-Q filings in index, "
               f"{len(quarterly_matched)} match universe\n")
 
@@ -923,14 +1061,33 @@ def main() -> None:
                         fye_month=fye_month,
                         dry_run=args.dry_run,
                     )
+                    if n > 0:
+                        co_inserted += 1
+                    else:
+                        co_no_new += 1
                 except Exception as exc:
                     print(f"  [{ticker}] skipped — {type(exc).__name__}: {exc}")
+                    co_failed += 1
                     n = 0
                 total_rows += n
 
         action = "would insert" if args.dry_run else "inserted"
         print(f"\nDone — {total_checked} universe filings checked, "
               f"{total_rows:,} rows {action}.")
+
+        with get_db(CONSTITUENTS_DB) as log_conn:
+            run_id = _write_pull_log(
+                log_conn, args, log_mode, len(cik_map), start_time,
+                rows_inserted=total_rows,
+                companies_checked=total_checked,
+                companies_inserted=co_inserted,
+                companies_no_new=co_no_new,
+                companies_failed=co_failed,
+                companies_skipped=0,
+                filings_in_index=filings_in_index,
+                filings_matched=filings_matched,
+            )
+        print(f"Run logged — run_id={run_id}")
 
     else:
         # ── Company-by-company mode (backfill / targeted) ───────────────────
@@ -942,8 +1099,8 @@ def main() -> None:
             latest_q_map      = get_latest_quarter_per_company(conn) if args.quarterly else {}
             stored_q_map      = get_stored_quarters_per_company(conn) if args.quarterly else {}
 
-        mode = "quarterly (10-Q)" if args.quarterly else "annual (10-K)"
-        print(f"Universe: {len(company_map):,} companies  |  mode: {mode}")
+        mode_label = "quarterly (10-Q)" if args.quarterly else "annual (10-K)"
+        print(f"Universe: {len(company_map):,} companies  |  mode: {mode_label}")
         print(f"Companies with existing data: {len(latest_fy_map):,}")
 
         # Build candidate list
@@ -984,6 +1141,10 @@ def main() -> None:
 
         total_rows = 0
         stale_count = 0
+        companies_skipped = 0
+        co_inserted = 0
+        co_no_new   = 0
+        co_failed   = 0
 
         with get_db(CONSTITUENTS_DB) as conn:
             for i, (simfin_id, info) in enumerate(candidates):
@@ -999,9 +1160,10 @@ def main() -> None:
 
                 # Determine which fiscal years this company is missing (fill-gaps mode)
                 existing_fys: Optional[set] = None
-                if args.fill_gaps:
-                    # Union of ISIN-keyed rows and SimFin-ID-keyed rows so that
-                    # historical SimFin Q4 data is not re-fetched from EDGAR.
+                if args.fill_gaps and not args.quarterly:
+                    # Annual fill-gaps only: skip companies with complete FY coverage.
+                    # When --quarterly is also set, the quarterly path has its own skip
+                    # logic (EDGAR latest_sk check) so we must not skip here.
                     existing_fys = (
                         fy_set_map.get(isin or "", set()) | fy_set_map.get(str(simfin_id), set())
                     )
@@ -1009,20 +1171,21 @@ def main() -> None:
                     needed = set(range(MIN_FISCAL_YEAR, current_year + 1))
                     missing = needed - existing_fys
                     if not missing:
+                        companies_skipped += 1
                         continue  # nothing to fill for this company
 
                 elif not args.fill_gaps and not args.quarterly:
                     # Quick check: is this company likely stale?
                     current_year = date.today().year
                     if latest_fy is not None and latest_fy >= current_year - 1 and not args.ticker and not args.cik:
+                        companies_skipped += 1
                         continue  # already up to date
 
                 if args.quarterly:
-                    # Determine latest quarterly sort key for this company
-                    latest_sk = (
-                        latest_q_map.get(isin) if isin else None
-                    ) or latest_q_map.get(str(simfin_id))
-                    # Skip if already have the most recent expected quarter
+                    # EDGAR-first: check only ISIN-keyed stored data (not SimFin-keyed).
+                    # SimFin coverage must not block EDGAR from fetching the same quarters.
+                    latest_sk = latest_q_map.get(isin) if isin else None
+                    # Skip if EDGAR already has the most recent expected quarter
                     today_d   = date.today()
                     fye_month = info.get("fye_month", 12)
                     m_today   = today_d.month
@@ -1030,7 +1193,8 @@ def main() -> None:
                     expected_q = 1 if m_today <= 3 else 2 if m_today <= 6 else 3 if m_today <= 9 else 3
                     expected_sk = today_d.year * 10 + expected_q
                     if not args.ticker and not args.cik and latest_sk is not None and latest_sk >= expected_sk:
-                        continue  # already up to date for this quarter
+                        companies_skipped += 1
+                        continue  # EDGAR already up to date for this quarter
 
                 stale_count += 1
                 if i > 0 and i % 10 == 0:
@@ -1038,10 +1202,10 @@ def main() -> None:
 
                 try:
                     if args.quarterly:
-                        # Build per-company set of already-stored sort_keys for gap-aware fetch
-                        stored_sk = (
-                            stored_q_map.get(isin, set()) | stored_q_map.get(str(simfin_id), set())
-                        )
+                        # Use ISIN-keyed stored sort_keys only — SimFin-keyed quarters must not
+                        # block EDGAR from fetching (EDGAR-first strategy).
+                        # --force clears even EDGAR-stored keys to allow a full re-fetch.
+                        stored_sk = set() if args.force else stored_q_map.get(isin, set())
                         n = process_company_quarterly(
                             simfin_id, info, stored_sk, conn,
                             dry_run=args.dry_run,
@@ -1053,9 +1217,14 @@ def main() -> None:
                             fill_gaps=args.fill_gaps,
                             existing_fys=existing_fys,
                         )
+                    if n > 0:
+                        co_inserted += 1
+                    else:
+                        co_no_new += 1
                 except Exception as exc:
                     ticker = info.get("ticker", str(simfin_id))
                     print(f"  [{ticker}] skipped — {type(exc).__name__}: {exc}")
+                    co_failed += 1
                     n = 0
                 total_rows += n
 
@@ -1063,6 +1232,18 @@ def main() -> None:
             print(f"\n[DRY RUN] {stale_count} stale companies identified.")
         else:
             print(f"\nDone — inserted {total_rows:,} rows across {stale_count} companies.")
+
+        with get_db(CONSTITUENTS_DB) as log_conn:
+            run_id = _write_pull_log(
+                log_conn, args, log_mode, len(company_map), start_time,
+                rows_inserted=total_rows,
+                companies_checked=stale_count,
+                companies_inserted=co_inserted,
+                companies_no_new=co_no_new,
+                companies_failed=co_failed,
+                companies_skipped=companies_skipped,
+            )
+        print(f"Run logged — run_id={run_id}")
 
 
 if __name__ == "__main__":

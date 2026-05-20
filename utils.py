@@ -16,20 +16,50 @@ pio.templates.default = "plotly_dark"
 
 _CSS = """
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
-html, body, [class*="css"], .stMarkdown, .stDataFrame, button, input, select, textarea
-    { font-family: 'Inter', sans-serif !important; }
+@import url('https://fonts.googleapis.com/css2?family=Inter:ital,wght@0,300;0,400;0,500;0,600;0,700;1,400&display=swap');
+
+/* ── Font: apply Inter to content elements (not icon spans) ───────────────── */
+html, body,
+p, h1, h2, h3, h4, h5, h6, li, td, th, label, a,
+button, input, select, textarea,
+[class*="css"],
+.stMarkdown, .stDataFrame, .stText,
+[data-testid="stMarkdownContainer"],
+[data-testid="stWidgetLabel"],
+[data-testid="stMetricValue"],
+[data-testid="stMetricLabel"],
+[data-testid="stSidebarNavLink"] {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif !important;
+}
+
+/* ── Typography refinements ──────────────────────────────────────────────── */
+h1 { font-size: 1.75rem !important; font-weight: 600 !important; letter-spacing: -0.02em !important; line-height: 1.3 !important; }
+h2 { font-size: 1.35rem !important; font-weight: 600 !important; letter-spacing: -0.015em !important; }
+h3 { font-size: 1.1rem  !important; font-weight: 500 !important; letter-spacing: -0.01em !important; }
+p, li, .stMarkdown p { font-size: 0.9rem !important; line-height: 1.65 !important; }
+
+/* ── Hide Streamlit chrome ───────────────────────────────────────────────── */
 #MainMenu, footer, [data-testid="stDeployButton"], [data-testid="stDecoration"]
     { display: none !important; }
+
+/* ── Layout ──────────────────────────────────────────────────────────────── */
 .block-container { padding-top: 1.5rem !important; padding-bottom: 2rem !important; }
+
+/* ── Metric cards ────────────────────────────────────────────────────────── */
 [data-testid="stMetric"] {
     background: rgba(59,130,246,0.07);
     border: 1px solid rgba(59,130,246,0.18);
     border-radius: 0.5rem;
     padding: 0.85rem 1rem;
 }
-[data-testid="stMetricValue"] { font-size: 1.35rem !important; }
+[data-testid="stMetricValue"] { font-size: 1.35rem !important; font-weight: 600 !important; }
+[data-testid="stMetricLabel"] { font-size: 0.75rem !important; font-weight: 500 !important; letter-spacing: 0.03em !important; text-transform: uppercase !important; opacity: 0.7 !important; }
+
+/* ── Dividers ────────────────────────────────────────────────────────────── */
 hr { border-color: rgba(255,255,255,0.08) !important; }
+
+/* ── Sidebar nav: capitalize "app" → "App" (first entry from app.py) ──────── */
+[data-testid="stSidebarNav"] li:first-child a span { text-transform: capitalize !important; }
 </style>
 """
 

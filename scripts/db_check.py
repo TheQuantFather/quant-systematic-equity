@@ -49,10 +49,10 @@ n_risk      = q("data/risk.db", "SELECT COUNT(*) FROM covariance_matrix")
 latest_risk = q("data/risk.db", "SELECT MAX(data_date) FROM covariance_matrix")
 print(f"risk.db         {n_risk} covariance snapshots  latest={latest_risk}")
 
-latest_barra = q("data/barra.db", "SELECT MAX(snapshot_date) FROM factor_covariance")
-n_barra_fr   = q("data/barra.db", "SELECT COUNT(DISTINCT trade_date) FROM factor_returns")
-latest_bfr   = q("data/barra.db", "SELECT MAX(trade_date) FROM factor_returns")
-print(f"barra.db        factor_returns={n_barra_fr} days  latest_fr={latest_bfr}  latest_cov={latest_barra}\n")
+latest_barra = q("data/risk.db", "SELECT MAX(snapshot_date) FROM factor_covariance")
+n_barra_fr   = q("data/risk.db", "SELECT COUNT(DISTINCT trade_date) FROM factor_returns")
+latest_bfr   = q("data/risk.db", "SELECT MAX(trade_date) FROM factor_returns")
+print(f"risk.db (barra) factor_returns={n_barra_fr} days  latest_fr={latest_bfr}  latest_cov={latest_barra}\n")
 
 dates = {"factors": latest_fac, "models": latest_mod, "risk": latest_risk, "barra": latest_barra}
 unique = set(dates.values())

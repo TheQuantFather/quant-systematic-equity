@@ -509,7 +509,7 @@ def build_historical_snapshots(
 # EDGAR metadata enrichment
 # ---------------------------------------------------------------------------
 
-_EDGAR_HEADERS = {"User-Agent": "universe-builder shivam3125@gmail.com"}
+_EDGAR_HEADERS = {"User-Agent": os.getenv("EDGAR_IDENTITY", "your-name your@email.com")}
 
 def _edgar_fetch(url: str, timeout: int = 10) -> dict:
     req = urllib.request.Request(url, headers=_EDGAR_HEADERS)

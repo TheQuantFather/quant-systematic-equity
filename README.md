@@ -2,7 +2,7 @@
 
 A production-grade quantitative investing framework covering ~1,000 US equities from the **iShares Russell 1000** universe. Built end-to-end: EDGAR/SimFin data ingestion → 28-factor model → Barra-style risk model → CVXPY portfolio optimiser → interactive Streamlit dashboard.
 
-> **What's new**: Short Interest model (FINRA SVR), Data Quality dashboard page, GP derivation from Revenue − CoR, repeatable `--date` flags, and DB-driven universe mappings (no hardcoded ISIN/ticker dicts).
+> **What's new**: Barra tables consolidated into `risk.db` (single risk DB); dynamic snapshot dates from `factors.db`; quarterly backfill cadence (28 snapshots); pull log in `constituents.db`; Barra factor IDs driven by `factors_reference.csv`.
 
 ![Python](https://img.shields.io/badge/Python-3.13-3776AB?logo=python&logoColor=white)
 ![SQLite](https://img.shields.io/badge/Storage-SQLite-003B57?logo=sqlite&logoColor=white)
@@ -35,12 +35,12 @@ flowchart TD
     F[FINRA\nshort volume] -->|create_svr.py| R
 
     C & R & U -->|create_factors.py| F2[(factors.db\n28+ factors)]
-    F2 -->|create_models.py| M[(models.db\n8 model scores)]
+    F2 -->|create_models.py| M[(models.db\n9 model scores)]
     R -->|create_risk.py| RI[(risk.db\nLedoit-Wolf Σ)]
-    R & F2 -->|create_barra.py| BA[(barra.db\nBarra K=29)]
+    R & F2 -->|create_barra.py| RI
 
-    F2 & M & RI & BA -->|optimize_portfolio.py| P[portfolio_output/\nweights · summaries]
-    U & F2 & M & P & BA --> APP[Streamlit Dashboard\napp.py + 9 pages]
+    F2 & M & RI -->|optimize_portfolio.py| P[portfolio_output/\nweights · summaries]
+    U & F2 & M & P & RI --> APP[Streamlit Dashboard\napp.py + 10 pages]
 ```
 
 ---
@@ -151,8 +151,9 @@ Financial data is anchored to `publish_date` (EDGAR `acceptance_datetime`), not 
 
 ### Snapshot Schedule
 
-Six annual snapshots per factor model run, each using data published ≥ 90 days after fiscal year-end (sufficient for all Russell 1000 10-K filers):
+28 snapshots total: 6 annual (April 1, ≥ 90-day lag for Dec FY-end filers) + 22 quarterly mid-period (15th of Feb/May/Aug/Nov). Snapshot dates are stored in `factors.db` and discovered automatically by downstream scripts — no hardcoded date lists.
 
+Annual snapshots:
 ```
 2021-04-01 → FY2020    2024-04-01 → FY2023
 2022-04-01 → FY2021    2025-04-01 → FY2024
@@ -184,10 +185,10 @@ python create_universe.py          # ~994 companies from iShares N-PORT-P
 python create_databases.py         # SimFin financial statements → constituents.db
 python create_returns.py           # daily prices → returns.db
 python create_svr.py --backfill    # FINRA short volume → returns.db
-python create_factors.py --backfill
+python create_factors.py --quarterly-backfill   # all 28 quarterly snapshot dates
 python create_models.py
 python create_risk.py --backfill
-python create_barra.py --backfill
+python create_barra.py --backfill               # writes to risk.db
 python create_strategy_params.py   # creates data/strategy_params.xlsx
 python optimize_portfolio.py
 streamlit run app.py
@@ -206,7 +207,7 @@ python create_svr.py               # latest FINRA short volume
 python create_factors.py --date 2026-04-01
 python create_models.py  --date 2026-04-01   # --date is repeatable
 python create_risk.py    --date 2026-04-01
-python create_barra.py   --date 2026-04-01   # --date is repeatable
+python create_barra.py   --date 2026-04-01   # --date is repeatable; writes to risk.db
 python optimize_portfolio.py
 ```
 
@@ -238,11 +239,10 @@ python optimize_portfolio.py
 ├── create_factors.py             # Factor computation → factors.db
 ├── create_models.py              # Model scoring → models.db
 ├── create_risk.py                # Ledoit-Wolf covariance → risk.db
-├── create_barra.py               # Barra factor risk model → barra.db
+├── create_barra.py               # Barra factor risk model → risk.db (same file)
 ├── create_strategy_params.py     # Reset strategy_params.xlsx template
 ├── optimize_portfolio.py         # CVXPY optimiser → portfolio_output/
 ├── daily_update.py               # Automated daily/weekly pipeline runner
-├── validate_constituents.py      # Data quality diagnostics
 ├── scripts/
 │   ├── db_check.py               # Pipeline health check across all DBs
 │   └── validate_ticker.py        # LTM financials for any ticker
@@ -252,8 +252,7 @@ python optimize_portfolio.py
     ├── returns.db
     ├── factors.db
     ├── models.db
-    ├── risk.db
-    ├── barra.db
+    ├── risk.db                   # Ledoit-Wolf + Barra tables
     ├── strategy_params.xlsx
     └── portfolio_output/
 ```
@@ -269,8 +268,8 @@ constituents.db   — (constituent_id, security_id, publish_date) · value · fi
 returns.db        — (isin, date) · price · total_return · svr (short volume ratio)
 factors.db        — (data_date, factor_id, security_id) · factor_value · factor_value_z
 models.db         — (data_date, model_id, security_id) · model_value · model_value_z
-risk.db           — data_date (PK) · zlib(N×N float32 covariance) · isin_list JSON
-barra.db          — factor_returns · factor_covariance · idiosyncratic_vars · factor_exposures
+risk.db           — covariance_matrix: data_date (PK) · zlib(N×N float32) · isin_list JSON
+                    factor_returns · factor_covariance · idiosyncratic_vars · factor_exposures (Barra)
 ```
 
 ---
@@ -280,7 +279,7 @@ barra.db          — factor_returns · factor_covariance · idiosyncratic_vars 
 | Component | Technology |
 |-----------|-----------|
 | Language | Python 3.13 |
-| Storage | SQLite (7 databases, ~2GB total) |
+| Storage | SQLite (6 databases, ~2GB total) |
 | Data — financials | [edgartools](https://github.com/dgunning/edgartools) + SimFin |
 | Data — prices | yfinance |
 | Data — short interest | FINRA REGSHO via HTTP |

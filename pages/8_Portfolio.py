@@ -17,12 +17,26 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from config import (
-    OUTPUT_DIR, PARAMS_FILE, MODELS_DB, RISK_DB, BARRA_DB,
+    OUTPUT_DIR, PARAMS_FILE, MODELS_DB, RISK_DB,
     UNIVERSE_DB as UNIV_DB, BENCHMARK_DIR,
-    BARRA_GROUPS as _BARRA_GROUPS,
-    MODELS_REF,
+    FACTORS_REF, MODELS_REF,
+    BARRA_SECTORS as _BARRA_SECTORS,
 )
 from utils import get_db, inject_css
+
+# Build BARRA_GROUPS dynamically from factors_reference.csv
+_ref_csv  = pd.read_csv(str(FACTORS_REF))
+_N_SECTOR = len(_BARRA_SECTORS)
+_N_STYLE  = len(_ref_csv[_ref_csv["barra_factor_type"] == "style"])
+_N_BETA   = 1
+_N_FUND   = len(_ref_csv[_ref_csv["barra_factor_type"] == "fundamental"])
+_BARRA_GROUPS = {
+    "Sector":      slice(0, _N_SECTOR),
+    "Style":       slice(_N_SECTOR, _N_SECTOR + _N_STYLE),
+    "Beta":        _N_SECTOR + _N_STYLE,
+    "Fundamental": slice(_N_SECTOR + _N_STYLE + _N_BETA,
+                         _N_SECTOR + _N_STYLE + _N_BETA + _N_FUND),
+}
 
 # Base model IDs and display names — read from models_reference.csv, not hardcoded.
 _mref = pd.read_csv(MODELS_REF)
@@ -162,26 +176,27 @@ def load_risk_contributions(risk_date: str, isins: tuple,
 def load_risk_contributions_barra(barra_date: str, isins: tuple,
                                    weights: tuple) -> pd.DataFrame | None:
     """Compute per-stock risk contributions from Barra Σ = XFX' + Δ."""
-    if not BARRA_DB.exists():
+    try:
+        with get_db(RISK_DB) as conn:
+            row = conn.execute(
+                "SELECT factor_names, cov_blob FROM factor_covariance WHERE snapshot_date=?",
+                (barra_date,),
+            ).fetchone()
+            if row is None:
+                return None
+            fnames = json.loads(row[0])
+            K = len(fnames)
+            F = np.frombuffer(zlib.decompress(row[1]), dtype=np.float32).reshape(K, K).astype(np.float64)
+            x_rows = conn.execute(
+                "SELECT security_id, factor_id, exposure FROM factor_exposures WHERE snapshot_date=?",
+                (barra_date,),
+            ).fetchall()
+            d_rows = conn.execute(
+                "SELECT security_id, idio_var FROM idiosyncratic_vars WHERE snapshot_date=?",
+                (barra_date,),
+            ).fetchall()
+    except Exception:
         return None
-    with get_db(BARRA_DB) as conn:
-        row = conn.execute(
-            "SELECT factor_names, cov_blob FROM factor_covariance WHERE snapshot_date=?",
-            (barra_date,),
-        ).fetchone()
-        if row is None:
-            return None
-        fnames = json.loads(row[0])
-        K = len(fnames)
-        F = np.frombuffer(zlib.decompress(row[1]), dtype=np.float32).reshape(K, K).astype(np.float64)
-        x_rows = conn.execute(
-            "SELECT security_id, factor_id, exposure FROM factor_exposures WHERE snapshot_date=?",
-            (barra_date,),
-        ).fetchall()
-        d_rows = conn.execute(
-            "SELECT security_id, idio_var FROM idiosyncratic_vars WHERE snapshot_date=?",
-            (barra_date,),
-        ).fetchall()
 
     x_data: dict = {}
     for sec_id, fac_id, exp in x_rows:
@@ -220,29 +235,30 @@ def load_risk_contributions_barra(barra_date: str, isins: tuple,
 @st.cache_data(ttl=300)
 def load_barra_components(barra_date: str) -> tuple | None:
     """
-    Return (F, fnames, X_df, delta_s) from barra.db for a snapshot date.
+    Return (F, fnames, X_df, delta_s) from risk.db (Barra tables) for a snapshot date.
     Shared across portfolio risk and active risk attribution.
     """
-    if not BARRA_DB.exists():
+    try:
+        with get_db(RISK_DB) as conn:
+            row = conn.execute(
+                "SELECT factor_names, cov_blob FROM factor_covariance WHERE snapshot_date=?",
+                (barra_date,),
+            ).fetchone()
+            if row is None:
+                return None
+            fnames = json.loads(row[0])
+            K      = len(fnames)
+            F      = np.frombuffer(zlib.decompress(row[1]), dtype=np.float32).reshape(K, K).astype(np.float64)
+            x_rows = conn.execute(
+                "SELECT security_id, factor_id, exposure FROM factor_exposures WHERE snapshot_date=?",
+                (barra_date,),
+            ).fetchall()
+            d_rows = conn.execute(
+                "SELECT security_id, idio_var FROM idiosyncratic_vars WHERE snapshot_date=?",
+                (barra_date,),
+            ).fetchall()
+    except Exception:
         return None
-    with get_db(BARRA_DB) as conn:
-        row = conn.execute(
-            "SELECT factor_names, cov_blob FROM factor_covariance WHERE snapshot_date=?",
-            (barra_date,),
-        ).fetchone()
-        if row is None:
-            return None
-        fnames = json.loads(row[0])
-        K      = len(fnames)
-        F      = np.frombuffer(zlib.decompress(row[1]), dtype=np.float32).reshape(K, K).astype(np.float64)
-        x_rows = conn.execute(
-            "SELECT security_id, factor_id, exposure FROM factor_exposures WHERE snapshot_date=?",
-            (barra_date,),
-        ).fetchall()
-        d_rows = conn.execute(
-            "SELECT security_id, idio_var FROM idiosyncratic_vars WHERE snapshot_date=?",
-            (barra_date,),
-        ).fetchall()
     x_data: dict = {}
     for sec_id, fac_id, exp in x_rows:
         x_data.setdefault(sec_id, {})[fac_id] = float(exp)
@@ -667,7 +683,7 @@ with tab4:
         risk_model_label = f"Ledoit-Wolf ({risk_date})"
 
     if barra_comps is None and lw_raw is None:
-        st.info("Risk attribution requires risk.db or barra.db. Run the relevant pipeline first.")
+        st.info("Risk attribution requires risk.db. Run the relevant pipeline first.")
     else:
         # ── Portfolio weight vector (held stocks only, normalised) ───────────
         held         = df[df["portfolio_weight"] > 1e-5].copy()
