@@ -15,11 +15,12 @@ Usage:
 """
 
 import argparse
-import logging
 import subprocess
 import sys
 from datetime import date, datetime
 from pathlib import Path
+
+from utils import get_logger
 
 # ---------------------------------------------------------------------------
 # Config
@@ -27,25 +28,12 @@ from pathlib import Path
 
 PYTHON   = sys.executable
 REPO_DIR = Path(__file__).parent.resolve()
-LOG_DIR  = REPO_DIR / "logs"
-LOG_FILE = LOG_DIR / "daily_update.log"
 
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
 
-LOG_DIR.mkdir(exist_ok=True)
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)s  %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-    handlers=[
-        logging.FileHandler(LOG_FILE),
-        logging.StreamHandler(sys.stdout),
-    ],
-)
-log = logging.getLogger(__name__)
+log = get_logger("daily_update")
 
 
 # ---------------------------------------------------------------------------

@@ -24,7 +24,9 @@ import numpy as np
 import pandas as pd
 
 from config import FACTORS_DB, MODELS_DB, MODELS_REF as MODELS_CSV, FACTORS_REF as FACTORS_CSV
-from utils import get_db, winsorized_zscore
+from utils import get_db, get_logger, winsorized_zscore
+
+log = get_logger("create_models")
 
 
 # ---------------------------------------------------------------------------
@@ -112,7 +114,7 @@ def setup_models_db(conn: sqlite3.Connection, clean: bool = False) -> None:
         cols = [r[1] for r in conn.execute("PRAGMA table_info(models)").fetchall()]
         if 'fiscal_year' in cols or clean:
             reason = "old schema (had fiscal_year column)" if 'fiscal_year' in cols else "--clean flag"
-            print(f"[INFO] Dropping models table ({reason}) — will rebuild from scratch")
+            log.info("Dropping models table (%s) — will rebuild from scratch", reason)
             conn.execute("DROP TABLE models")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS models (
@@ -250,33 +252,33 @@ def main() -> None:
     alpha_models      = get_alpha_models(models)
     factor_directions = load_factor_directions()
 
-    print(f"Models to create : {list(models.keys())}")
-    print(f"Base models      : {list(base_models.keys())}")
-    print(f"Alpha models     : {list(alpha_models.keys())}")
+    log.info("Models to create : %s", list(models.keys()))
+    log.info("Base models      : %s", list(base_models.keys()))
+    log.info("Alpha models     : %s", list(alpha_models.keys()))
 
-    print("\nLoading pre-computed z-scores from factors.db ...")
+    log.info("Loading pre-computed z-scores from factors.db ...")
     factors_data = load_factors_zscores(date_filter=args.dates)
     dates = sorted(factors_data.keys())
-    print(f"Loaded z-scores for {len(dates)} date(s): {dates}")
+    log.info("Loaded z-scores for %d date(s): %s", len(dates), dates)
 
     with get_db(MODELS_DB) as conn:
         setup_models_db(conn, clean=args.clean)
 
-        print("\n=== Stage 1: Base models from factor z-scores ===")
+        log.info("=== Stage 1: Base models from factor z-scores ===")
         n1 = compute_base_models(conn, base_models, factors_data, factor_directions)
-        print(f"  {n1:,} base model records written")
+        log.info("  %s base model records written", f"{n1:,}")
 
         if alpha_models:
-            print("\n=== Stage 2: Alpha models from base model scores ===")
+            log.info("=== Stage 2: Alpha models from base model scores ===")
             n2 = compute_alpha_models(conn, alpha_models, factors_data)
-            print(f"  {n2:,} alpha model records written")
+            log.info("  %s alpha model records written", f"{n2:,}")
         else:
             n2 = 0
 
-        print("\nComputing cross-sectional z-scores for model scores ...")
+        log.info("Computing cross-sectional z-scores for model scores ...")
         compute_model_zscores(conn)  # commits inside here
 
-    print(f"\nDone — {n1 + n2:,} total records | {len(models)} models × {len(dates)} date(s)")
+    log.info("Done — %s total records | %d models × %d date(s)", f"{n1 + n2:,}", len(models), len(dates))
 
 
 if __name__ == "__main__":

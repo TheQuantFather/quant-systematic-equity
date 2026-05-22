@@ -29,7 +29,9 @@ import pandas as pd
 import requests
 
 from config import RETURNS_DB, UNIVERSE_DB
-from utils import get_db
+from utils import get_db, get_logger
+
+log = get_logger("create_svr")
 
 FINRA_URL = "https://api.finra.org/data/group/otcMarket/name/regShoDaily"
 PAGE_SIZE = 5000
@@ -91,15 +93,20 @@ def _fetch_page(offset: int, retries: int = 5) -> list[dict]:
                 headers={"Accept": "application/json"},
                 timeout=30,
             )
+            if resp.status_code == 400:
+                # FINRA returns 400 when offset exceeds actual record count
+                # (record-total header can be stale). Treat as end of data.
+                return []
             resp.raise_for_status()
             return resp.json()
         except Exception as e:
             if attempt < retries - 1:
                 wait = 2 ** attempt
-                print(f"    Retry {attempt+1}/{retries} at offset {offset:,} ({e}) — waiting {wait}s")
+                log.warning("Retry %d/%d at offset %s (%s) — waiting %ds", attempt + 1, retries, f"{offset:,}", e, wait)
                 time.sleep(wait)
             else:
                 raise
+
 
 
 def _detect_fields(sample: dict) -> tuple[str, str, str, str]:
@@ -128,7 +135,7 @@ def fetch_svr(
     # Probe first page at start_offset to detect field names
     probe = _fetch_page(start_offset, retries=5)
     if not probe:
-        print("  No data at start_offset — nothing to fetch.")
+        log.warning("No data at start_offset — nothing to fetch.")
         return pd.DataFrame()
 
     date_f, ticker_f, short_f, total_f = _detect_fields(probe[0])
@@ -162,8 +169,8 @@ def fetch_svr(
 
         if pages % 20 == 0:
             latest = max(str(r.get(date_f, "")) for r in page)
-            print(f"    Page {pages}, offset {offset:,} | universe rows: {len(raw_rows):,} | "
-                  f"latest date: {latest}")
+            log.info("Page %d, offset %s | universe rows: %s | latest date: %s",
+                     pages, f"{offset:,}", f"{len(raw_rows):,}", latest)
 
         if len(page) < PAGE_SIZE:
             break  # last page
@@ -219,13 +226,10 @@ def print_coverage(conn: sqlite3.Connection) -> None:
     ).fetchone()
     total, n_isins, n_dates, min_d, max_d = row
     meta = dict(conn.execute("SELECT key, value FROM metadata WHERE key LIKE 'last_svr%'").fetchall())
-    print("\n── SVR Coverage ─────────────────────────────────")
-    print(f"  svr_daily rows:  {total:,}")
-    print(f"  ISINs:           {n_isins:,}")
-    print(f"  Trading days:    {n_dates:,}  ({min_d} → {max_d})")
+    log.info("SVR coverage: %s rows | %s ISINs | %s trading days (%s → %s)",
+             f"{total:,}", f"{n_isins:,}", f"{n_dates:,}", min_d, max_d)
     for k, v in meta.items():
-        print(f"  {k}: {v}")
-    print("─────────────────────────────────────────────────")
+        log.info("  %s: %s", k, v)
 
 
 # ---------------------------------------------------------------------------
@@ -246,7 +250,7 @@ def main() -> None:
             "SELECT ticker, isin FROM companies WHERE ticker IS NOT NULL AND ticker != ''"
         ).fetchall()
     ticker_to_isin: dict[str, str] = {t.upper(): i for t, i in rows}
-    print(f"Universe: {len(ticker_to_isin):,} tickers")
+    log.info("Universe: %s tickers", f"{len(ticker_to_isin):,}")
 
     with get_db(RETURNS_DB) as conn:
         setup_db(conn)
@@ -256,32 +260,33 @@ def main() -> None:
             return
 
         # Determine start offset and cutoff date
-        print("Probing FINRA record count ...")
+        log.info("Probing FINRA record count ...")
         total_records = _get_total_records()
-        print(f"  Total FINRA records: {total_records:,}")
+        log.info("Total FINRA records: %s", f"{total_records:,}")
 
         if args.backfill:
             start_offset = max(0, total_records - BACKFILL_BUFFER)
             cutoff_date  = (date.today() - timedelta(days=95)).isoformat()
-            print(f"Backfill mode: offset {start_offset:,}, cutoff {cutoff_date}")
+            log.info("Backfill mode: offset %s, cutoff %s", f"{start_offset:,}", cutoff_date)
         else:
             # Incremental: find last date already in DB
             last_row = conn.execute("SELECT MAX(date) FROM svr_daily").fetchone()
             last_date = last_row[0] if last_row and last_row[0] else None
 
             if last_date is None:
-                print("No existing SVR data — run with --backfill first.")
+                log.error("No existing SVR data — run with --backfill first.")
                 return
 
             start_offset = max(0, total_records - INCREMENTAL_BUFFER)
             cutoff_date  = last_date
-            print(f"Incremental mode: offset {start_offset:,}, cutoff {cutoff_date} (last date in DB)")
+            log.info("Incremental mode: offset %s, cutoff %s (last date in DB)",
+                     f"{start_offset:,}", cutoff_date)
 
-        print(f"Fetching SVR data ...")
+        log.info("Fetching SVR data ...")
         df = fetch_svr(start_offset, cutoff_date, ticker_to_isin)
 
         if df.empty:
-            print("No new rows to insert.")
+            log.info("No new rows to insert.")
         else:
             n = upsert_svr(conn, df)
             today_str = date.today().isoformat()
@@ -290,7 +295,7 @@ def main() -> None:
                 (today_str,),
             )
             conn.commit()
-            print(f"Inserted {n:,} rows | dates {df['date'].min()} → {df['date'].max()}")
+            log.info("Inserted %s rows | dates %s → %s", f"{n:,}", df['date'].min(), df['date'].max())
 
         print_coverage(conn)
 

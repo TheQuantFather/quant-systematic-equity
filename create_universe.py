@@ -34,7 +34,9 @@ from pathlib import Path
 from datetime import datetime
 
 from config import DATA_DIR, SIMFIN_DIR, UNIVERSE_DB as DB_PATH
-from utils import get_db
+from utils import get_db, get_logger
+
+log = get_logger("create_universe")
 
 INDEX_DIR  = DATA_DIR / "universe_index"
 
@@ -483,12 +485,12 @@ def build_historical_snapshots(
         for snap_date, (acc, _period) in sorted(filings.items()):
             acc_to_dates.setdefault(acc, []).append(snap_date)
 
-        print(f"\n  [{index_name}]")
+        log.info("[%s]", index_name)
         for acc, snap_dates in sorted(acc_to_dates.items()):
             try:
                 holdings = _fetch_nport_isins(acc, cik, known_isins)
             except Exception as e:
-                print(f"    {snap_dates[0]}: fetch error — {e}")
+                log.warning("  %s: fetch error — %s", snap_dates[0], e)
                 continue
             for snap_date in snap_dates:
                 for h in holdings:
@@ -499,7 +501,7 @@ def build_historical_snapshots(
                         "weight":        h["weight"],
                         "market_value":  h["market_value"],
                     })
-                print(f"    {snap_date}: {len(holdings)} companies  (acc {acc})")
+                log.info("  %s: %d companies  (acc %s)", snap_date, len(holdings), acc)
             time.sleep(0.3)
 
     return pd.DataFrame(rows)
@@ -541,7 +543,7 @@ def enrich_edgar_metadata(companies: pd.DataFrame) -> pd.DataFrame:
     try:
         tickers_data = _edgar_fetch("https://www.sec.gov/files/company_tickers.json", timeout=15)
     except Exception as e:
-        print(f"  [EDGAR] Could not fetch company_tickers.json: {e}")
+        log.warning("[EDGAR] Could not fetch company_tickers.json: %s", e)
         return companies
 
     # Build ticker → CIK dict (CIK as zero-padded 10-digit string)
@@ -558,7 +560,7 @@ def enrich_edgar_metadata(companies: pd.DataFrame) -> pd.DataFrame:
     if missing.empty:
         return companies
 
-    print(f"  [EDGAR] Looking up CIKs for {len(missing)} companies ...")
+    log.info("[EDGAR] Looking up CIKs for %d companies ...", len(missing))
     filled = 0
 
     for idx, row in missing.iterrows():
@@ -588,7 +590,7 @@ def enrich_edgar_metadata(companies: pd.DataFrame) -> pd.DataFrame:
         except Exception:
             pass
 
-    print(f"  [EDGAR] Filled CIK for {filled} / {len(missing)} missing companies")
+    log.info("[EDGAR] Filled CIK for %d / %d missing companies", filled, len(missing))
     return companies
 
 
@@ -698,13 +700,11 @@ def refresh_isins() -> None:
         existing = {r[0] for r in conn.execute("SELECT ticker FROM isin_patch").fetchall()}
 
     pending = [t for t in ticker_list if t not in existing]
-    print(
-        f"Tickers: {len(ticker_list)} total, {len(existing)} already in isin_patch, "
-        f"{len(pending)} to fetch from FMP ..."
-    )
+    log.info("Tickers: %d total, %d already in isin_patch, %d to fetch from FMP ...",
+             len(ticker_list), len(existing), len(pending))
 
     if not pending:
-        print("  Nothing to fetch — all tickers already resolved.")
+        log.info("Nothing to fetch — all tickers already resolved.")
         return
 
     with get_db(DB_PATH) as conn:
@@ -712,13 +712,13 @@ def refresh_isins() -> None:
         rate_limited = False
         for i, ticker in enumerate(pending):
             if (i + 1) % 100 == 0:
-                print(f"  {i + 1}/{len(pending)} ...")
+                log.info("  %d/%d ...", i + 1, len(pending))
             try:
                 isin = _fmp_fetch_isin(ticker, api_key)
             except urllib.error.HTTPError as e:
                 if e.code == 429:
-                    print(f"\n[ERROR] FMP rate limit hit after {i} requests (HTTP 429).")
-                    print("        Create a new free FMP account, update FMP_API_KEY in .env, and re-run.")
+                    log.error("[ERROR] FMP rate limit hit after %d requests (HTTP 429). "
+                              "Create a new free FMP account, update FMP_API_KEY in .env, and re-run.", i)
                     rate_limited = True
                     break
                 raise
@@ -734,9 +734,9 @@ def refresh_isins() -> None:
         conn.commit()
 
     label = "rate-limited — re-run with new FMP key" if rate_limited else "not found by FMP"
-    print(f"  {hits} new ISINs written to isin_patch, {len(misses)} {label}")
+    log.info("%d new ISINs written to isin_patch, %d %s", hits, len(misses), label)
     if misses and not rate_limited:
-        print(f"  Not found: {', '.join(misses[:20])}" + (" ..." if len(misses) > 20 else ""))
+        log.info("Not found: %s%s", ", ".join(misses[:20]), " ..." if len(misses) > 20 else "")
 
 
 # ---------------------------------------------------------------------------
@@ -759,7 +759,7 @@ def fix_isins() -> None:
     tickers so you can act on them manually or add a key and re-run.
     """
     # ---------- Phase 1: identify suspects via N-PORT comparison ----------
-    print("Loading companies table and isin_patch ...")
+    log.info("Loading companies table and isin_patch ...")
     with get_db(DB_PATH) as conn:
         seed_all_reference_tables(conn)
         companies_rows = conn.execute("SELECT ticker, isin FROM companies").fetchall()
@@ -767,7 +767,7 @@ def fix_isins() -> None:
 
     ticker_to_isin: dict[str, str]      = {r[0]: r[1] for r in companies_rows}
     patched_by_ticker: dict[str, str]   = {r[0]: r[1] for r in patch_rows}
-    print(f"  {len(companies_rows)} companies, {len(patched_by_ticker)} already in isin_patch")
+    log.info("  %d companies, %d already in isin_patch", len(companies_rows), len(patched_by_ticker))
 
     # Fetch N-PORT: latest accession per index (deduplicated)
     registry = load_index_registry()
@@ -785,18 +785,18 @@ def fix_isins() -> None:
     if not latest_acc_cik:
         raise RuntimeError("No N-PORT accessions found in nport_accessions table.")
 
-    print(f"\nFetching {len(latest_acc_cik)} latest N-PORT filing(s) ...")
+    log.info("Fetching %d latest N-PORT filing(s) ...", len(latest_acc_cik))
     nport_isins: set[str] = set()
     for acc, cik in latest_acc_cik:
         try:
             isins = _fetch_nport_all_ec_isins(acc, cik)
             nport_isins.update(isins)
-            print(f"  {acc}: {len(isins)} EC holdings")
+            log.info("  %s: %d EC holdings", acc, len(isins))
         except Exception as e:
-            print(f"  {acc}: fetch error — {e}")
+            log.warning("  %s: fetch error — %s", acc, e)
         time.sleep(0.3)
 
-    print(f"\nN-PORT: {len(nport_isins)} unique EC ISINs in latest filing(s)")
+    log.info("N-PORT: %d unique EC ISINs in latest filing(s)", len(nport_isins))
 
     # Suspects: companies whose effective ISIN (patch wins over companies table) is not in N-PORT.
     # Exclude synthetic placeholders — those are handled by --refresh-isins.
@@ -808,38 +808,36 @@ def fix_isins() -> None:
         if effective_isin not in nport_isins:
             suspect_tickers.append(ticker)
 
-    print(f"Suspect tickers (effective ISIN not in N-PORT): {len(suspect_tickers)}")
+    log.info("Suspect tickers (effective ISIN not in N-PORT): %d", len(suspect_tickers))
     if not suspect_tickers:
-        print("No suspects — all company ISINs match N-PORT.")
+        log.info("No suspects — all company ISINs match N-PORT.")
         return
 
     for t in sorted(suspect_tickers):
         eff = patched_by_ticker.get(t, ticker_to_isin[t])
-        print(f"  {t:<10} {eff}")
+        log.info("  %-10s %s", t, eff)
 
     # ---------- Phase 2: fix via FMP, validated against N-PORT ----------
     api_key = _load_fmp_api_key()
     if not api_key:
-        print(
-            f"\nNo FMP_API_KEY in .env — cannot auto-fix. "
-            f"Add FMP_API_KEY=<key> to .env and re-run --fix-isins."
-        )
+        log.warning("No FMP_API_KEY in .env — cannot auto-fix. "
+                    "Add FMP_API_KEY=<key> to .env and re-run --fix-isins.")
         return
 
-    print(f"\nQuerying FMP for {len(suspect_tickers)} suspect ticker(s) ...")
+    log.info("Querying FMP for %d suspect ticker(s) ...", len(suspect_tickers))
     resolved: dict[str, str] = {}   # ticker → FMP ISIN (N-PORT validated)
     unresolved: list[str]    = []
     rate_limited             = False
 
     for i, ticker in enumerate(sorted(suspect_tickers)):
         if (i + 1) % 5 == 0 or i == 0:
-            print(f"  {i + 1}/{len(suspect_tickers)} ...")
+            log.info("  %d/%d ...", i + 1, len(suspect_tickers))
         try:
             fmp_isin = _fmp_fetch_isin(ticker, api_key)
         except urllib.error.HTTPError as e:
             if e.code == 429:
-                print(f"\n[ERROR] FMP rate limit hit after {i} requests (HTTP 429).")
-                print("        Create a new free FMP account, update FMP_API_KEY in .env, and re-run.")
+                log.error("[ERROR] FMP rate limit hit after %d requests (HTTP 429). "
+                          "Create a new free FMP account, update FMP_API_KEY in .env, and re-run.", i)
                 unresolved.extend(sorted(suspect_tickers)[i:])
                 rate_limited = True
                 break
@@ -852,7 +850,7 @@ def fix_isins() -> None:
 
     if resolved:
         isin_by_ticker = {r[0]: r[1] for r in companies_rows}
-        print(f"\nWriting {len(resolved)} corrected ISIN(s) to isin_patch ...")
+        log.info("Writing %d corrected ISIN(s) to isin_patch ...", len(resolved))
         with get_db(DB_PATH) as conn:
             for ticker, isin in sorted(resolved.items()):
                 conn.execute(
@@ -862,20 +860,18 @@ def fix_isins() -> None:
             conn.commit()
         for ticker, isin in sorted(resolved.items()):
             old = isin_by_ticker.get(ticker, "?")
-            print(f"  {ticker:<10}  {old}  →  {isin}")
+            log.info("  %-10s  %s  →  %s", ticker, old, isin)
 
     if unresolved:
-        print(
-            f"\n{len(unresolved)} suspect ticker(s) could not be auto-fixed "
-            f"(FMP returned no ISIN present in N-PORT):"
-        )
+        log.warning("%d suspect ticker(s) could not be auto-fixed "
+                    "(FMP returned no ISIN present in N-PORT):", len(unresolved))
         for t in unresolved:
             eff = patched_by_ticker.get(t, ticker_to_isin.get(t, "?"))
-            print(f"  {t:<10}  current={eff}")
+            log.warning("  %-10s  current=%s", t, eff)
 
-    print(f"\nDone. {len(resolved)} patched, {len(unresolved)} unresolved.")
+    log.info("Done. %d patched, %d unresolved.", len(resolved), len(unresolved))
     if resolved:
-        print("Re-run 'python create_universe.py' to rebuild companies table with corrected ISINs.")
+        log.info("Re-run 'python create_universe.py' to rebuild companies table with corrected ISINs.")
 
 
 # ---------------------------------------------------------------------------
@@ -940,12 +936,9 @@ def write_db(companies: pd.DataFrame, snapshots: pd.DataFrame) -> None:
         n_patch = conn.execute("SELECT COUNT(*) FROM isin_patch").fetchone()[0]
         n_reg   = conn.execute("SELECT COUNT(*) FROM index_registry").fetchone()[0]
         n_acc   = conn.execute("SELECT COUNT(*) FROM nport_accessions").fetchone()[0]
-        print(f"  ticker_alias:       {n_alias} aliases")
-        print(f"  isin_patch:         {n_patch} overrides")
-        print(f"  index_registry:     {n_reg} indexes")
-        print(f"  nport_accessions:   {n_acc} entries")
-        print(f"  companies:          {len(companies):,} rows")
-        print(f"  universe_snapshots: {len(snapshots):,} rows")
+        log.info("DB written: ticker_alias=%d, isin_patch=%d, index_registry=%d, nport_accessions=%d, "
+                 "companies=%s, universe_snapshots=%s",
+                 n_alias, n_patch, n_reg, n_acc, f"{len(companies):,}", f"{len(snapshots):,}")
 
 
 # ---------------------------------------------------------------------------
@@ -964,28 +957,24 @@ def print_report(
     simfin_m  = companies["simfin_id"].notna().sum()
     no_cik    = companies["cik"].isna().sum()
 
-    print(f"\n{'='*55}")
-    print(f"COMPANIES TABLE  ({total:,} securities)")
-    print(f"{'='*55}")
-    print(f"  ISIN from patch:     {patched:>4}  (FMP / manual override)")
-    print(f"  ISIN from SimFin:    {total - synthetic - patched:>4}")
-    print(f"  Synthetic ISIN:      {synthetic:>4}  (run --refresh-isins to resolve)")
+    log.info("=== COMPANIES TABLE  (%s securities) ===", f"{total:,}")
+    log.info("  ISIN from patch:  %4d  (FMP / manual override)", patched)
+    log.info("  ISIN from SimFin: %4d", total - synthetic - patched)
+    log.info("  Synthetic ISIN:   %4d  (run --refresh-isins to resolve)", synthetic)
     if synthetic:
         synt = companies[companies["isin"].str.startswith("NOISN_")][["ticker","company_name"]].values
         for t, n in synt:
-            print(f"    {t:<12} {n}")
-    print(f"  SimFin metadata:     {simfin_m:>4} / {total}")
-    print(f"  Missing CIK:         {no_cik:>4}  (non-US or new listings)")
+            log.info("    %-12s %s", t, n)
+    log.info("  SimFin metadata:  %4d / %d", simfin_m, total)
+    log.info("  Missing CIK:      %4d  (non-US or new listings)", no_cik)
 
-    print(f"\n{'='*55}")
-    print(f"UNIVERSE SNAPSHOTS")
-    print(f"{'='*55}")
+    log.info("=== UNIVERSE SNAPSHOTS ===")
     for (idx, dt), grp in snapshots.groupby(["index_name", "snapshot_date"]):
-        print(f"  {idx:<20} {dt}   {len(grp):>5} companies")
+        log.info("  %-20s %s   %5d companies", idx, dt, len(grp))
 
-    print(f"\nGICS sector breakdown (all companies):")
+    log.info("GICS sector breakdown (all companies):")
     for sector, cnt in companies["gics_sector"].value_counts().items():
-        print(f"  {sector:<30} {cnt:>4}")
+        log.info("  %-30s %4d", sector, cnt)
 
 
 # ---------------------------------------------------------------------------
@@ -1015,22 +1004,19 @@ def _write_snapshots_only(snapshots: pd.DataFrame) -> None:
         n_reg = conn.execute("SELECT COUNT(*) FROM index_registry").fetchone()[0]
         n_acc = conn.execute("SELECT COUNT(*) FROM nport_accessions").fetchone()[0]
 
-    print(f"  index_registry:     {n_reg} indexes")
-    print(f"  nport_accessions:   {n_acc} entries")
-    print(f"  universe_snapshots: {len(snapshots):,} rows")
+    log.info("Snapshots written: index_registry=%d, nport_accessions=%d, universe_snapshots=%s",
+             n_reg, n_acc, f"{len(snapshots):,}")
 
 
 def rebuild_snapshots() -> None:
     """Rebuild universe_snapshots from CSVs + EDGAR N-PORT-P. Does not touch companies."""
-    print("=" * 55)
-    print("REBUILD UNIVERSE SNAPSHOTS")
-    print("=" * 55)
+    log.info("=== REBUILD UNIVERSE SNAPSHOTS ===")
 
     with get_db(DB_PATH) as conn:
         companies = pd.read_sql("SELECT isin, ticker FROM companies", conn)
         seed_all_reference_tables(conn)
     known_isins = set(companies["isin"].dropna())
-    print(f"Known ISINs from companies table: {len(known_isins)}")
+    log.info("Known ISINs from companies table: %d", len(known_isins))
 
     registry = load_index_registry()
 
@@ -1038,32 +1024,32 @@ def rebuild_snapshots() -> None:
     ishares_frames: list[tuple[pd.DataFrame, str, str]] = []
     for path in index_files:
         eq, snapshot_date, index_name = load_ishares(path)
-        print(f"  {path.name:<45}  {len(eq):>5} holdings  ({index_name} @ {snapshot_date})")
+        log.info("  %-45s  %5d holdings  (%s @ %s)", path.name, len(eq), index_name, snapshot_date)
         ishares_frames.append((eq, snapshot_date, index_name))
 
     snapshots_csv = build_snapshots(ishares_frames, companies) if ishares_frames else pd.DataFrame()
-    print(f"CSV snapshots: {len(snapshots_csv):,} rows")
+    log.info("CSV snapshots: %s rows", f"{len(snapshots_csv):,}")
 
-    print("\nFetching N-PORT-P snapshots from EDGAR ...")
+    log.info("Fetching N-PORT-P snapshots from EDGAR ...")
     hist = build_historical_snapshots(known_isins, registry=registry)
-    print(f"EDGAR snapshots: {len(hist):,} rows")
+    log.info("EDGAR snapshots: %s rows", f"{len(hist):,}")
 
     all_snapshots = pd.concat([snapshots_csv, hist], ignore_index=True)
     all_snapshots = all_snapshots.drop_duplicates(subset=["snapshot_date", "isin", "index_name"])
-    print(f"Total unique snapshot rows: {len(all_snapshots):,}")
+    log.info("Total unique snapshot rows: %s", f"{len(all_snapshots):,}")
 
-    print(f"\nWriting to {DB_PATH} ...")
+    log.info("Writing to %s ...", DB_PATH)
     _write_snapshots_only(all_snapshots)
 
     for idx_name in sorted(all_snapshots["index_name"].unique()):
         sub = all_snapshots[all_snapshots["index_name"] == idx_name]
         dates = sorted(sub["snapshot_date"].unique())
-        print(f"\n  [{idx_name}] {len(dates)} snapshot dates, {len(sub):,} total rows")
+        log.info("[%s] %d snapshot dates, %s total rows", idx_name, len(dates), f"{len(sub):,}")
         for d in dates:
             n = (sub["snapshot_date"] == d).sum()
-            print(f"    {d}: {n} companies")
+            log.info("  %s: %d companies", d, n)
 
-    print("\nDone.")
+    log.info("Done.")
 
 
 # ---------------------------------------------------------------------------
@@ -1096,72 +1082,65 @@ def main() -> None:
         return
 
     if args.refresh_isins:
-        print("=" * 55)
-        print("REFRESH ISINs from FMP")
-        print("=" * 55)
+        log.info("=== REFRESH ISINs from FMP ===")
         refresh_isins()
-        print("\nDone. Re-run without --refresh-isins to rebuild companies table with updated ISINs.")
+        log.info("Done. Re-run without --refresh-isins to rebuild companies table with updated ISINs.")
         return
 
     if args.fix_isins:
-        print("=" * 55)
-        print("FIX ISINs via N-PORT + FMP validation")
-        print("=" * 55)
+        log.info("=== FIX ISINs via N-PORT + FMP validation ===")
         fix_isins()
         return
 
-    print("=" * 55)
-    print("CREATE UNIVERSE")
-    print("=" * 55)
+    log.info("=== CREATE UNIVERSE ===")
 
-    print("\nLoading SimFin data ...")
+    log.info("Loading SimFin data ...")
     simfin = load_simfin()
-    print(f"  {len(simfin):,} companies loaded")
+    log.info("  %s companies loaded", f"{len(simfin):,}")
 
     index_files = sorted(INDEX_DIR.glob("*.csv")) if INDEX_DIR.exists() else []
     if not index_files:
-        print("[ERROR] No CSV files found in data/universe_index/")
+        log.error("[ERROR] No CSV files found in data/universe_index/")
         return
 
-    print(f"\nLoading {len(index_files)} index file(s) ...")
+    log.info("Loading %d index file(s) ...", len(index_files))
     ishares_frames: list[tuple[pd.DataFrame, str, str]] = []
     for path in index_files:
         eq, snapshot_date, index_name = load_ishares(path)
-        print(f"  {path.name:<45}  {len(eq):>5} holdings  ({index_name} @ {snapshot_date})")
+        log.info("  %-45s  %5d holdings  (%s @ %s)", path.name, len(eq), index_name, snapshot_date)
         ishares_frames.append((eq, snapshot_date, index_name))
 
     # Seed reference tables before first use, then load from DB
-    print("\nLoading reference tables from DB ...")
+    log.info("Loading reference tables from DB ...")
     with get_db(DB_PATH) as conn:
         seed_all_reference_tables(conn)
     patch    = load_isin_patch()
     alias    = load_ticker_alias()
     registry = load_index_registry()
-    print(f"  isin_patch: {len(patch)} overrides | ticker_alias: {len(alias)} | indexes: {len(registry)}")
+    log.info("  isin_patch: %d overrides | ticker_alias: %d | indexes: %d",
+             len(patch), len(alias), len(registry))
 
-    print("\nBuilding companies table ...")
+    log.info("Building companies table ...")
     companies = build_companies(ishares_frames, simfin, patch=patch, alias=alias)
 
-    print("Enriching metadata from EDGAR ...")
+    log.info("Enriching metadata from EDGAR ...")
     companies = enrich_edgar_metadata(companies)
 
-    print("Building universe_snapshots table ...")
+    log.info("Building universe_snapshots table ...")
     snapshots = build_snapshots(ishares_frames, companies, alias=alias)
 
-    print("Fetching historical universe snapshots from EDGAR N-PORT-P ...")
+    log.info("Fetching historical universe snapshots from EDGAR N-PORT-P ...")
     known_isins = set(companies["isin"].dropna())
     hist = build_historical_snapshots(known_isins, registry=registry)
     if not hist.empty:
         snapshots = pd.concat([snapshots, hist], ignore_index=True)
 
-    print(f"\nWriting to {DB_PATH} ...")
+    log.info("Writing to %s ...", DB_PATH)
     write_db(companies, snapshots)
 
     print_report(companies, snapshots, patch=patch)
 
-    print("\n" + "=" * 55)
-    print("Done.")
-    print("=" * 55)
+    log.info("=== Done ===")
 
 
 if __name__ == "__main__":

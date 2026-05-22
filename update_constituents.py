@@ -33,7 +33,9 @@ import pandas as pd
 from edgar import Company, get_filings, set_identity
 
 from config import CONSTITUENTS_DB, UNIVERSE_DB, CONCEPT_MAP_XLSX
-from utils import classify_sector, get_db
+from utils import classify_sector, get_db, get_logger
+
+log = get_logger("update_constituents")
 
 # Earliest fiscal year to fetch. Set to 2017 to support 2019-04-01 factor
 # snapshots (needs FY2018 annual data) with one extra year of LTM buffer.
@@ -341,8 +343,8 @@ def _parse_statement(
 
     # Warn when a quarterly filing exposes only YTD data
     if prefer_standalone and _period_label(col) in _YTD_LABELS:
-        print(f"  [WARN period] only cumulative ({_period_label(col)}) column available "
-              f"for quarterly context — YTD decomposition will be needed")
+        log.warning("[WARN period] only cumulative (%s) column available "
+                    "for quarterly context — YTD decomposition will be needed", _period_label(col))
 
     concept_priority = {sc: i for i, sc in enumerate(concept_map.keys())}
 
@@ -680,19 +682,19 @@ def process_filing_annual(
     report_date  = period
 
     if dry_run:
-        print(f"  [{ticker}] would fetch FY{fy}  (filed {publish_date})")
+        log.info("[%s] would fetch FY%s  (filed %s)", ticker, fy, publish_date)
         return 0
 
     try:
         income_d, balance_d, cashflow_d = extract_filing_data(filing)
     except Exception as exc:
-        print(f"  [{ticker}] FY{fy} XBRL parse error: {exc}")
+        log.warning("[%s] FY%s XBRL parse error: %s", ticker, fy, exc)
         return 0
 
     rows = build_rows(security_id, fy, publish_date, report_date, income_d, balance_d, cashflow_d)
     if rows:
         insert_rows(conn, rows)
-        print(f"  [{ticker}] FY{fy}  {len(rows)} rows  (filed {publish_date})")
+        log.info("[%s] FY%s  %d rows  (filed %s)", ticker, fy, len(rows), publish_date)
     return len(rows)
 
 
@@ -730,19 +732,19 @@ def process_filing_quarterly(
     report_date  = period
 
     if dry_run:
-        print(f"  [{ticker}] would fetch {q_label} FY{q_fy}  (filed {publish_date})")
+        log.info("[%s] would fetch %s FY%s  (filed %s)", ticker, q_label, q_fy, publish_date)
         return 0
 
     try:
         income_d, balance_d, cashflow_d = extract_filing_data(filing, is_quarterly=True)
     except Exception as exc:
-        print(f"  [{ticker}] {q_label} FY{q_fy} XBRL parse error: {exc}")
+        log.warning("[%s] %s FY%s XBRL parse error: %s", ticker, q_label, q_fy, exc)
         return 0
 
     rows = build_rows(security_id, q_fy, publish_date, report_date, income_d, balance_d, cashflow_d, period_override=q_label)
     if rows:
         insert_rows(conn, rows)
-        print(f"  [{ticker}] {q_label} FY{q_fy}  {len(rows)} rows  (filed {publish_date})")
+        log.info("[%s] %s FY%s  %d rows  (filed %s)", ticker, q_label, q_fy, len(rows), publish_date)
     return len(rows)
 
 
@@ -797,7 +799,7 @@ def process_company(
 
     co = resolve_company(info)
     if co is None:
-        print(f"  [{ticker}] EDGAR lookup failed — skipping")
+        log.warning("[%s] EDGAR lookup failed — skipping", ticker)
         return 0
 
     filings = co.get_filings(form="10-K")
@@ -829,13 +831,13 @@ def process_company(
         report_date  = period
 
         if dry_run:
-            print(f"  [{ticker}] would fetch FY{fy}  (filed {publish_date})")
+            log.info("[%s] would fetch FY%s  (filed %s)", ticker, fy, publish_date)
             continue
 
         try:
             income_d, balance_d, cashflow_d = extract_filing_data(filing)
         except Exception as exc:
-            print(f"  [{ticker}] FY{fy} XBRL parse error: {exc}")
+            log.warning("[%s] FY%s XBRL parse error: %s", ticker, fy, exc)
             continue
 
         rows = build_rows(
@@ -843,7 +845,7 @@ def process_company(
             income_d, balance_d, cashflow_d,
         )
         new_rows.extend(rows)
-        print(f"  [{ticker}] FY{fy}  {len(rows)} rows  (filed {publish_date})")
+        log.info("[%s] FY%s  %d rows  (filed %s)", ticker, fy, len(rows), publish_date)
 
     if new_rows:
         insert_rows(conn, new_rows)
@@ -911,13 +913,13 @@ def process_company_quarterly(
         report_date  = period
 
         if dry_run:
-            print(f"  [{ticker}] would fetch {q_label} FY{q_fy}  (filed {publish_date})")
+            log.info("[%s] would fetch %s FY%s  (filed %s)", ticker, q_label, q_fy, publish_date)
             continue
 
         try:
             income_d, balance_d, cashflow_d = extract_filing_data(filing, is_quarterly=True)
         except Exception as exc:
-            print(f"  [{ticker}] {q_label} FY{q_fy} XBRL parse error: {exc}")
+            log.warning("[%s] %s FY%s XBRL parse error: %s", ticker, q_label, q_fy, exc)
             continue
 
         rows = build_rows(
@@ -926,7 +928,7 @@ def process_company_quarterly(
             period_override=q_label,
         )
         new_rows.extend(rows)
-        print(f"  [{ticker}] {q_label} FY{q_fy}  {len(rows)} rows  (filed {publish_date})")
+        log.info("[%s] %s FY%s  %d rows  (filed %s)", ticker, q_label, q_fy, len(rows), publish_date)
 
     if new_rows:
         insert_rows(conn, new_rows)
@@ -984,8 +986,8 @@ def main() -> None:
         # ── EDGAR filing index mode ─────────────────────────────────────────
         # Download the EDGAR index, filter to universe, process only actual filers.
         cik_map = build_cik_universe_map(sector_type_filter=args.sector_type)
-        print(f"Universe: {len(cik_map):,} companies with known CIK")
-        print(f"Mode: index (last {args.days} days)\n")
+        log.info("Universe: %s companies with known CIK", f"{len(cik_map):,}")
+        log.info("Mode: index (last %d days)", args.days)
 
         with get_db(CONSTITUENTS_DB) as conn:
             latest_fy_map  = get_latest_fy_per_company(conn)
@@ -1000,7 +1002,7 @@ def main() -> None:
         filings_matched  = 0
 
         # ── Annual 10-K ──────────────────────────────────────────────────────
-        print(f"Fetching 10-K index (last {args.days} days) ...")
+        log.info("Fetching 10-K index (last %d days) ...", args.days)
         annual_filings = fetch_recent_filings("10-K", args.days)
         annual_matched = [
             (f, cik_map[int(f.cik)][0], cik_map[int(f.cik)][1])
@@ -1009,8 +1011,7 @@ def main() -> None:
         ]
         filings_in_index += len(annual_filings)
         filings_matched  += len(annual_matched)
-        print(f"  {len(annual_filings)} 10-K filings in index, "
-              f"{len(annual_matched)} match universe\n")
+        log.info("%d 10-K filings in index, %d match universe", len(annual_filings), len(annual_matched))
 
         with get_db(CONSTITUENTS_DB) as conn:
             for filing, security_id, info in annual_matched:
@@ -1028,13 +1029,13 @@ def main() -> None:
                     else:
                         co_no_new += 1
                 except Exception as exc:
-                    print(f"  [{ticker}] skipped — {type(exc).__name__}: {exc}")
+                    log.warning("[%s] skipped — %s: %s", ticker, type(exc).__name__, exc)
                     co_failed += 1
                     n = 0
                 total_rows += n
 
         # ── Quarterly 10-Q ───────────────────────────────────────────────────
-        print(f"\nFetching 10-Q index (last {args.days} days) ...")
+        log.info("Fetching 10-Q index (last %d days) ...", args.days)
         quarterly_filings = fetch_recent_filings("10-Q", args.days)
         quarterly_matched = [
             (f, cik_map[int(f.cik)][0], cik_map[int(f.cik)][1])
@@ -1043,8 +1044,7 @@ def main() -> None:
         ]
         filings_in_index += len(quarterly_filings)
         filings_matched  += len(quarterly_matched)
-        print(f"  {len(quarterly_filings)} 10-Q filings in index, "
-              f"{len(quarterly_matched)} match universe\n")
+        log.info("%d 10-Q filings in index, %d match universe", len(quarterly_filings), len(quarterly_matched))
 
         with get_db(CONSTITUENTS_DB) as conn:
             for filing, security_id, info in quarterly_matched:
@@ -1066,14 +1066,14 @@ def main() -> None:
                     else:
                         co_no_new += 1
                 except Exception as exc:
-                    print(f"  [{ticker}] skipped — {type(exc).__name__}: {exc}")
+                    log.warning("[%s] skipped — %s: %s", ticker, type(exc).__name__, exc)
                     co_failed += 1
                     n = 0
                 total_rows += n
 
         action = "would insert" if args.dry_run else "inserted"
-        print(f"\nDone — {total_checked} universe filings checked, "
-              f"{total_rows:,} rows {action}.")
+        log.info("Done — %d universe filings checked, %s rows %s.",
+                 total_checked, f"{total_rows:,}", action)
 
         with get_db(CONSTITUENTS_DB) as log_conn:
             run_id = _write_pull_log(
@@ -1087,7 +1087,7 @@ def main() -> None:
                 filings_in_index=filings_in_index,
                 filings_matched=filings_matched,
             )
-        print(f"Run logged — run_id={run_id}")
+        log.info("Run logged — run_id=%s", run_id)
 
     else:
         # ── Company-by-company mode (backfill / targeted) ───────────────────
@@ -1100,8 +1100,8 @@ def main() -> None:
             stored_q_map      = get_stored_quarters_per_company(conn) if args.quarterly else {}
 
         mode_label = "quarterly (10-Q)" if args.quarterly else "annual (10-K)"
-        print(f"Universe: {len(company_map):,} companies  |  mode: {mode_label}")
-        print(f"Companies with existing data: {len(latest_fy_map):,}")
+        log.info("Universe: %s companies  |  mode: %s", f"{len(company_map):,}", mode_label)
+        log.info("Companies with existing data: %s", f"{len(latest_fy_map):,}")
 
         # Build candidate list
         if args.ticker:
@@ -1111,7 +1111,7 @@ def main() -> None:
                 if (info.get("ticker") or "").upper() == args.ticker.upper()
             ]
             if not candidates:
-                print(f"Ticker {args.ticker!r} not found in universe.")
+                log.error("Ticker %r not found in universe.", args.ticker)
                 return
         elif args.cik:
             candidates = [
@@ -1120,7 +1120,7 @@ def main() -> None:
                 if info.get("cik") == args.cik
             ]
             if not candidates:
-                print(f"CIK {args.cik} not found in universe.")
+                log.error("CIK %s not found in universe.", args.cik)
                 return
         else:
             # Prioritise companies already in constituents.db (known good), then zero-data companies.
@@ -1135,9 +1135,9 @@ def main() -> None:
             candidates = candidates[: args.limit]
 
         if args.dry_run:
-            print(f"\n[DRY RUN] Checking {len(candidates):,} companies ...\n")
+            log.info("[DRY RUN] Checking %s companies ...", f"{len(candidates):,}")
         else:
-            print(f"\nProcessing {len(candidates):,} companies ...\n")
+            log.info("Processing %s companies ...", f"{len(candidates):,}")
 
         total_rows = 0
         stale_count = 0
@@ -1223,15 +1223,15 @@ def main() -> None:
                         co_no_new += 1
                 except Exception as exc:
                     ticker = info.get("ticker", str(simfin_id))
-                    print(f"  [{ticker}] skipped — {type(exc).__name__}: {exc}")
+                    log.warning("[%s] skipped — %s: %s", ticker, type(exc).__name__, exc)
                     co_failed += 1
                     n = 0
                 total_rows += n
 
         if args.dry_run:
-            print(f"\n[DRY RUN] {stale_count} stale companies identified.")
+            log.info("[DRY RUN] %d stale companies identified.", stale_count)
         else:
-            print(f"\nDone — inserted {total_rows:,} rows across {stale_count} companies.")
+            log.info("Done — inserted %s rows across %d companies.", f"{total_rows:,}", stale_count)
 
         with get_db(CONSTITUENTS_DB) as log_conn:
             run_id = _write_pull_log(
@@ -1243,7 +1243,7 @@ def main() -> None:
                 companies_failed=co_failed,
                 companies_skipped=companies_skipped,
             )
-        print(f"Run logged — run_id={run_id}")
+        log.info("Run logged — run_id=%s", run_id)
 
 
 if __name__ == "__main__":

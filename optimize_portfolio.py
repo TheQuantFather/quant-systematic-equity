@@ -69,7 +69,9 @@ _ensure_mosek_symlink()
 from config import (
     OUTPUT_DIR, PARAMS_FILE, UNIVERSE_DB, MODELS_DB, RISK_DB, BENCHMARK_DIR,
 )
-from utils import get_db
+from utils import get_db, get_logger
+
+log = get_logger("optimize_portfolio")
 
 
 # ── Excel params ──────────────────────────────────────────────────────────────
@@ -279,7 +281,7 @@ def load_barra_L(barra_date: str, investable: list[str]) -> np.ndarray | None:
         return np.vstack([A, B]).T                   # (N, K+N)
 
     except Exception as exc:
-        print(f"  [WARN] Barra load failed ({exc}); falling back to Ledoit-Wolf.")
+        log.warning("Barra load failed (%s); falling back to Ledoit-Wolf.", exc)
         return None
 
 
@@ -326,6 +328,37 @@ def _sector_industry_matrices(investable, gics_df):
         B_ind[industries.index(_industry(isin)), j]     = 1.0
 
     return sectors, industries, B_sector, B_ind, _sector, _industry
+
+
+def _lp_prescreen(
+    strategy: dict,
+    investable: list[str],
+    alpha: np.ndarray,
+    b: np.ndarray,
+    Sigma: np.ndarray | None,
+    L: np.ndarray,
+    sectors: list,
+    industries: list,
+    B_sector: np.ndarray,
+    B_ind: np.ndarray,
+    n_keep: int,
+) -> list[int] | None:
+    """
+    Solve the LP relaxation (no integer constraints) and return sorted indices of
+    the top n_keep stocks by weight. Used to build a small, constraint-aware
+    candidate set before solving the full MIP.
+    """
+    c_relax = {k: v for k, v in strategy["constraints"].items()
+               if k not in ("max_positions", "min_position_if_held")}
+    s_relax = {**strategy, "constraints": c_relax, "solver": "CLARABEL"}
+    try:
+        lp_weights, _ = _optimize_alpha(
+            s_relax, investable, alpha, b, Sigma, L,
+            sectors, industries, B_sector, B_ind)
+        keep_idx = np.argsort(-lp_weights)[:n_keep]
+        return sorted(keep_idx.tolist())
+    except Exception:
+        return None
 
 
 def _covariance_submatrix(risk_cov, risk_isin_idx, investable):
@@ -395,8 +428,7 @@ def _ensure_mosek(strategy: dict) -> None:
     """Auto-promote solver to MOSEK when integer constraints are present."""
     if _has_integer_constraints(strategy["constraints"]):
         if strategy.get("solver", "CLARABEL").upper() != "MOSEK":
-            print(f"  [INFO] Integer constraints detected — switching solver to MOSEK "
-                  f"(was {strategy['solver']})")
+            log.info("Integer constraints detected — switching solver to MOSEK (was %s)", strategy["solver"])
             strategy["solver"] = "MOSEK"
 
 
@@ -465,10 +497,8 @@ def _optimize_alpha(strategy, investable, alpha, b, Sigma, L,
     n_pos       = int((weights > 1e-4).sum())
     info_ratio  = exp_alpha / active_risk if active_risk > 0 else 0.0
 
-    print(f"\n  Expected alpha: {exp_alpha:+.4f}")
-    print(f"  Active risk:    {active_risk:.2%}")
-    print(f"  Info ratio:     {info_ratio:.2f}")
-    print(f"  Positions:      {n_pos}")
+    log.info("Expected alpha: %+.4f | Active risk: %.2f%% | Info ratio: %.2f | Positions: %d",
+             exp_alpha, active_risk * 100, info_ratio, n_pos)
 
     return weights, {
         "expected_alpha": round(exp_alpha, 4),
@@ -550,10 +580,8 @@ def _optimize_sharpe(strategy, investable, alpha, Sigma, L,
     sharpe     = exp_return / port_vol if port_vol > 0 else 0.0
     n_pos      = int((weights > 1e-4).sum())
 
-    print(f"\n  Expected return (alpha proxy): {exp_return:+.4f}")
-    print(f"  Portfolio vol:  {port_vol:.2%}")
-    print(f"  Sharpe ratio:   {sharpe:.2f}")
-    print(f"  Positions:      {n_pos}")
+    log.info("Expected return: %+.4f | Portfolio vol: %.2f%% | Sharpe: %.2f | Positions: %d",
+             exp_return, port_vol * 100, sharpe, n_pos)
 
     return weights, {
         "expected_alpha": round(exp_return, 4),
@@ -616,8 +644,7 @@ def _optimize_min_variance(strategy, investable, b, Sigma, L,
     port_vol = float(np.sqrt(_variance(weights, Sigma, L)))
     n_pos    = int((weights > 1e-4).sum())
 
-    print(f"\n  Portfolio vol:  {port_vol:.2%}")
-    print(f"  Positions:      {n_pos}")
+    log.info("Portfolio vol: %.2f%% | Positions: %d", port_vol * 100, n_pos)
 
     return weights, {
         "expected_alpha": 0.0,
@@ -638,12 +665,12 @@ _MOSEK_PARAMS = {
 }
 
 # Extra params applied only when the problem contains integer variables.
-# Allow MOSEK up to 120 s of branch-and-bound; it will return the best
+# Allow MOSEK up to 300 s of branch-and-bound; it will return the best
 # incumbent if time expires (status = optimal_inaccurate → still accepted).
 _MOSEK_PARAMS_MIP = {
     **_MOSEK_PARAMS,
-    "MSK_DPAR_OPTIMIZER_MAX_TIME":      120.0,
-    "MSK_DPAR_MIO_MAX_TIME":            120.0,
+    "MSK_DPAR_OPTIMIZER_MAX_TIME":      300.0,
+    "MSK_DPAR_MIO_MAX_TIME":            300.0,
     "MSK_DPAR_MIO_TOL_REL_GAP":         1e-3,   # 0.1% optimality gap is fine in practice
 }
 
@@ -658,7 +685,7 @@ def _solve(prob, solver_name: str):
     key = solver_name.upper()
     solver = solver_map.get(key, cp.CLARABEL)
     n_vars = sum(v.size for v in prob.variables())
-    print(f"  Solving ({solver_name}, vars={n_vars}) ...", end=" ", flush=True)
+    log.info("Solving (%s, vars=%d) ...", solver_name, n_vars)
 
     is_mip = any(v.attributes.get("boolean") for v in prob.variables())
     kwargs: dict = {"verbose": False}
@@ -667,7 +694,7 @@ def _solve(prob, solver_name: str):
 
     prob.solve(solver=solver, **kwargs)
     val = f"  obj={prob.value:.4f}" if prob.value is not None else ""
-    print(f"status={prob.status}{val}")
+    log.info("status=%s%s", prob.status, val)
     if prob.status not in ("optimal", "optimal_inaccurate"):
         raise RuntimeError(f"Optimization failed: {prob.status}")
 
@@ -828,43 +855,41 @@ def optimize_for_backtest(
 
     except Exception as exc:
         # Caller decides how to handle (e.g. carry forward previous weights)
-        print(f"  [WARN] optimize_for_backtest failed ({alpha_date}): {exc}")
+        log.warning("optimize_for_backtest failed (%s): %s", alpha_date, exc)
         return None
 
 
 # ── Main orchestration ────────────────────────────────────────────────────────
 
 def run_optimization(strategy: dict) -> tuple[pd.DataFrame, dict]:
-    print(f"\n{'='*60}")
-    print(f"  Strategy:  {strategy['name']}  ({strategy['strategy_id']})")
-    print(f"  Objective: {strategy['objective']}")
-    print(f"{'='*60}")
+    log.info("=== Strategy: %s  (%s)  Objective: %s ===",
+             strategy["name"], strategy["strategy_id"], strategy["objective"])
 
     objective = strategy["objective"]
 
-    print("  Loading covariance ...", end=" ", flush=True)
+    log.info("Loading covariance ...")
     risk_cov, risk_isins = load_covariance(strategy["risk_date"])
     risk_isin_idx = {isin: i for i, isin in enumerate(risk_isins)}
-    print(f"{len(risk_isins)} stocks in risk model")
+    log.info("  %d stocks in risk model", len(risk_isins))
 
     # Benchmark — always load for display if benchmark_file is set;
     # only fed into the optimiser's b vector for maximize_alpha.
     if strategy["benchmark_file"]:
-        print("  Loading benchmark ...", end=" ", flush=True)
+        log.info("Loading benchmark ...")
         bm_df = load_benchmark(strategy["benchmark_file"])
         ticker_to_isin = map_tickers_to_isins(list(bm_df["ticker"]))
         bm_df["isin"] = bm_df["ticker"].map(ticker_to_isin)
         bm_df = bm_df.dropna(subset=["isin"])
         bm_df["weight"] /= bm_df["weight"].sum()
-        print(f"{len(bm_df)} benchmark stocks")
+        log.info("  %d benchmark stocks", len(bm_df))
     else:
         bm_df = pd.DataFrame(columns=["isin", "weight"])
 
     # Alpha scores (blended from Alpha_Weights sheet)
-    print("  Loading alpha scores ...", end=" ", flush=True)
+    log.info("Loading alpha scores ...")
     alpha_lookup = load_blended_alpha(strategy["alpha_weights"], strategy["alpha_date"])
     models_str   = ", ".join(f"{m}×{w:.2g}" for m, w in strategy["alpha_weights"].items())
-    print(f"{len(alpha_lookup)} scores  [{models_str}]")
+    log.info("  %d scores  [%s]", len(alpha_lookup), models_str)
 
     meta_df = load_universe_metadata()
     gics_df = meta_df.set_index("isin")
@@ -872,30 +897,11 @@ def run_optimization(strategy: dict) -> tuple[pd.DataFrame, dict]:
     investable  = _build_investable(strategy, bm_df, risk_isins, risk_isin_idx)
     alpha_arr   = np.array([alpha_lookup.get(isin, 0.0) for isin in investable])
 
-    # Pre-screen universe when cardinality is set — reduces MIP problem size.
-    # Keep the top candidates by alpha (sharpe/alpha objectives) or by low
-    # individual variance (min_variance), capped at max_positions * 5 or 200.
     c_pre       = strategy["constraints"]
-    max_pos_n   = c_pre.get("max_positions")
-    if max_pos_n is not None:
-        prescreen_n = max(int(max_pos_n) * 5, 200)
-        if len(investable) > prescreen_n:
-            if strategy["objective"] == "minimize_variance":
-                # Pre-fetch diagonal of covariance to rank by lowest individual vol
-                diag_full = np.array([risk_cov[risk_isin_idx[i], risk_isin_idx[i]]
-                                      for i in investable])
-                keep_idx = np.argsort(diag_full)[:prescreen_n]
-            else:
-                keep_idx = np.argsort(-alpha_arr)[:prescreen_n]
-            keep_idx  = np.sort(keep_idx)
-            investable = [investable[i] for i in keep_idx]
-            alpha_arr  = alpha_arr[keep_idx]
-            print(f"  MIP pre-screen: {len(investable)} candidates "
-                  f"(max_positions={max_pos_n})")
 
     N           = len(investable)
     isin_to_pos = {isin: i for i, isin in enumerate(investable)}
-    print(f"  Investable universe: {N} stocks")
+    log.info("Investable universe: %d stocks", N)
 
     # ── Risk model: Barra (default) or Ledoit-Wolf fallback ──────────────────
     Sigma, L = _covariance_submatrix(risk_cov, risk_isin_idx, investable)
@@ -909,11 +915,11 @@ def run_optimization(strategy: dict) -> tuple[pd.DataFrame, dict]:
             L     = L_barra
             Sigma = None   # not needed — _variance() uses ||L.T @ w||² instead
             used_barra_date = barra_date
-            print(f"  Risk model:  Barra ({barra_date})  [{L.shape[1]} factors+stocks]")
+            log.info("Risk model: Barra (%s)  [%d factors+stocks]", barra_date, L.shape[1])
         else:
-            print(f"  Risk model:  Ledoit-Wolf (Barra unavailable)")
+            log.info("Risk model: Ledoit-Wolf (Barra unavailable)")
     else:
-        print(f"  Risk model:  Ledoit-Wolf")
+        log.info("Risk model: Ledoit-Wolf")
 
     alpha    = alpha_arr
 
@@ -928,6 +934,85 @@ def run_optimization(strategy: dict) -> tuple[pd.DataFrame, dict]:
 
     sectors, industries, B_sector, B_ind, _sector_fn, _industry_fn = \
         _sector_industry_matrices(investable, gics_df)
+
+    # LP-guided pre-screen for MIP strategies.
+    # Solve the continuous relaxation first (CLARABEL, fast), keep the top
+    # max_positions stocks by LP weight as the MIP candidate set.
+    # Using 1× (not 2×) because the LP-positive stocks (those the LP actually needs
+    # to satisfy constraints) are all ranked above the zero-weight stocks, so a
+    # 1× window includes all of them while keeping the MIP size small.
+    max_pos_n = c_pre.get("max_positions")
+    if (max_pos_n is not None and len(investable) > int(max_pos_n)
+            and objective == "maximize_alpha"):
+        n_cand = int(max_pos_n)
+        log.info("LP pre-screen: relaxation → top %d candidates ...", n_cand)
+        lp_idx = _lp_prescreen(
+            strategy, investable, alpha, b, Sigma, L,
+            sectors, industries, B_sector, B_ind, n_cand)
+        if lp_idx is not None:
+            lp_arr = np.array(lp_idx)
+            # Save full-universe sector matrices before subsetting — needed to
+            # correct sector benchmark weights after the pre-screen drops stocks.
+            b_full_pre        = b.copy()
+            B_sector_full_pre = B_sector.copy()
+            sectors_full_pre  = list(sectors)
+
+            investable  = [investable[i] for i in lp_idx]
+            alpha       = alpha[lp_arr]
+            b           = b[lp_arr]
+            bm_display  = bm_display[lp_arr]
+            Sigma, L    = _covariance_submatrix(risk_cov, risk_isin_idx, investable)
+            if used_barra_date:
+                L_barra = load_barra_L(used_barra_date, investable)
+                if L_barra is not None:
+                    L = L_barra
+                    Sigma = None
+            sectors, industries, B_sector, B_ind, _sector_fn, _industry_fn = \
+                _sector_industry_matrices(investable, gics_df)
+
+            # Dropped stocks still have benchmark weight, so the subsetted b
+            # underestimates sector benchmark weights — the MIP sector constraint
+            # would target the wrong level (e.g. Industrials at 4.6% instead of
+            # 9.2%).  Rescale b within each sector so B_sector @ b equals the
+            # full-benchmark sector weight.
+            for s_idx, sector in enumerate(sectors):
+                if sector not in sectors_full_pre:
+                    continue
+                s_full     = sectors_full_pre.index(sector)
+                full_sec_w = float(B_sector_full_pre[s_full] @ b_full_pre)
+                incl_sec_w = float(B_sector[s_idx] @ b)
+                if incl_sec_w > 1e-10 and full_sec_w > 0:
+                    b[B_sector[s_idx].astype(bool)] *= full_sec_w / incl_sec_w
+
+            N = len(investable)
+            log.info("LP pre-screen done (%d candidates)", N)
+        else:
+            log.info("LP pre-screen failed — using full universe")
+
+    # Alpha-score pre-screen for maximize_sharpe / minimize_variance MIPs.
+    # The LP pre-screen above is only for maximize_alpha (needs a benchmark LP).
+    # For other objectives with cardinality constraints, the full-universe MIP
+    # can be intractable (e.g. 998 binary vars). Pre-screen to top 5× max_positions
+    # by alpha score — fast heuristic that keeps the MIP size manageable.
+    if max_pos_n is not None and objective in ("maximize_sharpe", "minimize_variance"):
+        n_alpha_cand = min(len(investable), int(max_pos_n) * 5)
+        if n_alpha_cand < len(investable):
+            top_idx = np.argsort(-alpha)[:n_alpha_cand]
+            top_arr = np.array(sorted(top_idx.tolist()))
+            investable  = [investable[i] for i in top_arr]
+            alpha       = alpha[top_arr]
+            b           = b[top_arr]
+            bm_display  = bm_display[top_arr]
+            Sigma, L    = _covariance_submatrix(risk_cov, risk_isin_idx, investable)
+            if used_barra_date:
+                L_barra = load_barra_L(used_barra_date, investable)
+                if L_barra is not None:
+                    L = L_barra
+                    Sigma = None
+            sectors, industries, B_sector, B_ind, _sector_fn, _industry_fn = \
+                _sector_industry_matrices(investable, gics_df)
+            N = len(investable)
+            log.info("MIP pre-screen (alpha): top %d candidates (max_positions=%s)", N, max_pos_n)
 
     _ensure_mosek(strategy)
 
@@ -994,7 +1079,7 @@ def save_results(results_df: pd.DataFrame, summary: dict) -> Path:
     with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2)
 
-    print(f"\n  Saved → {latest}")
+    log.info("Saved → %s", latest)
     return latest
 
 
@@ -1008,12 +1093,13 @@ def main():
     args = parser.parse_args()
 
     if not PARAMS_FILE.exists():
-        print(f"ERROR: {PARAMS_FILE} not found. Run create_strategy_params.py first.")
+        log.error("ERROR: %s not found. Run create_strategy_params.py first.", PARAMS_FILE)
         return
 
     if args.list:
         xl = pd.ExcelFile(PARAMS_FILE)
         df = pd.read_excel(xl, sheet_name="Strategies")
+        # print() intentional here — tabular display for CLI listing only
         print(df[["strategy_id", "name", "active", "objective"]].to_string(index=False))
         return
 
@@ -1021,17 +1107,17 @@ def main():
     if args.solver:
         for s in strategies:
             s["solver"] = args.solver.upper()
-    print(f"Running {len(strategies)} strategy/strategies ...")
+    log.info("Running %d strategy/strategies ...", len(strategies))
 
     for s in strategies:
         try:
             results_df, summary = run_optimization(s)
             save_results(results_df, summary)
         except Exception as exc:
-            print(f"\n  ERROR in {s['strategy_id']}: {exc}")
+            log.error("ERROR in %s: %s", s["strategy_id"], exc)
             raise
 
-    print("\nDone.")
+    log.info("Done.")
 
 
 if __name__ == "__main__":
