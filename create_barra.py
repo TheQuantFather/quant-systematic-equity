@@ -61,7 +61,9 @@ from config import (
     SHRINK_IDIO, EIGENFLOOR, VRA_MIN, VRA_MAX, MIN_STOCKS,
     BARRA_SECTORS as SECTORS,
 )
-from utils import get_db, winsorized_zscore
+from utils import get_db, get_logger, winsorized_zscore
+
+log = get_logger("create_barra")
 
 # ---------------------------------------------------------------------------
 # Load Barra factor IDs from reference CSV (order = barra_factor_order column)
@@ -439,7 +441,7 @@ def _compute_all_factor_returns(
     f_data: dict   = {}   # {date_str: ndarray(K)}
     eps_sq_data: dict = {}  # {date_str: {isin: eps²}}
 
-    print(f"  Running regressions ({len(trading_days)} trading days × {K} factors)...")
+    log.info("Running regressions (%d trading days × %d factors)...", len(trading_days), K)
     for idx, td in enumerate(trading_days):
         td_str = td.strftime("%Y-%m-%d")
 
@@ -467,7 +469,7 @@ def _compute_all_factor_returns(
         eps_sq_data[td_str] = {isin: e ** 2 for isin, e in zip(isins_day, eps_t)}
 
         if (idx + 1) % 500 == 0:
-            print(f"    ... {idx+1}/{len(trading_days)} days")
+            log.info("  ... %d/%d days", idx + 1, len(trading_days))
 
     # ── Build DataFrames ────────────────────────────────────────────────────
     if not f_data:
@@ -485,7 +487,7 @@ def _compute_all_factor_returns(
         for isin, v in row_dict.items():
             eps_sq_df.loc[pd.Timestamp(date_str), isin] = v
 
-    print(f"  Done: {len(f_df)} days, {len(all_isins)} stocks with residuals")
+    log.info("Done: %d days, %d stocks with residuals", len(f_df), len(all_isins))
     return f_df, eps_sq_df
 
 
@@ -502,13 +504,20 @@ def _build_and_save_snapshot(
     """Compute full Barra model for one snapshot date and write to risk.db."""
     snap_ts = pd.Timestamp(snap_date_str)
 
-    # Slice factor returns history up to snapshot
-    F_hist_df = f_df[f_df.index <= snap_ts]
-    if len(F_hist_df) < 60:
-        print(f"  [WARN] Insufficient history for {snap_date_str} — skipping.")
+    # Strict point-in-time: all time-series data must precede snap_ts so that
+    # the same-day returns are never used in the covariance estimate (look-ahead
+    # bias). Historical --backfill runs respect this too, so all snapshots are
+    # built consistently from T-1 data.
+    f_df_pit        = f_df[f_df.index             < snap_ts]
+    returns_pit     = returns_wide[returns_wide.index < snap_ts]
+    eps_sq_pit      = eps_sq_df[eps_sq_df.index   < snap_ts]
+    betas_pit       = betas_wide[betas_wide.index  < snap_ts]
+
+    if len(f_df_pit) < 60:
+        log.warning("Insufficient history for %s — skipping.", snap_date_str)
         return
 
-    F_hist = F_hist_df.values  # (T, K)
+    F_hist = f_df_pit.values  # (T, K)
 
     # ── Factor covariance ────────────────────────────────────────────────────
     # _ewma_nw_cov returns daily-unit covariance; annualise (×252) so that
@@ -517,7 +526,7 @@ def _build_and_save_snapshot(
     F_cov = _ewma_nw_cov(F_hist, HL_FACTOR_COV, NW_LAGS) * 252.0
 
     # ── Idiosyncratic variance ───────────────────────────────────────────────
-    delta = _idio_variance(eps_sq_df, snap_ts, HL_IDIO, SHRINK_IDIO)
+    delta = _idio_variance(eps_sq_pit, snap_ts, HL_IDIO, SHRINK_IDIO)
 
     # ── Resolve factor snapshot and beta map for this date ───────────────────
     snap_keys = sorted(factor_snapshots.keys())
@@ -526,22 +535,20 @@ def _build_and_save_snapshot(
     )
     fsnap_now = factor_snapshots[latest_snap]
 
-    # Use the trading day closest to snap_date for betas
+    # Use the last available trading day strictly before snap_date for betas
     beta_row = (
-        betas_wide.loc[snap_ts]
-        if snap_ts in betas_wide.index
-        else betas_wide[betas_wide.index <= snap_ts].iloc[-1]
-        if not betas_wide[betas_wide.index <= snap_ts].empty
+        betas_pit.iloc[-1]
+        if not betas_pit.empty
         else betas_wide.iloc[-1]
     )
     beta_map_now = beta_row.dropna().to_dict()
 
     # ── VRA ──────────────────────────────────────────────────────────────────
     isins_snap = [i for i in fsnap_now if i in isin_sector]
-    B2 = _vra(returns_wide, F_cov, delta, snap_ts,
+    B2 = _vra(returns_pit, F_cov, delta, returns_pit.index[-1] if not returns_pit.empty else snap_ts,
                fsnap_now, isin_sector, beta_map_now)
     if abs(B2 - 1.0) > 0.01:
-        print(f"  VRA B²={B2:.3f} → scaling covariance")
+        log.info("VRA B²=%.3f → scaling covariance", B2)
     F_cov = B2 * F_cov
     delta  = {isin: B2 * v for isin, v in delta.items()}
 
@@ -582,9 +589,9 @@ def _build_and_save_snapshot(
 
     conn.commit()
 
-    print(
-        f"  Saved snapshot {snap_date_str}: "
-        f"F({K}×{K}), δ({len(delta)} stocks), X({len(isins_snap)}×{K}), VRA={B2:.3f}"
+    log.info(
+        "Saved snapshot %s: F(%dx%d), δ(%d stocks), X(%dx%d), VRA=%.3f",
+        snap_date_str, K, K, len(delta), len(isins_snap), K, B2,
     )
 
 
@@ -602,28 +609,26 @@ def _most_recent_friday() -> str:
 # ── Main entry point ───────────────────────────────────────────────────────────
 
 def main(snapshot_dates: list[str]) -> None:
-    print("=" * 60)
-    print("  Barra Factor Risk Model")
-    print("=" * 60)
+    log.info("=== Barra Factor Risk Model ===")
 
-    print("\nLoading universe...")
+    log.info("Loading universe...")
     isin_sector = _load_universe()
-    print(f"  {len(isin_sector)} companies")
+    log.info("  %d companies", len(isin_sector))
 
-    print("Loading factor snapshots...")
+    log.info("Loading factor snapshots...")
     factor_snapshots = _load_factor_snapshots()
-    print(f"  {len(factor_snapshots)} snapshots, "
-          f"{sum(len(v) for v in factor_snapshots.values())} stock-snapshot rows")
+    log.info("  %d snapshots, %d stock-snapshot rows",
+             len(factor_snapshots), sum(len(v) for v in factor_snapshots.values()))
 
-    print("Loading returns...")
+    log.info("Loading returns...")
     returns_wide = _load_returns_wide()
-    print(f"  {len(returns_wide)} trading days, {returns_wide.shape[1]} stocks")
-    print(f"  Period: {returns_wide.index[0].date()} → {returns_wide.index[-1].date()}")
+    log.info("  %d trading days, %d stocks", len(returns_wide), returns_wide.shape[1])
+    log.info("  Period: %s → %s", returns_wide.index[0].date(), returns_wide.index[-1].date())
 
-    print("Computing rolling 60-day betas...")
+    log.info("Computing rolling 60-day betas...")
     betas_wide = _compute_beta_60d(returns_wide)
 
-    print("\nComputing daily factor returns...")
+    log.info("Computing daily factor returns...")
     f_df, eps_sq_df = _compute_all_factor_returns(
         returns_wide, betas_wide, isin_sector, factor_snapshots
     )
@@ -631,7 +636,7 @@ def main(snapshot_dates: list[str]) -> None:
     conn = _init_db()
 
     # Persist all factor returns (INSERT OR REPLACE for idempotency)
-    print("Saving factor returns to DB...")
+    log.info("Saving factor returns to DB...")
     rows = [
         (ts.strftime("%Y-%m-%d"), fn, float(val))
         for ts, row in f_df.iterrows()
@@ -643,14 +648,17 @@ def main(snapshot_dates: list[str]) -> None:
         rows,
     )
     conn.commit()
-    print(f"  {len(rows):,} factor return rows saved")
+    log.info("  %s factor return rows saved", f"{len(rows):,}")
 
-    # Build and save each requested snapshot
+    # Build snapshots where we have at least some factor returns before the snap
+    # date (strict PIT: snap-date returns are never used). Allow up to 7 calendar
+    # days gap so a Friday snapshot builds when only Thursday returns are in DB.
+    last_fr = f_df.index[-1].date()
     snap_dates_filtered = [
         d for d in snapshot_dates
-        if d <= f_df.index[-1].strftime("%Y-%m-%d")
+        if date.fromisoformat(d) <= last_fr + timedelta(days=7)
     ]
-    print(f"\nBuilding {len(snap_dates_filtered)} Barra snapshot(s)...")
+    log.info("Building %d Barra snapshot(s)...", len(snap_dates_filtered))
     for snap_date_str in snap_dates_filtered:
         _build_and_save_snapshot(
             snap_date_str, returns_wide, f_df, eps_sq_df,
@@ -658,7 +666,7 @@ def main(snapshot_dates: list[str]) -> None:
         )
 
     conn.close()
-    print("\nDone.")
+    log.info("Done.")
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
@@ -678,11 +686,11 @@ if __name__ == "__main__":
 
     if args.backfill:
         dates = _get_snapshot_dates()
-        print(f"Backfill: {len(dates)} snapshots from {dates[0]} to {dates[-1]}")
+        log.info("Backfill: %d snapshots from %s to %s", len(dates), dates[0], dates[-1])
     elif args.dates:
         dates = sorted(set(args.dates))
     else:
         dates = [_most_recent_friday()]
-        print(f"Snapshot for most-recent Friday: {dates[0]}")
+        log.info("Snapshot for most-recent Friday: %s", dates[0])
 
     main(dates)

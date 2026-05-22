@@ -10,6 +10,9 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
 from config import PARAMS_FILE as OUT
+from utils import get_logger
+
+log = get_logger("create_strategy_params")
 
 HEADER_FILL = PatternFill("solid", fgColor="1F4E79")
 HEADER_FONT = Font(bold=True, color="FFFFFF", size=11)
@@ -301,7 +304,7 @@ def main():
     build_reference(wb)
 
     wb.save(OUT)
-    print(f"Created {OUT}  ({OUT.stat().st_size // 1024} KB)")
+    log.info("Created %s  (%s KB)", OUT, OUT.stat().st_size // 1024)
 
 
 if __name__ == "__main__":

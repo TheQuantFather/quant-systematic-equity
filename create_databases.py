@@ -6,7 +6,9 @@ from datetime import datetime
 from config import (
     DATA_DIR, SIMFIN_DIR, CONSTITUENTS_DB, UNIVERSE_DB, CONSTITUENTS_REF,
 )
-from utils import get_db
+from utils import get_db, get_logger
+
+log = get_logger("create_databases")
 
 
 def load_constituents_reference():
@@ -89,11 +91,11 @@ def _process_statements(df, stmt_type, stmt_constituents, universe, current_date
 
 
 def create_constituents_database():
-    print("Creating constituents database...")
+    log.info("Creating constituents database...")
 
     constituents_ref = load_constituents_reference()
     if constituents_ref is None:
-        print("constituents_reference.csv not found — aborting.")
+        log.error("constituents_reference.csv not found — aborting.")
         return
 
     universe     = load_universe()
@@ -130,21 +132,21 @@ def create_constituents_database():
             for filename, is_quarterly in [(annual_file, False), (quarterly_file, True)]:
                 path = SIMFIN_DIR / filename
                 if not path.exists():
-                    print(f"  {filename} not found — skipping.")
+                    log.warning("%s not found — skipping.", filename)
                     continue
 
                 label = "quarterly" if is_quarterly else "annual"
                 df = _load_simfin_file(path, is_quarterly)
-                print(f"  {stmt_type} {label}: {len(df):,} rows")
+                log.info("  %s %s: %s rows", stmt_type, label, f"{len(df):,}")
 
                 rows = _process_statements(df, stmt_type, constituents_ref, universe, current_date)
                 if rows:
                     _insert_rows(conn, rows)
                     total += len(rows)
-                    print(f"    → inserted {len(rows):,} records")
+                    log.info("    → inserted %s records", f"{len(rows):,}")
 
         conn.commit()
-    print(f"\nDone. Total records: {total:,}")
+    log.info("Done. Total records: %s", f"{total:,}")
 
 
 if __name__ == "__main__":

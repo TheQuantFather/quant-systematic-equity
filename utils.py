@@ -2,7 +2,11 @@
 utils.py — Shared utilities for the factor pipeline.
 """
 
+import logging
+import logging.handlers
+import os
 import sqlite3
+import sys
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Generator
@@ -62,6 +66,44 @@ hr { border-color: rgba(255,255,255,0.08) !important; }
 [data-testid="stSidebarNav"] li:first-child a span { text-transform: capitalize !important; }
 </style>
 """
+
+
+_LOG_DIR = Path(__file__).parent / "logs"
+
+_FMT = logging.Formatter(
+    "%(asctime)s  %(levelname)-8s  %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+
+
+def get_logger(name: str) -> logging.Logger:
+    """
+    Return a named logger that writes to logs/<name>.log and stdout.
+
+    - Level: LOG_LEVEL env var (default INFO). Set LOG_LEVEL=DEBUG for verbose output.
+    - Log files rotate at 5 MB, keeping 3 backups.
+    - Calling get_logger() twice with the same name returns the same logger (idempotent).
+    """
+    logger = logging.getLogger(name)
+    if logger.handlers:
+        return logger  # already configured — don't add duplicate handlers
+
+    level = getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO)
+    logger.setLevel(level)
+    logger.propagate = False  # don't bubble up to the root logger
+
+    _LOG_DIR.mkdir(exist_ok=True)
+    fh = logging.handlers.RotatingFileHandler(
+        _LOG_DIR / f"{name}.log", maxBytes=5_000_000, backupCount=3, encoding="utf-8"
+    )
+    fh.setFormatter(_FMT)
+    logger.addHandler(fh)
+
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setFormatter(_FMT)
+    logger.addHandler(sh)
+
+    return logger
 
 
 def inject_css() -> None:

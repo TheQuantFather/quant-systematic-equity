@@ -28,7 +28,9 @@ from pathlib import Path
 import pandas as pd
 
 from config import DATA_DIR, RETURNS_DB, UNIVERSE_DB
-from utils import get_db
+from utils import get_db, get_logger
+
+log = get_logger("create_returns")
 
 HISTORY_START = "2020-01-01"   # earliest date fetched for tickers with no existing data
 YAHOO_DELAY   = 0.15           # seconds between per-ticker requests (avoids rate-limiting)
@@ -118,12 +120,12 @@ def update_from_yahoo(
 
     already_current = len(ticker_to_isin) - len(work)
     if already_current:
-        print(f"  {already_current:,} tickers already current — skipping")
-    print(f"  {len(work):,} tickers to update")
+        log.info("%s tickers already current — skipping", f"{already_current:,}")
+    log.info("%s tickers to update", f"{len(work):,}")
 
     # Preflight: wait until Yahoo Finance is actually responding before burning
     # through retries on every ticker.  Uses exponential backoff up to 30 minutes.
-    print("  Checking Yahoo Finance connectivity ...")
+    log.info("Checking Yahoo Finance connectivity ...")
     _wait_for_yahoo()
 
     total_inserted = 0
@@ -138,9 +140,10 @@ def update_from_yahoo(
             consec_none += 1
             if consec_none >= 20:
                 conn.commit()
-                print(
-                    f"\n  [ABORT] 20 consecutive failures — Yahoo Finance is rate-limiting.\n"
-                    f"  Committed {total_inserted:,} rows so far. Re-run --update later."
+                log.error(
+                    "[ABORT] 20 consecutive failures — Yahoo Finance is rate-limiting. "
+                    "Committed %s rows so far. Re-run --update later.",
+                    f"{total_inserted:,}",
                 )
                 return
         else:
@@ -176,7 +179,8 @@ def update_from_yahoo(
         if (i + 1) % 50 == 0:
             conn.commit()
             pct = (i + 1) / len(work) * 100
-            print(f"  {i+1:,}/{len(work):,} ({pct:.0f}%) | {total_inserted:,} rows | {errors} errors")
+            log.info("%s/%s (%.0f%%) | %s rows | %d errors",
+                     f"{i+1:,}", f"{len(work):,}", pct, f"{total_inserted:,}", errors)
 
         time.sleep(YAHOO_DELAY)
 
@@ -186,7 +190,7 @@ def update_from_yahoo(
         (today_str,),
     )
     conn.commit()
-    print(f"\nYahoo update complete — {total_inserted:,} rows | {errors} errors")
+    log.info("Yahoo update complete — %s rows | %d errors", f"{total_inserted:,}", errors)
 
 
 # ---------------------------------------------------------------------------
@@ -208,7 +212,7 @@ def update_benchmark_returns(
     today_str = date.today().strftime("%Y-%m-%d")
 
     if not UNIVERSE_DB.exists():
-        print("  [benchmarks] universe.db not found — skipping")
+        log.warning("[benchmarks] universe.db not found — skipping")
         return
 
     with get_db(UNIVERSE_DB) as uc:
@@ -217,14 +221,14 @@ def update_benchmark_returns(
         ).fetchall()
 
     if not registry:
-        print("  [benchmarks] index_registry is empty — nothing to fetch")
+        log.warning("[benchmarks] index_registry is empty — nothing to fetch")
         return
 
     per_index_last: dict[str, str] = dict(conn.execute(
         "SELECT index_name, MAX(date) FROM benchmark_returns GROUP BY index_name"
     ).fetchall())
 
-    print(f"  Updating {len(registry)} benchmark index(es) ...")
+    log.info("Updating %d benchmark index(es) ...", len(registry))
     total_inserted = 0
 
     for index_name, etf_ticker in sorted(registry):
@@ -236,7 +240,7 @@ def update_benchmark_returns(
 
         raw_rows = _yahoo_ticker(etf_ticker, from_str, today_str, retries=3)
         if raw_rows is None:
-            print(f"  [{index_name}] fetch failed for {etf_ticker}")
+            log.warning("[%s] fetch failed for %s", index_name, etf_ticker)
             continue
         if not raw_rows:
             continue
@@ -263,12 +267,12 @@ def update_benchmark_returns(
         new_count = sum(1 for r in rows if r[1] > from_str)
         total_inserted += new_count
         if new_count:
-            print(f"  [{index_name:30s}] {etf_ticker:6s}  +{new_count} rows")
+            log.info("[%-30s] %-6s  +%d rows", index_name, etf_ticker, new_count)
 
         time.sleep(YAHOO_DELAY)
 
     conn.commit()
-    print(f"  Benchmark update complete — {total_inserted:,} new rows")
+    log.info("Benchmark update complete — %s new rows", f"{total_inserted:,}")
 
 
 def _wait_for_yahoo(max_wait_minutes: int = 30) -> None:
@@ -282,14 +286,14 @@ def _wait_for_yahoo(max_wait_minutes: int = 30) -> None:
     while True:
         rows = _yahoo_ticker("SPY", "2026-01-01", "2026-01-02", retries=0)
         if rows is not None:   # None = permanent error; [] = no data; list = success
-            print("  Yahoo Finance is responding — starting update")
+            log.info("Yahoo Finance is responding — starting update")
             return
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            print(f"  [WARN] Yahoo Finance still rate-limited after {max_wait_minutes}m — proceeding anyway")
+            log.warning("Yahoo Finance still rate-limited after %dm — proceeding anyway", max_wait_minutes)
             return
         actual_wait = min(wait, remaining)
-        print(f"  Rate-limited — waiting {actual_wait:.0f}s (up to {max_wait_minutes}m total)...")
+        log.info("Rate-limited — waiting %.0fs (up to %dm total)...", actual_wait, max_wait_minutes)
         time.sleep(actual_wait)
         wait = min(wait * 2, 300)
 
@@ -439,7 +443,7 @@ def _yahoo_ticker(
 # ---------------------------------------------------------------------------
 
 def run_checks(conn: sqlite3.Connection) -> bool:
-    print("\nRunning integrity checks …")
+    log.info("Running integrity checks ...")
     passed = True
 
     total = conn.execute("SELECT COUNT(*) FROM returns").fetchone()[0]
@@ -479,8 +483,11 @@ def run_checks(conn: sqlite3.Connection) -> bool:
 
 def _check(label: str, condition: bool, detail: str = "") -> None:
     status = "PASS" if condition else "FAIL"
-    detail_str = f"  ({detail})" if detail else ""
-    print(f"  [{status}] {label}{detail_str}")
+    msg = f"[{status}] {label}" + (f"  ({detail})" if detail else "")
+    if condition:
+        log.info(msg)
+    else:
+        log.error(msg)
 
 
 # ---------------------------------------------------------------------------
@@ -493,13 +500,10 @@ def print_summary(conn: sqlite3.Connection) -> None:
     min_d, max_d = conn.execute("SELECT MIN(date), MAX(date) FROM returns").fetchone()
     meta     = dict(conn.execute("SELECT key, value FROM metadata").fetchall())
 
-    print("\n── Returns DB Summary ──────────────────────────")
-    print(f"  returns table rows:  {total:,}")
-    print(f"  ISINs:               {n_isins:,}")
-    print(f"  Date range:          {min_d} → {max_d}")
+    log.info("Returns DB: %s rows | %s ISINs | %s → %s",
+             f"{total:,}", f"{n_isins:,}", min_d, max_d)
     for k, v in meta.items():
-        print(f"  {k}: {v}")
-    print("────────────────────────────────────────────────")
+        log.info("  %s: %s", k, v)
 
 
 # ---------------------------------------------------------------------------
@@ -544,7 +548,7 @@ def main():
     try:
         if args.update:
             update_from_yahoo(conn, history_start=args.history_start)
-            print("\nUpdating benchmark index returns ...")
+            log.info("Updating benchmark index returns ...")
             update_benchmark_returns(conn, history_start=args.history_start)
 
         if args.check or args.update:

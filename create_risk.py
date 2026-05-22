@@ -27,7 +27,9 @@ from config import (
     LW_MIN_HISTORY   as MIN_HISTORY,
     LW_WINSOR_CLIP   as WINSOR_CLIP,
 )
-from utils import get_db
+from utils import get_db, get_logger
+
+log = get_logger("create_risk")
 
 
 def _get_snapshot_dates() -> list[str]:
@@ -154,18 +156,13 @@ def unpack_matrix(blob: bytes) -> np.ndarray:
 # ── Per-date processing ───────────────────────────────────────────────────────
 
 def process_date(conn: sqlite3.Connection, data_date: str) -> None:
-    print(f"  {data_date}: loading returns ...", end=" ", flush=True)
-
     wide = load_returns_window(data_date)
     if wide.empty:
-        print("no returns data — skipping")
+        log.warning("%s: no returns data — skipping", data_date)
         return
 
     n_raw = wide.shape[1]
-    print(f"{n_raw} stocks × {wide.shape[0]} days", end="  →  ", flush=True)
-
     cov, isins, shrinkage = compute_covariance(wide)
-
     blob = pack_matrix(cov)
 
     conn.execute(
@@ -187,10 +184,10 @@ def process_date(conn: sqlite3.Connection, data_date: str) -> None:
     )
     conn.commit()
 
-    print(
-        f"cov {len(isins)}×{len(isins)}, "
-        f"shrinkage={shrinkage:.3f}, "
-        f"blob={len(blob) / 1024:.0f} KB"
+    log.info(
+        "%s: %d stocks × %d days → cov %dx%d, shrinkage=%.3f, blob=%d KB",
+        data_date, n_raw, wide.shape[0], len(isins), len(isins),
+        shrinkage, len(blob) // 1024,
     )
 
 
@@ -212,13 +209,16 @@ def main():
     with get_db(RISK_DB) as conn:
         init_db(conn)
 
-        print(f"Building covariance risk model for {len(dates)} date(s) "
-              f"(lookback={LOOKBACK_DAYS}d, Ledoit-Wolf shrinkage) ...\n")
+        log.info(
+            "Building covariance risk model for %d date(s) "
+            "(lookback=%dd, Ledoit-Wolf shrinkage) ...",
+            len(dates), LOOKBACK_DAYS,
+        )
 
         for d in dates:
             process_date(conn, d)
 
-    print("\nDone.")
+    log.info("Done.")
 
 
 if __name__ == "__main__":

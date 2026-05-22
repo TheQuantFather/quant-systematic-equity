@@ -35,7 +35,9 @@ from config import (
     FACTORS_REF, CONSTITUENTS_REF,
     BACKFILL_DATES, QUARTERLY_BACKFILL_DATES,
 )
-from utils import classify_sector, get_db, winsorized_zscore
+from utils import classify_sector, get_db, get_logger, winsorized_zscore
+
+log = get_logger("create_factors")
 
 _PERIOD_ORDER = {'Q1': 1, 'Q2': 2, 'Q3': 3, 'Q4': 4}
 
@@ -51,7 +53,7 @@ def load_universe() -> dict:
             "SELECT isin, company_name, simfin_sector, simfin_industry, ticker "
             "FROM companies"
         ).fetchall()
-    print(f"Universe: {len(rows):,} companies")
+    log.info("Universe: %s companies", f"{len(rows):,}")
     universe = {}
     for isin, company_name, sector, industry, ticker in rows:
         universe[isin] = {
@@ -92,8 +94,8 @@ def load_snapshot_isins(snapshot: date) -> set | None:
             (matched_date,)
         ).fetchall()
     if matched_date != date_str:
-        print(f"  [INFO] No universe_snapshots for {date_str} — "
-              f"using closest ({matched_date}, {len(rows):,} companies)")
+        log.info("No universe_snapshots for %s — using closest (%s, %s companies)",
+                 date_str, matched_date, f"{len(rows):,}")
     return {r[0] for r in rows}
 
 
@@ -251,7 +253,7 @@ def load_constituent_data() -> dict:
     # Fix YTD-cumulative quarterly values before Q4 derivation (order matters).
     ytd_fixed = _fix_ytd_quarters(data, name_to_kind)
     if ytd_fixed:
-        print(f"  [YTD fix] decomposed {ytd_fixed:,} Q2/Q3 Flow values from cumulative to standalone")
+        log.info("[YTD fix] decomposed %s Q2/Q3 Flow values from cumulative to standalone", f"{ytd_fixed:,}")
 
     # Derive Q4 standalone for companies where Q4 income/cashflow is absent.
     # Q4 = FY − Q1 − Q2 − Q3 (exact accounting identity for Flow items).
@@ -301,7 +303,7 @@ def load_constituent_data() -> dict:
         derived_q4 += 1
 
     if derived_q4:
-        print(f"  [Q4 derivation] derived {derived_q4:,} Q4 Flow values from FY − (Q1+Q2+Q3)")
+        log.info("[Q4 derivation] derived %s Q4 Flow values from FY − (Q1+Q2+Q3)", f"{derived_q4:,}")
 
     # Annual-only filers: companies whose income/cash-flow is stored only as
     # fiscal_period='FY' (no Q1/Q2/Q3 quarterly breakdown — e.g. SimFin
@@ -341,10 +343,10 @@ def load_constituent_data() -> dict:
         annual_direct += 1
 
     if annual_direct:
-        print(f"  [annual-only] assigned {annual_direct:,} FY Flow values to Q4 for annual-only filers")
+        log.info("[annual-only] assigned %s FY Flow values to Q4 for annual-only filers", f"{annual_direct:,}")
 
     _fix_shares_units(data)
-    print(f"Loaded quarterly constituent data for {len(data):,} companies")
+    log.info("Loaded quarterly constituent data for %s companies", f"{len(data):,}")
     return data
 
 
@@ -380,7 +382,7 @@ def _fix_shares_units(data: dict) -> None:
                 data[sid][qkey][shares_key] = val * (10 ** power)
                 fixed += 1
     if fixed:
-        print(f"  [shares fix] corrected {fixed} unit-mismatched Shares (Basic) values")
+        log.info("[shares fix] corrected %d unit-mismatched Shares (Basic) values", fixed)
 
 
 def load_kind_map() -> dict:
@@ -414,7 +416,7 @@ def load_svr_data() -> dict:
     for isin, grp in df.groupby("isin", sort=False):
         grp = grp.sort_values("date")
         result[isin] = (grp["date"].values, grp["svr"].values.astype(np.float64))
-    print(f"Loaded SVR data for {len(result):,} ISINs")
+    log.info("Loaded SVR data for %s ISINs", f"{len(result):,}")
     return result
 
 
@@ -423,9 +425,9 @@ def load_price_data() -> dict:
     Returns {isin: (dates_np, total_returns_np, closes_np, volumes_np)} from returns table.
     """
     if not RETURNS_DB.exists():
-        print("[WARN] returns.db not found — price-based factors will be empty.")
+        log.warning("returns.db not found — price-based factors will be empty.")
         return {}
-    print("Loading full price history from returns.db ...")
+    log.info("Loading full price history from returns.db ...")
     with get_db(RETURNS_DB) as conn:
         df = pd.read_sql_query(
             "SELECT isin, date, total_return, close, volume FROM returns "
@@ -444,7 +446,7 @@ def load_price_data() -> dict:
             grp["close"].values,
             grp["volume"].values.astype(np.float64),
         )
-    print(f"Loaded price data for {len(prices):,} ISINs")
+    log.info("Loaded price data for %s ISINs", f"{len(prices):,}")
     return prices
 
 
@@ -566,10 +568,9 @@ def select_ltm_data(
         for i in range(len(keys) - 1):
             gap = keys[i + 1] - keys[i]
             if gap not in (1, 7):
-                print(
-                    f"  [WARN] {label}: non-consecutive quarters in LTM "
-                    f"(sort_keys {keys}) — gap {gap} at position {i}; "
-                    f"snapshot={snapshot}"
+                log.warning(
+                    "[%s] non-consecutive quarters in LTM (sort_keys %s) — gap %d at position %d; snapshot=%s",
+                    label, keys, gap, i, snapshot,
                 )
                 return
 
@@ -1054,7 +1055,7 @@ def setup_factors_db(conn: sqlite3.Connection, clean: bool = False) -> None:
         cols = [r[1] for r in conn.execute("PRAGMA table_info(factors)").fetchall()]
         if 'fiscal_year' in cols or clean:
             reason = "old schema (had fiscal_year column)" if 'fiscal_year' in cols else "--clean flag"
-            print(f"[INFO] Dropping factors table ({reason}) — will rebuild from scratch")
+            log.info("Dropping factors table (%s) — will rebuild from scratch", reason)
             conn.execute("DROP TABLE factors")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS factors (
@@ -1150,7 +1151,7 @@ def run_for_date(
             rows.append((date_str, factor_id, isin, float(value), today, today))
 
     if unknown_names:
-        print(f"[WARN] factor names not in factors_reference.csv (skipped): {sorted(unknown_names)}")
+        log.warning("factor names not in factors_reference.csv (skipped): %s", sorted(unknown_names))
 
     conn.executemany(
         "INSERT OR REPLACE INTO factors "
@@ -1176,7 +1177,7 @@ def run_for_date(
     conn.commit()
 
     n_companies = len({r[2] for r in rows})  # r[2] is isin
-    print(f"  {date_str}: {n_companies:,} companies, {len(rows):,} factor rows")
+    log.info("%s: %s companies, %s factor rows", date_str, f"{n_companies:,}", f"{len(rows):,}")
     return len(rows)
 
 
@@ -1209,14 +1210,14 @@ def main():
     else:
         dates_to_run = [date.today()]
 
-    print("Loading reference data ...")
+    log.info("Loading reference data ...")
     universe            = load_universe()
     ticker_map          = load_ticker_map()
     factor_name_to_id   = load_factor_name_to_id()
     factor_sector_types = load_factor_sector_types()
     kind_map            = load_kind_map()
 
-    print("Loading constituent data from constituents.db ...")
+    log.info("Loading constituent data from constituents.db ...")
     constituent_data = load_constituent_data()
 
     prices   = load_price_data()
@@ -1226,7 +1227,7 @@ def main():
         setup_factors_db(conn, clean=args.clean)
 
         total_rows = 0
-        print(f"\nProcessing {len(dates_to_run)} date(s): {[str(d) for d in dates_to_run]}")
+        log.info("Processing %d date(s): %s", len(dates_to_run), [str(d) for d in dates_to_run])
         for snapshot in dates_to_run:
             total_rows += run_for_date(
                 snapshot, universe, ticker_map,
@@ -1240,7 +1241,7 @@ def main():
             )
             conn.commit()
 
-    print(f"\nDone — {total_rows:,} total factor rows across {len(dates_to_run)} date(s)")
+    log.info("Done — %s total factor rows across %d date(s)", f"{total_rows:,}", len(dates_to_run))
 
 
 if __name__ == "__main__":
