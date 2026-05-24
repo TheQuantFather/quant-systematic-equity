@@ -109,11 +109,12 @@ def seed_registry_tables(conn: "sqlite3.Connection") -> None:
     """Create index_registry and nport_accessions tables if they don't exist yet."""
     conn.execute("""
         CREATE TABLE IF NOT EXISTS index_registry (
-            index_name  TEXT PRIMARY KEY,
-            etf_ticker  TEXT NOT NULL,
-            etf_name    TEXT NOT NULL,
-            series_id   TEXT,
-            cik         TEXT
+            index_name    TEXT PRIMARY KEY,
+            etf_ticker    TEXT NOT NULL,
+            etf_name      TEXT NOT NULL,
+            series_id     TEXT,
+            cik           TEXT,
+            is_investable INTEGER NOT NULL DEFAULT 0
         )
     """)
     conn.execute("""
@@ -511,7 +512,7 @@ def build_historical_snapshots(
 # EDGAR metadata enrichment
 # ---------------------------------------------------------------------------
 
-_EDGAR_HEADERS = {"User-Agent": os.getenv("EDGAR_IDENTITY", "your-name your@email.com")}
+_EDGAR_HEADERS = {"User-Agent": "universe-builder shivam3125@gmail.com"}
 
 def _edgar_fetch(url: str, timeout: int = 10) -> dict:
     req = urllib.request.Request(url, headers=_EDGAR_HEADERS)

@@ -26,7 +26,7 @@ from utils import get_logger
 # Config
 # ---------------------------------------------------------------------------
 
-PYTHON   = sys.executable
+PYTHON   = "/Users/shivam/opt/anaconda3/envs/quant/bin/python3.13"
 REPO_DIR = Path(__file__).parent.resolve()
 
 # ---------------------------------------------------------------------------

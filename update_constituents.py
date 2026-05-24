@@ -22,12 +22,14 @@ Usage:
 
 import argparse
 import re
+import signal
 import socket
 import sqlite3
 import subprocess
 import time
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta
-from typing import Optional
+from typing import Generator, Optional
 
 import pandas as pd
 from edgar import Company, get_filings, set_identity
@@ -41,7 +43,29 @@ log = get_logger("update_constituents")
 # snapshots (needs FY2018 annual data) with one extra year of LTM buffer.
 MIN_FISCAL_YEAR = 2017
 
-set_identity(os.getenv("EDGAR_IDENTITY", "your-name your@email.com"))
+set_identity("personal-research shivam3125@gmail.com")
+
+# Cap edgar's bulk HTTP timeout so stuck companies can't hang for 40+ minutes.
+# Default: 8 retries × 300s read timeout = 40 min max. New: 3 retries × 45s = 2.25 min max.
+import edgar.httprequests as _ehr
+import httpx as _httpx
+_ehr.BULK_TIMEOUT = _httpx.Timeout(45.0, connect=10.0)
+_ehr.BULK_RETRY_ATTEMPTS = 3
+
+
+@contextmanager
+def _time_limit(seconds: int) -> Generator[None, None, None]:
+    """Raise TimeoutError if the block takes longer than `seconds`."""
+    def _handler(signum: int, frame: object) -> None:
+        raise TimeoutError(f"exceeded {seconds}s per-company limit")
+    old = signal.signal(signal.SIGALRM, _handler)
+    signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old)
+
 
 # ---------------------------------------------------------------------------
 # Concept maps — loaded from data/edgar_concept_map.xlsx at startup.
@@ -105,19 +129,22 @@ _FISCAL_PERIOD = {
 def load_company_map(sector_type_filter: Optional[str] = None) -> dict[int, dict]:
     """
     Returns {simfin_id: {isin, ticker, cik, company_name, sector_type, fye_month}} from universe.db companies table.
+    Companies without a simfin_id but with a CIK are included using -cik as a synthetic key
+    (safe because security_id = isin or str(simfin_id), and all such companies have ISINs).
     sector_type_filter — if provided, only includes companies of that sector type.
     """
     with get_db(UNIVERSE_DB) as conn:
         rows = conn.execute(
             "SELECT simfin_id, isin, ticker, cik, company_name, simfin_sector, simfin_industry, fiscal_year_end "
-            "FROM companies WHERE simfin_id IS NOT NULL"
+            "FROM companies WHERE simfin_id IS NOT NULL OR cik IS NOT NULL"
         ).fetchall()
     out: dict[int, dict] = {}
     for simfin_id, isin, ticker, cik, company_name, sector, industry, fye in rows:
         st = classify_sector(sector, industry)
         if sector_type_filter and st != sector_type_filter:
             continue
-        out[int(simfin_id)] = {
+        key = int(simfin_id) if simfin_id is not None else -int(cik)
+        out[key] = {
             "isin":         isin,
             "ticker":       ticker,
             "cik":          int(cik) if cik is not None else None,
@@ -136,7 +163,7 @@ def build_cik_universe_map(sector_type_filter: Optional[str] = None) -> dict[int
     with get_db(UNIVERSE_DB) as conn:
         rows = conn.execute(
             "SELECT simfin_id, isin, ticker, cik, company_name, simfin_sector, simfin_industry, fiscal_year_end "
-            "FROM companies WHERE cik IS NOT NULL AND simfin_id IS NOT NULL"
+            "FROM companies WHERE cik IS NOT NULL"
         ).fetchall()
     result: dict[int, tuple[str, dict]] = {}
     for simfin_id, isin, ticker, cik, company_name, sector, industry, fye in rows:
@@ -164,6 +191,10 @@ def _quarter_from_period(period: str, fye_month: int = 12) -> tuple[str, int] | 
     Uses the company's fiscal year end to correctly identify which fiscal quarter
     each period_of_report falls in, regardless of calendar alignment.
 
+    Allows a 1-month spillover for 52-53 week fiscal year companies whose quarter
+    ends sometimes fall one day into the next calendar month (e.g. GD Q1 FY2026
+    ended April 5 instead of March 31; STX Q1 FY2026 ended October 3 vs September).
+
     Returns None for Q4 (period ending in fye_month) — covered by the 10-K fetcher.
     Returns None for unrecognised periods.
     """
@@ -178,25 +209,54 @@ def _quarter_from_period(period: str, fye_month: int = 12) -> tuple[str, int] | 
     def _qend(offset: int) -> int:
         return ((fye_month - offset - 1) % 12) + 1
 
+    def _next(mo: int) -> int:
+        return (mo % 12) + 1
+
     q1_end = _qend(9)
     q2_end = _qend(6)
     q3_end = _qend(3)
 
-    if m == fye_month:
-        return None  # Q4 — skip, covered by 10-K
+    # Skip Q4 and its 1-month spillover — both covered by 10-K
+    if m == fye_month or m == _next(fye_month):
+        return None
 
     # Fiscal year: if the period month falls after the FYE in the calendar year,
     # the period belongs to the fiscal year that ends the following calendar year.
     # Example: AAPL (FYE=Sep), Q1 ends Dec 2024 → fiscal year 2025 (ends Sep 2025).
     fy = y + (1 if m > fye_month else 0)
 
-    if m == q1_end:
+    if m == q1_end or m == _next(q1_end):
         return ("Q1", fy)
-    if m == q2_end:
+    if m == q2_end or m == _next(q2_end):
         return ("Q2", fy)
-    if m == q3_end:
+    if m == q3_end or m == _next(q3_end):
         return ("Q3", fy)
     return None  # period doesn't align with expected quarter ends — skip
+
+
+def _latest_expected_sk(today_d: date, fye_month: int) -> int:
+    """
+    Return the sort_key (fiscal_year*10+q_num) of the most recent quarterly
+    filing that should be available by today_d for a company with the given
+    fiscal year end month.  Uses a 2-month filing lag (covers the 40-45 day
+    SEC deadline for large/accelerated filers).
+    """
+    def _qend(offset: int) -> int:
+        return ((fye_month - offset - 1) % 12) + 1
+
+    q_defs = [(_qend(9), 1), (_qend(6), 2), (_qend(3), 3)]  # (end_month, q_num)
+    today_ym = today_d.year * 12 + today_d.month
+
+    best_sk = 0
+    for q_month, q_num in q_defs:
+        for y in [today_d.year, today_d.year - 1]:
+            qend_ym = y * 12 + q_month
+            if qend_ym + 2 > today_ym:
+                continue  # filing deadline not yet reached
+            fy = y + (1 if q_month > fye_month else 0)
+            best_sk = max(best_sk, fy * 10 + q_num)
+
+    return best_sk
 
 
 def get_latest_quarter_per_company(conn: sqlite3.Connection) -> dict[str, int]:
@@ -964,6 +1024,8 @@ def main() -> None:
                         help="Backfill mode only: fetch 10-Q quarterly filings instead of annual 10-K")
     parser.add_argument("--limit",   metavar="N",   type=int,
                         help="Backfill mode only: cap at N companies")
+    parser.add_argument("--timeout", metavar="N",   type=int, default=90,
+                        help="Backfill mode: per-company timeout in seconds before skipping (default 90)")
     args = parser.parse_args()
 
     use_index_mode = not (args.ticker or args.cik or args.fill_gaps or args.force)
@@ -1185,13 +1247,12 @@ def main() -> None:
                     # EDGAR-first: check only ISIN-keyed stored data (not SimFin-keyed).
                     # SimFin coverage must not block EDGAR from fetching the same quarters.
                     latest_sk = latest_q_map.get(isin) if isin else None
-                    # Skip if EDGAR already has the most recent expected quarter
-                    today_d   = date.today()
-                    fye_month = info.get("fye_month", 12)
-                    m_today   = today_d.month
-                    # Expected latest quarter: use Dec-FY mapping as a proxy for "up to date" check
-                    expected_q = 1 if m_today <= 3 else 2 if m_today <= 6 else 3 if m_today <= 9 else 3
-                    expected_sk = today_d.year * 10 + expected_q
+                    # Skip if EDGAR already has the most recent expected quarter.
+                    # Use FYE-aware expected_sk so Dec-FY companies aren't re-queried
+                    # for Q2 FY2026 that hasn't been filed yet (ends June 30).
+                    today_d     = date.today()
+                    fye_month   = info.get("fye_month", 12)
+                    expected_sk = _latest_expected_sk(today_d, fye_month)
                     if not args.ticker and not args.cik and latest_sk is not None and latest_sk >= expected_sk:
                         companies_skipped += 1
                         continue  # EDGAR already up to date for this quarter
@@ -1201,26 +1262,32 @@ def main() -> None:
                     time.sleep(0.5)   # light throttle every 10 companies
 
                 try:
-                    if args.quarterly:
-                        # Use ISIN-keyed stored sort_keys only — SimFin-keyed quarters must not
-                        # block EDGAR from fetching (EDGAR-first strategy).
-                        # --force clears even EDGAR-stored keys to allow a full re-fetch.
-                        stored_sk = set() if args.force else stored_q_map.get(isin, set())
-                        n = process_company_quarterly(
-                            simfin_id, info, stored_sk, conn,
-                            dry_run=args.dry_run,
-                        )
-                    else:
-                        n = process_company(
-                            simfin_id, info, latest_fy, conn,
-                            dry_run=args.dry_run,
-                            fill_gaps=args.fill_gaps,
-                            existing_fys=existing_fys,
-                        )
+                    with _time_limit(args.timeout):
+                        if args.quarterly:
+                            # Use ISIN-keyed stored sort_keys only — SimFin-keyed quarters must not
+                            # block EDGAR from fetching (EDGAR-first strategy).
+                            # --force clears even EDGAR-stored keys to allow a full re-fetch.
+                            stored_sk = set() if args.force else stored_q_map.get(isin, set())
+                            n = process_company_quarterly(
+                                simfin_id, info, stored_sk, conn,
+                                dry_run=args.dry_run,
+                            )
+                        else:
+                            n = process_company(
+                                simfin_id, info, latest_fy, conn,
+                                dry_run=args.dry_run,
+                                fill_gaps=args.fill_gaps,
+                                existing_fys=existing_fys,
+                            )
                     if n > 0:
                         co_inserted += 1
                     else:
                         co_no_new += 1
+                except TimeoutError:
+                    ticker = info.get("ticker", str(simfin_id))
+                    log.warning("[%s] timed out after %ds — skipping", ticker, args.timeout)
+                    co_failed += 1
+                    n = 0
                 except Exception as exc:
                     ticker = info.get("ticker", str(simfin_id))
                     log.warning("[%s] skipped — %s: %s", ticker, type(exc).__name__, exc)
