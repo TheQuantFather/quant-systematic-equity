@@ -218,6 +218,66 @@ def _constituent_coverage() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=300)
+def _ltm_gap_check() -> pd.DataFrame:
+    """
+    Universe companies missing FY2025 quarterly data.
+
+    For each universe company, computes the latest quarterly sort_key available
+    (sort_key = fiscal_year*10 + period_num, Q1=1 Q2=2 Q3=3).  Takes the MAX
+    across both ISIN-keyed (EDGAR) and SimFin-keyed records to handle companies
+    that have data under two different security_ids.  Returns companies where
+    that MAX is below the threshold (default Q3 FY2025 = 20253).
+    """
+    threshold = 20253  # Q3 FY2025 — companies should be at or past this by now
+
+    with get_db(CONSTITUENTS_DB) as conn:
+        latest_qtrs = pd.read_sql(
+            """
+            SELECT security_id,
+                   MAX(CASE fiscal_period
+                       WHEN 'Q1' THEN fiscal_year * 10 + 1
+                       WHEN 'Q2' THEN fiscal_year * 10 + 2
+                       WHEN 'Q3' THEN fiscal_year * 10 + 3
+                   END) AS latest_qtr_sk
+            FROM constituents
+            WHERE fiscal_period IN ('Q1','Q2','Q3')
+            GROUP BY security_id
+            """,
+            conn,
+        )
+    with get_db(UNIVERSE_DB) as conn:
+        companies = pd.read_sql(
+            "SELECT isin, ticker, company_name, gics_sector, simfin_id FROM companies "
+            "WHERE isin IS NOT NULL",
+            conn,
+        )
+    companies["simfin_str"] = companies["simfin_id"].apply(
+        lambda x: str(int(x)) if pd.notna(x) else None
+    )
+    # Merge ISIN-keyed (EDGAR) latest quarter
+    isin_sk = (
+        latest_qtrs.rename(columns={"security_id": "isin", "latest_qtr_sk": "edgar_sk"})
+    )
+    # Merge SimFin-keyed latest quarter
+    sfin_sk = (
+        latest_qtrs.rename(columns={"security_id": "simfin_str", "latest_qtr_sk": "simfin_sk"})
+    )
+    df = companies.merge(isin_sk, on="isin", how="left")
+    df = df.merge(sfin_sk, on="simfin_str", how="left")
+    df["latest_sk"] = df[["edgar_sk", "simfin_sk"]].max(axis=1)
+    stale = df[df["latest_sk"].isna() | (df["latest_sk"] < threshold)].copy()
+    return stale[["ticker", "company_name", "gics_sector", "latest_sk"]].sort_values(
+        "latest_sk", ascending=True, na_position="first"
+    )
+
+
+def _sk_label(sk: int) -> str:
+    year, q = divmod(int(sk), 10)
+    ql = {1: "Q1", 2: "Q2", 3: "Q3", 4: "Q4"}.get(q, str(q))
+    return f"{ql} FY{year}"
+
+
+@st.cache_data(ttl=300)
 def _recent_filings(n_days: int = 90) -> pd.DataFrame:
     """Filings published in the last N days (by publish_date)."""
     cutoff = (pd.Timestamp.today() - pd.Timedelta(days=n_days)).strftime("%Y-%m-%d")
@@ -955,6 +1015,58 @@ with tab_const:
         st.dataframe(nc_disp, hide_index=True, use_container_width=True)
     else:
         st.success("✅ All universe companies have constituent data.")
+
+    st.divider()
+    st.subheader("LTM window gaps")
+    st.caption(
+        "Universe companies missing FY2025 quarterly data (latest quarterly sort_key < Q3 FY2025). "
+        "Root cause: SimFin stopped updating at FY2024 Q3 while the EDGAR quarterly backfill "
+        "is still in progress.  This number should drop as the backfill completes."
+    )
+
+    with st.spinner("Checking LTM gaps…"):
+        gap_df = _ltm_gap_check()
+
+    if gap_df.empty:
+        st.success("✅ All universe companies have quarterly data through at least Q3 FY2025.")
+    else:
+        gap_df["Latest Quarter"] = gap_df["latest_sk"].apply(
+            lambda x: _sk_label(x) if pd.notna(x) else "No quarterly data"
+        )
+        no_data   = gap_df["latest_sk"].isna().sum()
+        thru_2024 = ((gap_df["latest_sk"] < 20250) & gap_df["latest_sk"].notna()).sum()
+        thru_q1   = ((gap_df["latest_sk"] >= 20250) & (gap_df["latest_sk"] < 20252) & gap_df["latest_sk"].notna()).sum()
+        thru_q2   = ((gap_df["latest_sk"] >= 20252) & (gap_df["latest_sk"] < 20253) & gap_df["latest_sk"].notna()).sum()
+
+        k1, k2, k3, k4, k5 = st.columns(5)
+        k1.metric("Missing FY2025 Q3+ data", f"{len(gap_df):,}")
+        k2.metric("No quarterly data at all", f"{no_data:,}")
+        k3.metric("Latest ≤ FY2024",  f"{thru_2024:,}")
+        k4.metric("Latest = FY2025 Q1", f"{thru_q1:,}")
+        k5.metric("Latest = FY2025 Q2", f"{thru_q2:,}")
+
+        col_tbl, col_chart = st.columns([3, 2])
+
+        with col_tbl:
+            disp = gap_df[["ticker", "company_name", "gics_sector", "Latest Quarter"]].copy()
+            st.dataframe(disp, hide_index=True, use_container_width=True, height=420)
+
+        with col_chart:
+            sector_counts = (
+                gap_df.groupby("gics_sector").size()
+                .reset_index(name="count")
+                .sort_values("count", ascending=True)
+            )
+            fig_sec = px.bar(
+                sector_counts, x="count", y="gics_sector", orientation="h",
+                labels={"count": "# companies missing FY2025+ data", "gics_sector": ""},
+                color="count", color_continuous_scale="Reds",
+            )
+            fig_sec.update_layout(
+                height=420, margin=dict(l=0, r=0, t=20, b=20),
+                showlegend=False, coloraxis_showscale=False,
+            )
+            st.plotly_chart(fig_sec, use_container_width=True)
 
     st.divider()
     st.subheader("Recent filings (last 90 days)")

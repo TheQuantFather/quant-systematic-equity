@@ -32,8 +32,18 @@ from utils import get_db, get_logger
 
 log = get_logger("create_returns")
 
-HISTORY_START = "2020-01-01"   # earliest date fetched for tickers with no existing data
-YAHOO_DELAY   = 0.15           # seconds between per-ticker requests (avoids rate-limiting)
+HISTORY_START     = "2020-01-01"   # earliest date fetched for universe stocks
+ETF_HISTORY_START = "2010-01-01"   # ETFs: more history for momentum strategy backtesting
+YAHOO_DELAY       = 0.15           # seconds between per-ticker requests (avoids rate-limiting)
+
+# ---------------------------------------------------------------------------
+# ETF universe defaults
+# Seeded into etf_universe table on first run; DB is the source of truth after that.
+# To add a new ETF:
+#   INSERT INTO etf_universe (ticker, name, asset_class, region) VALUES ('XYZ', ...);
+# To disable without deleting: UPDATE etf_universe SET active = 0 WHERE ticker = 'XYZ';
+# ---------------------------------------------------------------------------
+
 
 # ---------------------------------------------------------------------------
 # Schema
@@ -60,6 +70,14 @@ CREATE TABLE IF NOT EXISTS benchmark_returns (
     PRIMARY KEY (index_name, date)
 );
 CREATE INDEX IF NOT EXISTS idx_bench_date ON benchmark_returns (date);
+
+CREATE TABLE IF NOT EXISTS etf_dividends (
+    ticker  TEXT NOT NULL,
+    ex_date TEXT NOT NULL,
+    amount  REAL NOT NULL,
+    PRIMARY KEY (ticker, ex_date)
+);
+CREATE INDEX IF NOT EXISTS idx_etfdiv_ticker ON etf_dividends (ticker);
 
 CREATE TABLE IF NOT EXISTS metadata (
     key   TEXT PRIMARY KEY,
@@ -194,85 +212,164 @@ def update_from_yahoo(
 
 
 # ---------------------------------------------------------------------------
-# Benchmark index returns
+# Index / benchmark returns + dividends (unified)
 # ---------------------------------------------------------------------------
 
-def update_benchmark_returns(
+def update_index_returns(
     conn: sqlite3.Connection,
-    history_start: str = HISTORY_START,
+    history_start: str = ETF_HISTORY_START,
 ) -> None:
     """
-    Pull daily total returns for benchmark ETF proxies from Yahoo Finance and
-    store in benchmark_returns keyed by index_name (not ticker).
+    Pull daily prices and dividend events for every entry in universe.db
+    index_registry (benchmarks and investable ETFs alike).
 
-    ETF proxies are read from universe.db index_registry; entries with no
-    etf_ticker are skipped.  Uses adj_close for total return (same convention
-    as the returns table).
+    Prices     → benchmark_returns  keyed by index_name (e.g. 'sp500', 'efa').
+    Dividends  → etf_dividends      keyed by etf_ticker (the Yahoo Finance ticker).
+
+    All entries use the same history_start so the table is uniform.
+    The is_investable flag in index_registry is for strategy code only — price
+    and dividend fetching is identical regardless of that flag.
     """
     today_str = date.today().strftime("%Y-%m-%d")
 
     if not UNIVERSE_DB.exists():
-        log.warning("[benchmarks] universe.db not found — skipping")
+        log.warning("universe.db not found — skipping index update")
         return
 
     with get_db(UNIVERSE_DB) as uc:
-        registry = uc.execute(
-            "SELECT index_name, etf_ticker FROM index_registry WHERE etf_ticker IS NOT NULL"
+        registry: list[tuple[str, str]] = uc.execute(
+            "SELECT index_name, etf_ticker FROM index_registry "
+            "WHERE etf_ticker IS NOT NULL ORDER BY index_name"
         ).fetchall()
 
     if not registry:
-        log.warning("[benchmarks] index_registry is empty — nothing to fetch")
+        log.warning("index_registry is empty — nothing to fetch")
         return
 
-    per_index_last: dict[str, str] = dict(conn.execute(
-        "SELECT index_name, MAX(date) FROM benchmark_returns GROUP BY index_name"
+    index_names = [r[0] for r in registry]
+    etf_tickers = [r[1] for r in registry]
+
+    ph_i = ",".join("?" * len(index_names))
+    ph_t = ",".join("?" * len(etf_tickers))
+
+    per_price_last: dict[str, str] = dict(conn.execute(
+        f"SELECT index_name, MAX(date) FROM benchmark_returns "
+        f"WHERE index_name IN ({ph_i}) GROUP BY index_name",
+        index_names,
+    ).fetchall())
+    per_div_last: dict[str, str] = dict(conn.execute(
+        f"SELECT ticker, MAX(ex_date) FROM etf_dividends "
+        f"WHERE ticker IN ({ph_t}) GROUP BY ticker",
+        etf_tickers,
     ).fetchall())
 
-    log.info("Updating %d benchmark index(es) ...", len(registry))
-    total_inserted = 0
+    log.info("Updating %d index(es) ...", len(registry))
+    total_price_rows = 0
+    total_div_rows   = 0
 
-    for index_name, etf_ticker in sorted(registry):
-        last     = per_index_last.get(index_name)
-        from_str = last if last else history_start
+    for index_name, etf_ticker in registry:
+        # ── prices ────────────────────────────────────────────────────────
+        from_price = per_price_last.get(index_name) or history_start
+        raw_rows   = _yahoo_ticker(etf_ticker, from_price, today_str, retries=3)
 
-        if from_str > today_str:
-            continue
-
-        raw_rows = _yahoo_ticker(etf_ticker, from_str, today_str, retries=3)
         if raw_rows is None:
-            log.warning("[%s] fetch failed for %s", index_name, etf_ticker)
-            continue
-        if not raw_rows:
-            continue
+            log.warning("[%-30s] %s  price fetch failed", index_name, etf_ticker)
+        elif raw_rows:
+            price_rows: list[tuple] = []
+            for j, row in enumerate(raw_rows):
+                d, c, ac = row[1], row[5], row[6]
+                if j == 0:
+                    tr = None
+                else:
+                    prev_ac = raw_rows[j - 1][6]
+                    tr = (
+                        float(ac) / float(prev_ac) - 1
+                        if prev_ac and prev_ac > 0 and ac and ac > 0
+                        else None
+                    )
+                price_rows.append((index_name, d, float(c) if c else None, tr))
 
-        rows: list[tuple] = []
-        for j, row in enumerate(raw_rows):
-            d, c, ac = row[1], row[5], row[6]
-            if j == 0:
-                tr = None   # anchor row — INSERT OR IGNORE keeps existing if present
-            else:
-                prev_ac = raw_rows[j - 1][6]
-                tr = (
-                    float(ac) / float(prev_ac) - 1
-                    if prev_ac and prev_ac > 0 and ac and ac > 0
-                    else None
+            conn.executemany(
+                "INSERT OR IGNORE INTO benchmark_returns "
+                "(index_name, date, close, total_return) VALUES (?, ?, ?, ?)",
+                price_rows,
+            )
+            new_count = sum(1 for r in price_rows if r[1] > from_price)
+            total_price_rows += new_count
+            if new_count:
+                log.info("[%-30s] %-6s  +%d rows", index_name, etf_ticker, new_count)
+
+        time.sleep(YAHOO_DELAY)
+
+        # ── dividends ─────────────────────────────────────────────────────
+        from_div = per_div_last.get(etf_ticker) or history_start
+        div_rows = _yahoo_dividends(etf_ticker, from_div, today_str, retries=3)
+
+        if div_rows is None:
+            log.warning("[%-30s] %s  dividend fetch failed", index_name, etf_ticker)
+        elif div_rows:
+            new_divs = [(t, d, a) for t, d, a in div_rows if d > from_div]
+            if new_divs:
+                conn.executemany(
+                    "INSERT OR IGNORE INTO etf_dividends (ticker, ex_date, amount) "
+                    "VALUES (?, ?, ?)",
+                    new_divs,
                 )
-            rows.append((index_name, d, float(c) if c else None, tr))
-
-        conn.executemany(
-            "INSERT OR IGNORE INTO benchmark_returns (index_name, date, close, total_return) "
-            "VALUES (?, ?, ?, ?)",
-            rows,
-        )
-        new_count = sum(1 for r in rows if r[1] > from_str)
-        total_inserted += new_count
-        if new_count:
-            log.info("[%-30s] %-6s  +%d rows", index_name, etf_ticker, new_count)
+                total_div_rows += len(new_divs)
+                log.info("[%-30s] %-6s  dividends +%d events", index_name, etf_ticker, len(new_divs))
 
         time.sleep(YAHOO_DELAY)
 
     conn.commit()
-    log.info("Benchmark update complete — %s new rows", f"{total_inserted:,}")
+    log.info(
+        "Index update complete — %d price rows | %d dividend events",
+        total_price_rows, total_div_rows,
+    )
+
+
+def _yahoo_dividends(
+    ticker: str,
+    from_date: str,
+    to_date: str,
+    retries: int = 2,
+) -> list[tuple[str, str, float]] | None:
+    """
+    Fetch dividend ex-dates and amounts for one ETF from the Yahoo Finance v8
+    chart API.  Returns a list of (ticker, ex_date, amount) tuples sorted by
+    ex_date, None on permanent failure, or [] if no dividends in the window.
+    """
+    t1 = int(datetime.strptime(from_date, "%Y-%m-%d")
+             .replace(tzinfo=timezone.utc).timestamp())
+    t2 = int((datetime.strptime(to_date, "%Y-%m-%d")
+              .replace(tzinfo=timezone.utc) + timedelta(days=1)).timestamp())
+
+    url = (
+        f"https://query2.finance.yahoo.com/v8/finance/chart/{ticker}"
+        f"?interval=1d&period1={t1}&period2={t2}&events=div"
+    )
+
+    data = _fetch_url(url, retries=retries, fast_fail_on_429=False)
+    if data is None:
+        return None
+    if data == {}:
+        return []
+
+    try:
+        events    = data["chart"]["result"][0].get("events", {})
+        dividends = events.get("dividends", {})
+    except (KeyError, IndexError, TypeError):
+        return []
+
+    rows: list[tuple[str, str, float]] = []
+    for div_data in dividends.values():
+        ts     = div_data.get("date")
+        amount = div_data.get("amount")
+        if ts is None or not amount or amount <= 0:
+            continue
+        ex_date = datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime("%Y-%m-%d")
+        rows.append((ticker, ex_date, float(amount)))
+
+    return sorted(rows, key=lambda x: x[1])
 
 
 def _wait_for_yahoo(max_wait_minutes: int = 30) -> None:
@@ -478,6 +575,26 @@ def run_checks(conn: sqlite3.Connection) -> bool:
     meta_rows = conn.execute("SELECT key, value FROM metadata").fetchall()
     _check("Metadata table populated", len(meta_rows) > 0, str(dict(meta_rows)))
 
+    # Index checks
+    n_index = conn.execute(
+        "SELECT COUNT(DISTINCT index_name) FROM benchmark_returns"
+    ).fetchone()[0]
+    _check("benchmark_returns populated", n_index > 0, f"{n_index} indexes")
+
+    n_div_tickers = conn.execute(
+        "SELECT COUNT(DISTINCT ticker) FROM etf_dividends"
+    ).fetchone()[0]
+    _check("etf_dividends populated", n_div_tickers > 0, f"{n_div_tickers} tickers with dividend history")
+
+    sp500_min = conn.execute(
+        "SELECT MIN(date) FROM benchmark_returns WHERE index_name = 'sp500'"
+    ).fetchone()[0]
+    _check(
+        "Index history reaches 2010 (sp500)",
+        sp500_min is not None and sp500_min <= "2011-01-01",
+        f"sp500 starts {sp500_min}",
+    )
+
     return passed
 
 
@@ -548,8 +665,8 @@ def main():
     try:
         if args.update:
             update_from_yahoo(conn, history_start=args.history_start)
-            log.info("Updating benchmark index returns ...")
-            update_benchmark_returns(conn, history_start=args.history_start)
+            log.info("Updating index returns ...")
+            update_index_returns(conn)
 
         if args.check or args.update:
             run_checks(conn)
