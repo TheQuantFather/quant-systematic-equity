@@ -226,6 +226,29 @@ INSERT INTO nport_accessions VALUES ('nasdaq_100', '2026-04-01', '0001752724-26-
 
 **Rule**: never add hardcoded ticker/ISIN/accession mappings inside pipeline scripts. Always ask before making significant pipeline changes or adding new mappings.
 
+## Dashboard / Streamlit design principles
+
+Quality over quantity. Every element must answer a specific question about data health, research quality, or portfolio state. If removing it wouldn't cost any information, remove it.
+
+### What belongs
+- **Actionable flags**: ✅/⚠️/❌ status at a glance, with a clear table of offenders when something is wrong.
+- **Coverage gaps**: counts and per-company lists of what's missing, stale, or below threshold.
+- **Trend lines that can reveal drops**: e.g. companies per snapshot over time — a single dip is immediately visible and worth investigating.
+- **Compact summary tables**: factor fill rates, model centring stats, Barra snapshot counts. Numbers that have healthy ranges and flag when outside them.
+
+### What does NOT belong
+- **Distribution plots** (histograms, violin, box): knowing the shape of a distribution is almost never a quality question. Extremes are caught by explicit |z| > threshold counts; shape is irrelevant.
+- **Charts that duplicate a table below**: e.g. a bar chart of row counts when the table already lists every value.
+- **Charts that show expected variation**: e.g. staleness-bucket bars when the answer is always "all current" or "a handful stale" (the table below covers it).
+- **Metrics that don't discriminate**: avg/median fiscal years, history length histograms — these don't tell you which companies are problematic.
+- **Dual-axis charts**: almost always unreadable. Two separate charts or a table is cleaner.
+
+### Structure pattern (per section)
+1. One-line `st.caption()` stating what the section checks and why it matters.
+2. KPI metrics (2–5 columns) showing the key numbers at a glance.
+3. ✅ success message if clean, or ⚠️/❌ + actionable table if not.
+4. Optional: a single focused chart (e.g. coverage bar by quarter) only when spatial comparison across categories is genuinely clearer than a table.
+
 ## Code quality standards
 
 ### Pipeline vs exploratory
@@ -307,6 +330,7 @@ quarterly source for ~532 companies and the only historical source for most over
 - Re-running `create_strategy_params.py` overwrites any manual Excel edits. Only use to reset.
 - `_fix_ytd_quarters` only corrects **positive** Q1 Flow items — companies reporting losses in Q1 are skipped (can't determine sign of cumulative from ratio alone).
 - `_quarter_from_period()` allows a 1-month spillover for 52/53-week fiscal year companies whose quarter ends occasionally fall one day into the next calendar month (e.g. GD Q1 FY2026 ended Apr 5 instead of Mar 31). Both the quarter end month and the following month map to the same quarter.
+- **Annual 52/53-week spillover**: `process_filing_annual()` and `process_company()` apply the same spillover rule for 10-K filings — a December FYE company whose fiscal year ends on Jan 1–3 (52-week calendar) has its annual labeled `fiscal_year = period_year - 1`. Without this, the annual's `fiscal_year` mismatches the Q1/Q2/Q3 rows and Q4 derivation fails. Non-December FYE companies (e.g. Jan 31 FYE retailers) are unaffected: their annual periods in January correctly stay as `fiscal_year = period_year`.
 - `_latest_expected_sk()` is the FYE-aware skip gate in `--fill-gaps --quarterly` mode. It returns `fiscal_year*10+q_num` for the most recently expected filing (2-month lag). Companies already at or above this key are skipped without a network call.
 - `load_company_map()` includes companies with no `simfin_id` (EDGAR-only additions from N-PORT) using `-cik` as a synthetic key. Safe because `security_id = isin or str(simfin_id)` and all such companies have ISINs.
 

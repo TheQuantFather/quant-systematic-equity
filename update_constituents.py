@@ -720,6 +720,7 @@ def process_filing_annual(
     ticker: str,
     latest_fy: int | None,
     conn: sqlite3.Connection,
+    fye_month: int = 12,
     dry_run: bool = False,
 ) -> int:
     """
@@ -731,8 +732,14 @@ def process_filing_annual(
         return 0
     try:
         fy = int(period[:4])
+        period_month = int(period[5:7])
     except ValueError:
         return 0
+    # 52/53-week fiscal year spillover: a Dec-FYE company whose year-end lands in
+    # early January (e.g. Jan 1–3) should still be labelled as the prior year.
+    # Same 1-month window used by _quarter_from_period for quarterly filings.
+    if fye_month == 12 and period_month == 1:
+        fy -= 1
     if fy < MIN_FISCAL_YEAR:
         return 0
     if latest_fy is not None and fy <= latest_fy:
@@ -866,15 +873,20 @@ def process_company(
     if not filings or len(filings) == 0:
         return 0
 
+    fye_month = info.get("fye_month", 12)
     new_rows: list[tuple] = []
     for filing in list(filings):
         period   = filing.period_of_report        # e.g. '2024-09-28'
         if not period:
             continue
         try:
-            fy = int(period[:4])
+            fy           = int(period[:4])
+            period_month = int(period[5:7])
         except ValueError:
             continue
+        # 52/53-week spillover: Dec-FYE company whose year-end lands in January
+        if fye_month == 12 and period_month == 1:
+            fy -= 1
 
         if fy < MIN_FISCAL_YEAR:
             break  # don't go further back than the earliest snapshot needs
@@ -1081,9 +1093,11 @@ def main() -> None:
                 isin      = info.get("isin")
                 latest_fy = latest_fy_map.get(isin) or latest_fy_map.get(security_id)
                 total_checked += 1
+                fye_month = info.get("fye_month", 12)
                 try:
                     n = process_filing_annual(
                         filing, security_id, ticker, latest_fy, conn,
+                        fye_month=fye_month,
                         dry_run=args.dry_run,
                     )
                     if n > 0:
@@ -1247,15 +1261,26 @@ def main() -> None:
                     # EDGAR-first: check only ISIN-keyed stored data (not SimFin-keyed).
                     # SimFin coverage must not block EDGAR from fetching the same quarters.
                     latest_sk = latest_q_map.get(isin) if isin else None
-                    # Skip if EDGAR already has the most recent expected quarter.
-                    # Use FYE-aware expected_sk so Dec-FY companies aren't re-queried
-                    # for Q2 FY2026 that hasn't been filed yet (ends June 30).
+                    # Skip if EDGAR already has the most recent expected quarter AND
+                    # no internal gaps exist in the backfill window. Without the gap
+                    # check, companies whose latest_sk was advanced by a recent fetch
+                    # (e.g. Q1 FY2026) silently skip over missing older quarters
+                    # (e.g. Q3 FY2025) that never got fetched.
                     today_d     = date.today()
                     fye_month   = info.get("fye_month", 12)
                     expected_sk = _latest_expected_sk(today_d, fye_month)
                     if not args.ticker and not args.cik and latest_sk is not None and latest_sk >= expected_sk:
-                        companies_skipped += 1
-                        continue  # EDGAR already up to date for this quarter
+                        min_gap_sk = (today_d.year - 2) * 10 + 1  # mirrors process_company_quarterly
+                        stored_sk_set = stored_q_map.get(isin, set()) if isin else set()
+                        all_expected = {
+                            y * 10 + q
+                            for y in range(min_gap_sk // 10, latest_sk // 10 + 1)
+                            for q in (1, 2, 3)
+                            if min_gap_sk <= y * 10 + q <= latest_sk
+                        }
+                        if all_expected <= stored_sk_set:
+                            companies_skipped += 1
+                            continue  # EDGAR up to date, no internal gaps
 
                 stale_count += 1
                 if i > 0 and i % 10 == 0:
