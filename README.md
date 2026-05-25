@@ -1,6 +1,6 @@
-# Quant Factor Dashboard
+# Systematic Equity Investing Framework
 
-A systematic quantitative investing framework covering ~994 US equities from the **iShares Russell 1000 ETF** universe. Includes 28+ factors across 9 models, a Barra-style factor risk model (K=29), and a CVXPY portfolio optimiser with 9 configurable strategies.
+A full-stack quantitative investing system covering ~994 US equities from the **iShares Russell 1000 ETF** universe. Ingests EDGAR filings and price data, computes 28+ point-in-time factors across 9 models, estimates a Barra-style factor risk model (K=29), and runs a CVXPY portfolio optimiser with 9 configurable strategies.
 
 ## Architecture
 
