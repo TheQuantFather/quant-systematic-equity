@@ -23,9 +23,10 @@ screener    = db.get_screener_df()
 factor_meta = db.get_factor_metadata()
 model_meta  = db.get_model_metadata()
 
-MODEL_COL_NAMES = [f"{m} Model" for m in model_meta["Model"]]
-MODEL_COLS      = [c for c in screener.columns if c in MODEL_COL_NAMES]
+MODEL_COL_NAMES  = [f"{m} Model" for m in model_meta["Model"]]
+MODEL_COLS       = [c for c in screener.columns if c in MODEL_COL_NAMES]
 MODEL_ID_TO_NAME = dict(zip(model_meta["ModelID"], MODEL_COL_NAMES[:len(model_meta)]))
+MODEL_DISPLAY    = {f"{m} Model": m for m in model_meta["Model"]}
 
 # ---------------------------------------------------------------------------
 # Company selector
@@ -158,7 +159,7 @@ if model_scores:
     st.caption("Direction-adjusted composite z-scores — higher is always better.")
 
     models_df = pd.DataFrame(
-        {"Model": list(model_scores.keys()), "Score": list(model_scores.values())}
+        {"Model": [MODEL_DISPLAY.get(m, m) for m in model_scores.keys()], "Score": list(model_scores.values())}
     ).sort_values("Score", ascending=True)
 
     fig_models = px.bar(
@@ -196,7 +197,9 @@ if not models_ts.empty and models_ts["data_date"].nunique() > 1:
     with left_ts:
         st.markdown("**Model scores over time**")
         mts = models_ts.copy()
-        mts["model_name"] = mts["model_id"].map(MODEL_ID_TO_NAME)
+        mts["model_name"] = mts["model_id"].map(MODEL_ID_TO_NAME).map(
+            lambda x: MODEL_DISPLAY.get(x, x) if pd.notna(x) else x
+        )
         mts = mts.dropna(subset=["model_value_z", "model_name"])
 
         fig_mts = px.line(
@@ -553,8 +556,8 @@ else:
 st.subheader("Peer comparison")
 _composite_cols = [f"{m} Model" for m in model_meta[model_meta["IsComposite"] == 1]["Model"]]
 MODEL_SORT = next((n for n in _composite_cols if n in screener.columns), MODEL_COLS[0] if MODEL_COLS else None)
-_sort_label = MODEL_SORT.replace(" Model", "") if MODEL_SORT else "model"
-st.caption(f"Top 10 peers in **{industry}** ranked by {_sort_label} model score.")
+_sort_label = MODEL_DISPLAY.get(MODEL_SORT, MODEL_SORT) if MODEL_SORT else "model"
+st.caption(f"Top 10 peers in **{industry}** ranked by {_sort_label} score.")
 
 if MODEL_SORT and industry != "N/A":
     peers = (
@@ -572,6 +575,7 @@ if MODEL_SORT and industry != "N/A":
     styled_peers = peers[peer_display].copy()
     for c in [col for col in MODEL_COLS if col in styled_peers.columns]:
         styled_peers[c] = styled_peers[c].map(lambda x: f"{x:.3f}" if pd.notna(x) else "")
+    styled_peers = styled_peers.rename(columns=MODEL_DISPLAY)
 
     st.dataframe(styled_peers, use_container_width=True, hide_index=True)
 else:

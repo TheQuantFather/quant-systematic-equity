@@ -470,6 +470,17 @@ def load_factor_sector_types() -> dict:
     return dict(zip(df['factor_name'], df['sector_type']))
 
 
+def load_log_transform_factor_ids() -> set[str]:
+    """Returns the set of factor_ids whose values are log-transformed before z-scoring.
+
+    Used for always-positive ratio factors with heavy right-tail skew (e.g. EV/EBITDA,
+    Leverage) where log(x) brings the distribution to near-normal before winsorization.
+    Controlled via the log_transform column in factors_reference.csv.
+    """
+    df = pd.read_csv(FACTORS_REF)
+    return set(df.loc[df['log_transform'] == True, 'factor_id'])
+
+
 # Allowed factor sector_types per company sector_type
 _ALLOWED_FACTOR_SECTORS: dict[str, set] = {
     'general':   {'all', 'general'},
@@ -639,6 +650,28 @@ def get_close(
 
 
 # ---------------------------------------------------------------------------
+# Factor computation helpers
+# ---------------------------------------------------------------------------
+
+def _ebitda(op_income: float | None, da: float | None) -> float | None:
+    """EBITDA = Operating Income + |D&A|. Returns None if either input is missing."""
+    if op_income is None or da is None:
+        return None
+    return op_income + abs(da)
+
+
+def _enterprise_value(
+    market_cap: float,
+    short_debt: float | None,
+    long_debt: float | None,
+    cash: float | None,
+) -> float | None:
+    """EV = market_cap + debt - cash. Returns None when EV ≤ 0."""
+    ev = market_cap + (short_debt or 0) + (long_debt or 0) - (cash or 0)
+    return ev if ev > 0 else None
+
+
+# ---------------------------------------------------------------------------
 # Factor computation
 # ---------------------------------------------------------------------------
 
@@ -772,16 +805,16 @@ def compute_value_factors(
     if op_cf is not None:
         f['Cash Yield'] = op_cf / market_cap
     if cash is not None and op_income is not None and op_income > 0:
-        ev = market_cap + (short_debt or 0) + (long_debt or 0) - cash
-        if ev > 0:
+        ev = _enterprise_value(market_cap, short_debt, long_debt, cash)
+        if ev is not None:
             f['EV-to-EBIT'] = ev / op_income
 
-    # EV/EBITDA: EBITDA = op_income + D&A; require both positive and EV > 0
-    if (cash is not None and op_income is not None and da is not None):
-        ebitda = op_income + abs(da)
-        ev     = market_cap + (short_debt or 0) + (long_debt or 0) - cash
-        if ev > 0 and ebitda > 0:
-            f['EV/EBITDA'] = ev / ebitda
+    if cash is not None:
+        ebitda = _ebitda(op_income, da)
+        if ebitda is not None and ebitda > 0:
+            ev = _enterprise_value(market_cap, short_debt, long_debt, cash)
+            if ev is not None:
+                f['EV/EBITDA'] = ev / ebitda
 
     # Dividend Yield: only for companies that actually paid cash dividends (Dividends Paid < 0)
     if dividends is not None and dividends < 0:
@@ -809,23 +842,16 @@ def compute_growth_factors(cdata: dict, cdata_prior: dict) -> dict:
         ('Cash Flow Growth',          {'name': 'Net Cash from Operating Activities', 'require_positive_base': True}),
         ('Asset Growth',              {'name': 'Total Assets'}),
         ('Equity Growth',             {'name': 'Total Equity'}),
-        ('Operating Income Growth',   {'name': 'Operating Income (Loss)'}),
+        ('Operating Income Growth',   {'name': 'Operating Income (Loss)', 'require_positive_base': True}),
     ]:
         v = yoy(**kw)
         if v is not None:
             f[name] = v
 
     # EBITDA Growth: derive EBITDA = op_income + abs(D&A) for current and prior period
-    def _ebitda(cd: dict) -> Optional[float]:
-        op = cd.get('Operating Income (Loss)')
-        da = cd.get('Depreciation & Amortization')
-        if op is not None and da is not None:
-            return op + abs(da)
-        return None
-
-    cur_ebitda = _ebitda(cdata)
-    pri_ebitda = _ebitda(cdata_prior)
-    if cur_ebitda is not None and pri_ebitda is not None and pri_ebitda != 0:
+    cur_ebitda = _ebitda(cdata.get('Operating Income (Loss)'), cdata.get('Depreciation & Amortization'))
+    pri_ebitda = _ebitda(cdata_prior.get('Operating Income (Loss)'), cdata_prior.get('Depreciation & Amortization'))
+    if cur_ebitda is not None and pri_ebitda is not None and pri_ebitda > 0:
         f['EBITDA Growth'] = (cur_ebitda - pri_ebitda) / abs(pri_ebitda)
 
     return f
@@ -834,7 +860,15 @@ def compute_growth_factors(cdata: dict, cdata_prior: dict) -> dict:
 def compute_momentum_factors(
     isin: str, prices: dict, ref_date: date = None
 ) -> dict:
-    """6M and 12M cumulative total return — split-invariant."""
+    """Risk-adjusted momentum and long-term reversal factors.
+
+    All three factors share the same computation: compounded total return over
+    the window divided by annualised realised volatility (std of log returns × √252).
+
+      6M Momentum   : T−6m  → T−1m   (skip-month)
+      12M Momentum  : T−12m → T−1m   (skip-month)
+      LT Reversal   : T−36m → T−13m  (window before momentum; direction=−1)
+    """
     f = {}
     entry = prices.get(isin)
     if entry is None:
@@ -851,17 +885,32 @@ def compute_momentum_factors(
     if ref_idx < 1:
         return f
 
-    for months, name in [(6, "6M Momentum"), (12, "12M Momentum")]:
-        target = ref_dt - relativedelta(months=months)
-        tgt_np = np.datetime64(target, "D").astype("datetime64[ns]")
-        start_idx = int(np.searchsorted(dates, tgt_np, side="right"))
-        if start_idx > ref_idx:
+    for start_months, end_months, name in [
+        (6,  1,  "6M Momentum"),
+        (12, 1,  "12M Momentum"),
+        (36, 13, "LT Reversal"),
+    ]:
+        end_dt    = ref_dt - relativedelta(months=end_months)
+        end_np    = np.datetime64(end_dt, "D").astype("datetime64[ns]")
+        end_idx   = int(np.searchsorted(dates, end_np, side="right")) - 1
+
+        start_dt  = ref_dt - relativedelta(months=start_months)
+        start_np  = np.datetime64(start_dt, "D").astype("datetime64[ns]")
+        start_idx = int(np.searchsorted(dates, start_np, side="right"))
+
+        if end_idx < 1 or start_idx > end_idx:
             continue
-        window = total_rets[start_idx : ref_idx + 1]
-        valid  = window[np.isfinite(window)]
+        window   = total_rets[start_idx : end_idx + 1]
+        valid    = window[np.isfinite(window)]
         if len(valid) < 20:
             continue
-        f[name] = float(np.prod(1.0 + valid) - 1.0)
+        ret      = float(np.prod(1.0 + valid) - 1.0)
+        log_rets = np.log(1.0 + valid)
+        log_rets = log_rets[np.isfinite(log_rets)]
+        vol      = float(np.std(log_rets) * np.sqrt(252))
+        if vol <= 0:
+            continue
+        f[name]  = ret / vol
     return f
 
 
@@ -1095,6 +1144,7 @@ def run_for_date(
     svr_data: dict,
     factor_name_to_id: dict,
     factor_sector_types: dict,
+    log_transform_ids: set[str],
     conn: sqlite3.Connection,
 ) -> int:
     """Compute and write all factor rows for one snapshot date. Returns row count."""
@@ -1166,8 +1216,16 @@ def run_for_date(
         "SELECT rowid, factor_id, factor_value FROM factors WHERE data_date = ?",
         conn, params=(date_str,)
     )
+    # For heavily right-skewed always-positive factors (EV/EBITDA, EV-to-EBIT, Leverage),
+    # z-score on log(value) so the distribution is near-normal before winsorization.
+    # Raw factor_value is preserved unchanged in the DB.
+    z_input = df['factor_value'].copy()
+    z_input[df['factor_id'].isin(log_transform_ids)] = np.log(
+        df.loc[df['factor_id'].isin(log_transform_ids), 'factor_value']
+    )
     df['factor_value_z'] = (
-        df.groupby('factor_id')['factor_value']
+        df.assign(_z=z_input)
+        .groupby('factor_id')['_z']
         .transform(winsorized_zscore)
     )
     conn.executemany(
@@ -1215,6 +1273,7 @@ def main():
     ticker_map          = load_ticker_map()
     factor_name_to_id   = load_factor_name_to_id()
     factor_sector_types = load_factor_sector_types()
+    log_transform_ids   = load_log_transform_factor_ids()
     kind_map            = load_kind_map()
 
     log.info("Loading constituent data from constituents.db ...")
@@ -1232,7 +1291,7 @@ def main():
             total_rows += run_for_date(
                 snapshot, universe, ticker_map,
                 constituent_data, kind_map, prices, svr_data,
-                factor_name_to_id, factor_sector_types, conn,
+                factor_name_to_id, factor_sector_types, log_transform_ids, conn,
             )
             conn.execute(
                 "INSERT OR REPLACE INTO snapshot_dates (data_date, created_at) "
