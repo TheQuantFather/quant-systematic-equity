@@ -39,6 +39,7 @@ caffeinate -s -i nohup /Users/shivam/opt/anaconda3/envs/quant/bin/python3.13 -u 
 - `--fill-gaps` triggers company-by-company mode (index mode alone does NOT backfill)
 - `--quarterly` fetches 10-Q filings; omit for annual-only (10-K) backfill
 - `--timeout 90` skips any company that hangs for >90s (SIGALRM — may not interrupt httpx)
+- `MIN_QUARTERLY_FISCAL_YEAR = 2021` — earliest quarter fetched (Q1 FY2021); change this constant to extend/shorten the quarterly lookback window
 - edgar library HTTP timeouts are patched at startup: 45s read, 3 retries max (~2.25 min worst case)
 
 ### Long-running backfills — prevent Mac sleep
@@ -343,5 +344,6 @@ Stored in `.claude/commands/` — available in Claude Code as `/command-name`:
 | `/snapshot` | `/snapshot 2026-04-01` | Runs create_factors → models → risk → barra for a date |
 | `/validate` | `/validate ABBV` | Shows LTM P&L, cash flow, balance sheet for a ticker |
 | `/db-check` | `/db-check` | Health summary across all 6 databases, sync status |
+| `/sync` | `/sync` | Run tests, update BACKLOG/CLAUDE.md, commit private repo, sync to QuantPublic |
 
 See `BACKLOG.md` for pending work and research ideas.

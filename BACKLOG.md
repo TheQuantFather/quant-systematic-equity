@@ -15,9 +15,7 @@ Items are grouped by theme, not priority. Each has a rough effort and value rati
   Run `/validate` on each, confirm no `n/a` on Gross Profit and no consecutive-quarter warnings.
   `[HIGH]` `[easy]`
 
-- [ ] **Update risk.db** — one snapshot behind (2026-05-15 vs factors/models 2026-05-16)
-  `create_risk.py --date 2026-05-16`
-  `[MED]` `[easy]`
+- [x] **Update risk.db** — caught up; 2026-05-22 risk + Barra ran 2026-05-25.
 
 ---
 
@@ -36,14 +34,26 @@ Items are grouped by theme, not priority. Each has a rough effort and value rati
   covered by the non-zero filing for the same FY.
   `[MED]` `[easy]`
 
-- [ ] **EDGAR quarterly backfill** — `update_constituents.py` only keeps 2 years of quarterly
-  data. Some factors (momentum, growth) benefit from 3 years. Extend `min_sort_key` lookback
-  and re-run quarterly pull.
-  `[MED]` `[medium]`
+- [ ] **EDGAR historical quarterly backfill** — `MIN_QUARTERLY_FISCAL_YEAR` extended to 2021
+  (was a rolling 2-year window). Run `--fill-gaps --quarterly` for all ~968 companies to pull
+  Q1 FY2021 → present. Prerequisite for full historical factor restatement below. 2–4 hour job.
+  After completion: re-run factors/models/risk/barra for all snapshot dates.
+  `[HIGH]` `[medium]`
 
 ---
 
 ## Factors & Models
+
+- [ ] **Full historical factor restatement** — log-transform (EV/EBITDA, EV-to-EBIT, Leverage),
+  growth positive-base guards (Operating Income, EBITDA), momentum skip-month + vol-normalisation,
+  and LT Reversal factor were all applied only to the 2026-05-22 snapshot. Rebuild all prior
+  snapshot dates so cross-sectional z-scores are consistent across history.
+  Run: `python create_factors.py --date <all dates>` → `create_models.py` → `create_risk.py --backfill` → `create_barra.py --backfill`
+  `[HIGH]` `[easy]`
+
+- [ ] **Cash Conversion Quality denominator guard** — AUR and ROIV sit at −199× and −90× due to
+  near-zero revenue denominator. Fix requires a minimum revenue floor; design decision pending.
+  `[MED]` `[easy]`
 
 - [ ] **Insider transaction factor** — rework `explore_insider.py` to fetch per-CIK
   (994 targeted lookups) instead of global Form 4 index. Build net-buy / net-sell signal,
@@ -109,9 +119,7 @@ Items are grouped by theme, not priority. Each has a rough effort and value rati
   factors at the latest snapshot. Useful for model weight decisions.
   `[LOW]` `[medium]`
 
-- [ ] **Snapshot timeline view** — show factor/model values over time for a selected stock.
-  Currently Deep Dive shows latest only.
-  `[MED]` `[medium]`
+- [x] **Snapshot timeline view** — implemented in Deep Dive: model score history + factor z-score history across snapshot dates.
 
 ---
 
@@ -127,6 +135,21 @@ Items are grouped by theme, not priority. Each has a rough effort and value rati
 - [ ] **Automated daily update cron** — `daily_update.py` exists but unclear if scheduled.
   Wire to crontab or launchd for lights-out operation.
   `[MED]` `[medium]`
+
+---
+
+## Portfolio Strategies — Exploratory
+
+- [ ] **ETF strategy** — systematic long-only strategy structured as a rules-based ETF.
+  Define rebalance frequency, constituent selection rules (factor score thresholds), weighting
+  scheme, and capacity constraints. Evaluate tradability vs current optimize_portfolio.py output.
+  `[HIGH]` `[hard]`
+
+- [ ] **Hedge fund strategy** — long-short market-neutral portfolio using Alpha model.
+  Define gross/net exposure limits, short-side factor eligibility (low-score universe),
+  leverage constraints, and fee/financing cost model. Analyse factor risk decomposition
+  to ensure style neutrality on the short book.
+  `[HIGH]` `[hard]`
 
 ---
 

@@ -43,6 +43,10 @@ log = get_logger("update_constituents")
 # snapshots (needs FY2018 annual data) with one extra year of LTM buffer.
 MIN_FISCAL_YEAR = 2017
 
+# Earliest quarterly 10-Q to fetch. EDGAR XBRL quality pre-2021 is inconsistent;
+# 2021 gives 5 full years of quarterly history for growth/momentum factors.
+MIN_QUARTERLY_FISCAL_YEAR = 2021
+
 set_identity("personal-research shivam3125@gmail.com")
 
 # Cap edgar's bulk HTTP timeout so stuck companies can't hang for 40+ minutes.
@@ -789,7 +793,7 @@ def process_filing_quarterly(
     period_num = {"Q1": 1, "Q2": 2, "Q3": 3}[q_label]
     sort_key   = q_fy * 10 + period_num
 
-    min_sort_key = (date.today().year - 2) * 10 + 1
+    min_sort_key = MIN_QUARTERLY_FISCAL_YEAR * 10 + 1
     if sort_key < min_sort_key:
         return 0
     if stored_sks is not None and sort_key in stored_sks:
@@ -958,8 +962,7 @@ def process_company_quarterly(
     if not filings or len(filings) == 0:
         return 0
 
-    # Don't backfill more than 2 calendar years of quarters
-    min_sort_key = (date.today().year - 2) * 10 + 1
+    min_sort_key = MIN_QUARTERLY_FISCAL_YEAR * 10 + 1
 
     new_rows: list[tuple] = []
     for filing in list(filings):
@@ -1270,7 +1273,7 @@ def main() -> None:
                     fye_month   = info.get("fye_month", 12)
                     expected_sk = _latest_expected_sk(today_d, fye_month)
                     if not args.ticker and not args.cik and latest_sk is not None and latest_sk >= expected_sk:
-                        min_gap_sk = (today_d.year - 2) * 10 + 1  # mirrors process_company_quarterly
+                        min_gap_sk = MIN_QUARTERLY_FISCAL_YEAR * 10 + 1  # mirrors process_company_quarterly
                         stored_sk_set = stored_q_map.get(isin, set()) if isin else set()
                         all_expected = {
                             y * 10 + q
