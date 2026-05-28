@@ -3,7 +3,7 @@
 
 Tab 1 — Factor Backtest  : rank stocks by model z-score, hold equal-weight top-N.
 Tab 2 — Optimised Backtest: CVXPY walk-forward with quarterly rebalancing,
-         one-way turnover constraint, Barra risk model, S&P 500 universe,
+         two-way turnover constraint, Barra risk model, configurable universe,
          and per-trade EUR transaction costs.
 """
 
@@ -102,7 +102,7 @@ def active_metrics(ret: pd.Series, bench: pd.Series, turnover_pct: float | None)
         "Beta (vs benchmark)":  f"{beta:.2f}" if pd.notna(beta) else "—",
     }
     if turnover_pct is not None:
-        out["Avg rebal. turnover"] = f"{turnover_pct:.0f}%"
+        out["Avg rebal. turnover (2-way)"] = f"{turnover_pct:.0f}%"
     return out
 
 
@@ -114,10 +114,12 @@ def _cum_return_chart(
     traces: list[dict],
     title: str = "Cumulative return (base = 1.0)",
     height: int = 420,
+    excess_series: pd.Series | None = None,
 ) -> go.Figure:
     """
     Build a cumulative-return line chart.
     Each trace dict: {series (raw returns), name, color, width=2, dash="solid"}.
+    Optional excess_series (raw daily active returns) is plotted on a secondary Y-axis.
     """
     fig = go.Figure()
     for t in traces:
@@ -126,11 +128,26 @@ def _cum_return_chart(
             x=cum.index, y=cum.values, name=t["name"],
             line=dict(color=t["color"], width=t.get("width", 2), dash=t.get("dash", "solid")),
         ))
-    fig.update_layout(
+    layout_kwargs: dict = dict(
         title=title, height=height, yaxis_title="Portfolio value",
         hovermode="x unified", legend=dict(orientation="h", y=-0.15),
         margin=dict(l=0, r=0, t=40, b=10),
     )
+    if excess_series is not None and not excess_series.empty:
+        cum_excess = (1 + excess_series).cumprod() - 1
+        fig.add_trace(go.Scatter(
+            x=cum_excess.index, y=cum_excess.values * 100,
+            name="Excess return",
+            yaxis="y2",
+            line=dict(color="#16A34A", width=1.5, dash="dot"),
+        ))
+        layout_kwargs["yaxis2"] = dict(
+            title="Excess return (%)",
+            overlaying="y", side="right",
+            tickformat=".1f", showgrid=False,
+            zeroline=True, zerolinecolor="#E2E8F0", zerolinewidth=1,
+        )
+    fig.update_layout(**layout_kwargs)
     return fig
 
 
@@ -389,16 +406,15 @@ def _run_optimised_backtest(
     max_turnover: float,
     tc_per_trade_eur: float,
     benchmark_name: str,
+    universe_name: str = "sp500",
     rebal_freq: str = "quarterly",
-    min_weight: float = 0.0,
+    min_pos_if_held: float | None = None,
+    max_positions_override: int | None = None,
+    solver: str = "CLARABEL",
 ) -> dict:
     """
-    Walk-forward optimised backtest.
-
-    rebal_freq="quarterly": rebalance only at model snapshot dates (alpha + Barra both fresh).
-    rebal_freq="monthly":   rebalance monthly; alpha held constant from the most recent
-                            quarterly snapshot; Barra risk updated from the nearest weekly
-                            snapshot — reduces ex-ante/realized TE gap caused by drift.
+    Walk-forward optimised backtest. Starts from the first date where a Barra risk model
+    snapshot is available, so all periods use a consistent risk model.
 
     Returns a results dict or {"error": str} on failure.
     """
@@ -418,15 +434,16 @@ def _run_optimised_backtest(
     objective     = sp["objective"]
     constraints   = dict(sp["constraints"])
 
-    # All available model dates and S&P 500 universe dates (kept separate for monthly lookups)
+    # All available model dates and universe snapshot dates (carry-forward for gaps)
     with get_db(MODELS_DB) as conn:
         model_dates = sorted(r[0] for r in conn.execute("SELECT DISTINCT data_date FROM models").fetchall())
     with get_db(UNIVERSE_DB) as conn:
-        sp500_dates = sorted(r[0] for r in conn.execute(
-            "SELECT DISTINCT snapshot_date FROM universe_snapshots WHERE index_name = 'sp500'"
+        universe_dates = sorted(r[0] for r in conn.execute(
+            "SELECT DISTINCT snapshot_date FROM universe_snapshots WHERE index_name = ?",
+            (universe_name,),
         ).fetchall())
-    if not model_dates or not sp500_dates:
-        return {"error": "Need at least 1 model date and 1 S&P 500 universe snapshot."}
+    if not model_dates or not universe_dates:
+        return {"error": f"Need at least 1 model date and 1 '{universe_name}' universe snapshot."}
 
     # Available Barra and LW risk dates
     barra_dates: list[str] = []
@@ -452,9 +469,14 @@ def _run_optimised_backtest(
         return trading_index[pos] if pos < len(trading_index) else None
 
     # ── Build rebalancing schedule ────────────────────────────────────────────
+    # Start from the first date with Barra coverage so all periods use consistent risk model.
+    first_barra = barra_dates[0] if barra_dates else None
+    if first_barra is None:
+        return {"error": "No Barra snapshots found. Run create_barra.py --backfill first."}
+
     if rebal_freq == "monthly":
         # Monthly calendar dates → nearest trading day on or after each
-        first_alpha = pd.Timestamp(model_dates[0])
+        first_alpha = pd.Timestamp(first_barra)
         last_td     = trading_index[-1]
         anchors     = pd.date_range(start=first_alpha, end=last_td, freq="MS")
         rebal_dates: list[str] = []
@@ -464,16 +486,23 @@ def _run_optimised_backtest(
                 rebal_dates.append(trading_index[pos].strftime("%Y-%m-%d"))
         rebal_dates = sorted(set(rebal_dates))
     else:
-        # Quarterly: intersection of model dates and S&P 500 universe dates (existing behaviour)
-        rebal_dates = sorted(set(model_dates) & set(sp500_dates))
+        # Quarterly: model snapshot dates from first Barra date onwards.
+        rebal_dates = [d for d in model_dates if d >= first_barra]
 
     if len(rebal_dates) < 2:
         return {"error": "Not enough rebalancing dates in the backtest window."}
 
-    meta_df    = db.get_universe()[["security_id", "sector", "ticker", "company_name"]].copy()
-    sector_map = dict(zip(meta_df["security_id"], meta_df["sector"]))
-    ticker_map = dict(zip(meta_df["security_id"], meta_df["ticker"]))
-    name_map   = dict(zip(meta_df["security_id"], meta_df["company_name"]))
+    # Apply overrides from UI (take precedence over strategy defaults)
+    if max_positions_override is not None:
+        constraints["max_positions"] = max_positions_override
+    if min_pos_if_held is not None:
+        constraints["min_position_if_held"] = min_pos_if_held
+
+    meta_df      = db.get_universe()[["security_id", "sector", "industry", "ticker", "company_name"]].copy()
+    sector_map   = dict(zip(meta_df["security_id"], meta_df["sector"]))
+    industry_map = dict(zip(meta_df["security_id"], meta_df["industry"]))
+    ticker_map   = dict(zip(meta_df["security_id"], meta_df["ticker"]))
+    name_map     = dict(zip(meta_df["security_id"], meta_df["company_name"]))
 
     prev_weights: dict[str, float] | None = None
     period_log:   list[dict]              = []
@@ -490,50 +519,65 @@ def _run_optimised_backtest(
         if t_start is None or t_end is None or t_start >= t_end:
             continue
 
-        # For monthly rebalancing, alpha and S&P 500 universe come from the most recent
-        # quarterly snapshot; Barra risk is updated from the nearest weekly snapshot.
+        # Alpha and universe are carried forward from the most recent available snapshot.
         alpha_date   = _find_nearest_before(snap_date, model_dates)
-        sp500_snap   = _find_nearest_before(snap_date, sp500_dates)
+        uni_snap     = _find_nearest_before(snap_date, universe_dates)
         barra_date   = _find_nearest_before(snap_date, barra_dates)
         risk_date    = _find_nearest_before(snap_date, risk_dates)
 
-        if alpha_date is None or sp500_snap is None:
+        if alpha_date is None or uni_snap is None:
             warnings.append(f"{snap_date}: no alpha or universe snapshot available — skipped.")
             continue
         if risk_date is None:
             warnings.append(f"{snap_date}: no LW risk date available — skipped.")
             continue
 
-        sp500_isins = db.get_sp500_isins_at_date(sp500_snap)
-        bm_weights  = db.get_sp500_weights_at_date(sp500_snap) if objective == "maximize_alpha" else {}
-        if len(sp500_isins) < 50:
-            warnings.append(f"{snap_date}: only {len(sp500_isins)} S&P 500 stocks — skipped.")
+        uni_isins  = db.get_universe_isins_at_date(universe_name, uni_snap)
+        bm_weights = db.get_universe_weights_at_date(universe_name, uni_snap) if objective == "maximize_alpha" else {}
+        if len(uni_isins) < 50:
+            warnings.append(f"{snap_date}: only {len(uni_isins)} stocks in '{universe_name}' — skipped.")
             continue
 
-        opt_result = optimize_for_backtest(
-            alpha_weights=alpha_weights,
-            objective=objective,
-            constraints=constraints,
-            alpha_date=alpha_date,
-            barra_date=barra_date,
-            risk_date=risk_date,
-            sp500_isins=sp500_isins,
-            bm_weights=bm_weights,
-            prev_weights=prev_weights,
-            max_turnover=max_turnover,
-            solver="CLARABEL",
-            min_weight=min_weight,
-        )
+        # Progressive turnover relaxation: when the combination of tight turnover
+        # and shifting risk-model factor loadings makes the period infeasible, step
+        # up 1.5× and 2.25× before removing the constraint entirely. The actual
+        # turnover used is recorded in opt_metrics["turnover_relaxed"] so the UI can flag it.
+        _to_attempts = [max_turnover, max_turnover * 1.5, max_turnover * 1.5 ** 2, None]
+        opt_result = None
+        to_used: float | None = None
+        for _to in _to_attempts:
+            opt_result = optimize_for_backtest(
+                alpha_weights=alpha_weights,
+                objective=objective,
+                constraints=constraints,
+                alpha_date=alpha_date,
+                barra_date=barra_date,
+                risk_date=risk_date,
+                sp500_isins=uni_isins,
+                bm_weights=bm_weights,
+                prev_weights=prev_weights,
+                max_turnover=_to if _to is not None else 9999.0,
+                solver=solver,
+            )
+            if opt_result is not None:
+                to_used = _to
+                break
 
         if opt_result is None:
             warnings.append(f"{snap_date}: optimization failed — carrying forward previous weights.")
             new_weights: dict[str, float] = (
                 prev_weights if prev_weights is not None
-                else {isin: 1.0 / min(100, len(sp500_isins)) for isin in sp500_isins[:100]}
+                else {isin: 1.0 / min(100, len(uni_isins)) for isin in uni_isins[:100]}
             )
             opt_metrics: dict = {}
         else:
             new_weights, opt_metrics = opt_result
+            if to_used != max_turnover:
+                label = f"{to_used * 100:.0f}%" if to_used is not None else "unconstrained"
+                warnings.append(
+                    f"{snap_date}: turnover relaxed to {label} (requested {max_turnover * 100:.0f}% was infeasible)."
+                )
+                opt_metrics["turnover_relaxed"] = True
 
         # Transaction costs: count a trade only when the EUR value of the order meets a
         # minimum order size. Monthly rebalancing produces many small weight tweaks that
@@ -565,33 +609,47 @@ def _run_optimised_backtest(
         if len(port_returns) > 0:
             port_returns.iloc[0] -= tc_pct
 
-        # One-way turnover (fractional)
+        # Two-way turnover: sum of absolute weight changes (buys + sells)
         if prev_weights is not None and new_weights:
             actual_to = sum(
                 abs(new_weights.get(isin, 0.0) - prev_weights.get(isin, 0.0))
                 for isin in set(new_weights) | set(prev_weights)
-            ) / 2
+            )
         else:
             actual_to = 1.0
 
-        sector_weights: dict[str, float] = {}
+        sector_weights:    dict[str, float] = {}
+        bm_sector_weights: dict[str, float] = {}
+        industry_weights:    dict[str, float] = {}
+        bm_industry_weights: dict[str, float] = {}
         for isin, w in new_weights.items():
             sec = sector_map.get(isin, "Unknown")
+            ind = industry_map.get(isin, "Unknown")
             sector_weights[sec] = sector_weights.get(sec, 0.0) + w
+            industry_weights[ind] = industry_weights.get(ind, 0.0) + w
+        for isin, w in bm_weights.items():
+            sec = sector_map.get(isin, "Unknown")
+            ind = industry_map.get(isin, "Unknown")
+            bm_sector_weights[sec] = bm_sector_weights.get(sec, 0.0) + w
+            bm_industry_weights[ind] = bm_industry_weights.get(ind, 0.0) + w
 
         period_log.append({
-            "snap_date":       snap_date,
-            "next_snap":       next_snap[:10],
-            "alpha_date":      alpha_date,
-            "weights":         new_weights,
-            "n_trades":        n_trades,
-            "tc_pct":          tc_pct,
-            "turnover":        actual_to,
-            "sector_weights":  sector_weights,
-            "metrics":         opt_metrics,
-            "used_barra":      opt_metrics.get("used_barra", False),
-            "relaxed_integer": opt_metrics.get("relaxed_integer", False),
-            "n_positions":     opt_metrics.get("n_positions", len(new_weights)),
+            "snap_date":            snap_date,
+            "next_snap":            next_snap[:10],
+            "alpha_date":           alpha_date,
+            "weights":              new_weights,
+            "n_trades":             n_trades,
+            "tc_pct":               tc_pct,
+            "turnover":             actual_to,
+            "sector_weights":       sector_weights,
+            "bm_sector_weights":    bm_sector_weights,
+            "industry_weights":     industry_weights,
+            "bm_industry_weights":  bm_industry_weights,
+            "metrics":              opt_metrics,
+            "used_barra":           opt_metrics.get("used_barra", False),
+            "relaxed_integer":      opt_metrics.get("relaxed_integer", False),
+            "turnover_relaxed":     opt_metrics.get("turnover_relaxed", False),
+            "n_positions":          opt_metrics.get("n_positions", len(new_weights)),
         })
         return_parts.append(port_returns)
         prev_weights = new_weights
@@ -606,7 +664,9 @@ def _run_optimised_backtest(
         "strategy_name": sp["name"],
         "objective":     objective,
         "rebal_freq":    rebal_freq,
+        "universe_name": universe_name,
         "sector_map":    sector_map,
+        "industry_map":  industry_map,
         "ticker_map":    ticker_map,
         "name_map":      name_map,
     }
@@ -646,9 +706,8 @@ with st.sidebar:
 
     st.divider()
     st.caption(
-        f"Risk-free rate: {RISK_FREE:.0%} (Sharpe).  \n"
         "Equal-weight within each leg.  \n"
-        "Rebalances at each annual factor snapshot."
+        "Rebalances at each quarterly factor snapshot."
     )
 
 
@@ -665,7 +724,7 @@ tab1, tab2 = st.tabs(["Factor Backtest", "Optimised Backtest"])
 
 with tab1:
     st.caption(
-        "Annual rebalancing: rank stocks by model score at each snapshot, hold equal-weight "
+        "Quarterly rebalancing: rank stocks by model score at each snapshot, hold equal-weight "
         "top N. Pre-computed daily total returns; no transaction costs."
     )
 
@@ -837,13 +896,13 @@ with tab1:
                 text=[f"{v:.0f}%" for v in to_df["Turnover (%)"]],
                 textposition="outside",
             ))
-            fig_to.update_layout(height=300, yaxis_title="One-way turnover (%)",
+            fig_to.update_layout(height=300, yaxis_title="Two-way turnover (%)",
                                  yaxis_range=[0, 110],
                                  margin=dict(l=0, r=0, t=10, b=10))
             st.plotly_chart(fig_to, use_container_width=True)
             st.caption(
-                "% of long portfolio replaced at each rebalance. First period = 100% (portfolio "
-                f"built from scratch).  Average (ex-first): **{avg_turnover:.0f}%**."
+                "Two-way = buys + sells as % of portfolio. First period = 100% (built from scratch). "
+                f"Average (ex-first): **{avg_turnover:.0f}%**."
             )
 
     # Quintile analysis
@@ -946,18 +1005,18 @@ with tab1:
 
 with tab2:
     st.caption(
-        "Walk-forward quarterly rebalancing using the CVXPY optimizer.  "
-        "Universe: S&P 500 constituents at each snapshot.  "
+        "Walk-forward optimiser using CVXPY.  "
+        "Rebalances at every factor snapshot date (quarterly); universe snapshot carried forward when no new filing is available.  "
         "Risk model: Barra (K=29 factors, LW fallback).  "
         f"Transaction cost: €{TC_EUR:.0f} per order; orders counted only when trade value ≥ €{TC_EUR/0.01:.0f} (~1% commission ratio).  "
-        "Turnover: one-way quarterly limit.  "
+        "Turnover limit is two-way (buys + sells): a fully replaced 35-stock portfolio ≈ 100%.  "
         "Note: **realized TE** will exceed the strategy's ex-ante TE constraint — the optimizer "
-        "targets ex-ante Barra TE at each rebalance; quarterly drift and index composition "
-        "changes accumulate realized TE between rebalances."
+        "targets ex-ante Barra TE at each rebalance; drift and index composition changes accumulate between rebalances."
     )
 
     # ── Controls ──────────────────────────────────────────────────────────────
-    available_indices = db.get_available_benchmark_indices()
+    available_indices  = db.get_available_benchmark_indices()
+    available_universes = db.get_available_universe_indices()
 
     if not PARAMS_FILE.exists():
         st.warning("strategy_params.xlsx not found. Run `create_strategy_params.py` first.")
@@ -969,43 +1028,60 @@ with tab2:
     strategy_opts  = {row["name"].strip(): row["strategy_id"].strip()
                       for _, row in strats_df.iterrows()}
 
-    c1, c2, c3, c4, c5, c6 = st.columns([2, 1.5, 1, 1.5, 1.5, 1])
-    with c1:
+    # Row 1 — strategy / universe / benchmark selection
+    r1c1, r1c2, r1c3, r1c4 = st.columns([2.5, 1.5, 1.5, 1])
+    with r1c1:
         sel_strat_name = st.selectbox("Strategy", list(strategy_opts.keys()), key="opt_bt_strat")
         sel_strat_id   = strategy_opts[sel_strat_name]
-    with c2:
-        portfolio_eur = st.number_input(
-            "Portfolio size (€)", min_value=1_000, max_value=10_000_000,
-            value=50_000, step=5_000, key="opt_bt_size",
+    with r1c2:
+        default_uni = "russell_1000" if "russell_1000" in available_universes else (available_universes[0] if available_universes else "sp500")
+        sel_universe = st.selectbox(
+            "Universe", available_universes,
+            index=available_universes.index(default_uni) if default_uni in available_universes else 0,
+            key="opt_bt_uni",
         )
-    with c3:
-        max_to_pct = st.slider(
-            "Max turnover (%)", min_value=5, max_value=50, value=10, step=5, key="opt_bt_to"
-        )
-    with c4:
-        default_bench = "sp500" if "sp500" in available_indices else (available_indices[0] if available_indices else "")
+    with r1c3:
+        default_bench = "russell_1000" if "russell_1000" in available_indices else (available_indices[0] if available_indices else "")
         sel_bench = st.selectbox(
             "Benchmark", available_indices,
             index=available_indices.index(default_bench) if default_bench in available_indices else 0,
             key="opt_bt_bench",
         )
-    with c5:
+    with r1c4:
         rebal_freq = st.radio(
             "Rebalancing", ["Quarterly", "Monthly"],
-            captions=["Alpha + risk", "Stale alpha, fresh Barra"],
+            captions=["Alpha + risk", "Stale alpha"],
             key="opt_bt_freq",
         ).lower()
-    with c6:
-        min_weight_pct = st.number_input(
-            "Min weight (%)", min_value=0.0, max_value=1.0,
-            value=0.05, step=0.01, format="%.2f", key="opt_bt_minw",
-        )
-    min_weight = min_weight_pct / 100.0
 
+    # Row 2 — tuning parameters
+    r2c1, r2c2, r2c3, r2c4, r2c5, r2c6 = st.columns([1.5, 1.5, 1, 1.2, 1.2, 1.2])
+    with r2c1:
+        portfolio_eur = st.number_input(
+            "Portfolio size (€)", min_value=1_000, max_value=10_000_000,
+            value=50_000, step=5_000, key="opt_bt_size",
+        )
+    with r2c2:
+        max_to_pct = st.slider(
+            "Max turnover (%)", min_value=5, max_value=100, value=30, step=5, key="opt_bt_to"
+        )
+        st.caption("Two-way: buys + sells")
+    with r2c3:
+        min_pos_opts = {"Strategy default": None, "0.25%": 0.0025, "0.5%": 0.005,
+                        "1%": 0.01, "1.5%": 0.015, "2%": 0.02}
+        sel_min_pos  = st.selectbox("Min position", list(min_pos_opts.keys()),
+                                    index=0, key="opt_bt_minw")
+        min_pos_if_held_override = min_pos_opts[sel_min_pos]
+    with r2c4:
+        max_pos_opts   = ["Strategy default", "50", "75", "100", "150", "200"]
+        sel_max_pos    = st.selectbox("Max positions", max_pos_opts, index=0, key="opt_bt_maxpos")
+        max_positions_override = None if sel_max_pos == "Strategy default" else int(sel_max_pos)
+    with r2c5:
+        sel_solver = st.selectbox("Solver", ["CLARABEL", "MOSEK"], key="opt_bt_solver")
     run_clicked = st.button("▶ Run Optimised Backtest", type="primary", key="opt_bt_run")
 
     # ── Trigger computation ───────────────────────────────────────────────────
-    result_key = f"opt_bt_{sel_strat_id}_{portfolio_eur}_{max_to_pct}_{sel_bench}_{rebal_freq}_{min_weight_pct}"
+    result_key = f"opt_bt_{sel_strat_id}_{sel_universe}_{portfolio_eur}_{max_to_pct}_{sel_bench}_{rebal_freq}_{sel_min_pos}_{sel_max_pos}_{sel_solver}"
 
     if run_clicked:
         # Clear stale results from other parameter combinations
@@ -1014,13 +1090,16 @@ with tab2:
         est_time = "~30–60 s" if rebal_freq == "quarterly" else "~2–3 min"
         with st.spinner(f"Running {rebal_freq} walk-forward backtest for '{sel_strat_name}'…  ({est_time})"):
             st.session_state[result_key] = _run_optimised_backtest(
-                strategy_id      = sel_strat_id,
-                portfolio_eur    = float(portfolio_eur),
-                max_turnover     = max_to_pct / 100.0,
-                tc_per_trade_eur = TC_EUR,
-                benchmark_name   = sel_bench,
-                rebal_freq       = rebal_freq,
-                min_weight       = min_weight,
+                strategy_id            = sel_strat_id,
+                portfolio_eur          = float(portfolio_eur),
+                max_turnover           = max_to_pct / 100.0,
+                tc_per_trade_eur       = TC_EUR,
+                benchmark_name         = sel_bench,
+                universe_name          = sel_universe,
+                rebal_freq             = rebal_freq,
+                min_pos_if_held        = min_pos_if_held_override,
+                max_positions_override = max_positions_override,
+                solver                 = sel_solver,
             )
 
     # ── Display results ───────────────────────────────────────────────────────
@@ -1034,11 +1113,12 @@ with tab2:
         st.error(result["error"])
         st.stop()
 
-    port_series = result["port_series"]
-    period_log  = result["period_log"]
-    sector_map  = result["sector_map"]
-    ticker_map  = result["ticker_map"]
-    name_map    = result["name_map"]
+    port_series  = result["port_series"]
+    period_log   = result["period_log"]
+    sector_map   = result["sector_map"]
+    industry_map = result["industry_map"]
+    ticker_map   = result["ticker_map"]
+    name_map     = result["name_map"]
 
     if result["warnings"]:
         with st.expander(f"{len(result['warnings'])} warning(s)"):
@@ -1058,19 +1138,16 @@ with tab2:
     any_barra          = any(p["used_barra"] for p in period_log)
     any_relaxed        = any(p["relaxed_integer"] for p in period_log)
     freq_label         = result.get("rebal_freq", "quarterly").capitalize()
-    m1, m2, m3, m4    = st.columns(4)
-    m1.metric("Periods", f"{len(period_log)} ({freq_label})")
-    m2.metric("Avg turnover", f"{avg_to_pct_actual:.0f}%")
-    m3.metric("Total TC (est.)", f"€{total_tc:,.0f}")
-    m4.metric("Risk model", "Barra" if any_barra else "Ledoit-Wolf")
+    uni_label          = result.get("universe_name", "sp500").replace("_", " ").title()
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Universe", uni_label)
+    m2.metric("Periods", f"{len(period_log)} ({freq_label})")
+    m3.metric("Avg turnover (2-way)", f"{avg_to_pct_actual:.0f}%")
+    m4.metric("Total TC (est.)", f"€{total_tc:,.0f}")
+    m5.metric("Risk model", "Barra" if any_barra else "Ledoit-Wolf")
     if any_relaxed:
         st.info(
-            "**max_positions and min_position_if_held not applied** — these require MOSEK's "
-            "mixed-integer solver and are infeasible when running strategies designed for the "
-            "Russell 1000 universe against the S&P 500 (different benchmark composition makes "
-            "the cardinality + active-weight combination geometrically infeasible). "
-            "The backtest applies all continuous constraints: active risk, stock/sector/industry "
-            "active weights, and turnover."
+            "**max_positions / min_position_if_held not applied** — switch solver to MOSEK to enforce cardinality constraints."
         )
 
     st.divider()
@@ -1079,11 +1156,12 @@ with tab2:
     pt1, pt2, pt3 = st.tabs(["Performance", "Analysis", "Holdings"])
 
     with pt1:
+        excess_series = port_series.subtract(bench_series.reindex(port_series.index, fill_value=0.0))
         st.plotly_chart(_cum_return_chart([
             {"series": port_series,  "name": result["strategy_name"], "color": "#2563EB"},
             {"series": bench_series, "name": bench_label, "color": "#94A3B8",
              "width": 1.5, "dash": "dot"},
-        ]), use_container_width=True)
+        ], excess_series=excess_series), use_container_width=True)
 
         st.plotly_chart(_drawdown_chart([
             {"series": port_series,  "name": result["strategy_name"], "color": "#2563EB",
@@ -1115,25 +1193,56 @@ with tab2:
         st.subheader("Turnover per period")
         to_rows = [
             {"Period": p["snap_date"][:10], "Turnover (%)": round(p["turnover"] * 100, 1),
-             "# Trades": p["n_trades"], "TC (€)": round(p["tc_pct"] * portfolio_eur, 0)}
+             "# Trades": p["n_trades"], "TC (€)": round(p["tc_pct"] * portfolio_eur, 0),
+             "relaxed": p.get("turnover_relaxed", False)}
             for p in period_log
         ]
+        bar_colors = ["#F59E0B" if r["relaxed"] else "#2563EB" for r in to_rows]
         fig_to = go.Figure(go.Bar(
             x=[r["Period"] for r in to_rows], y=[r["Turnover (%)"] for r in to_rows],
-            marker_color="#2563EB",
+            marker_color=bar_colors,
             text=[f"{r['Turnover (%)']:.0f}%" for r in to_rows], textposition="outside",
         ))
         fig_to.add_hline(y=max_to_pct, line_dash="dash", line_color="#EF4444", line_width=1.5,
-                         annotation_text=f"Limit {max_to_pct}%", annotation_position="right")
+                         annotation_text=f"Requested limit {max_to_pct}%", annotation_position="right")
         max_to_shown = max(r["Turnover (%)"] for r in to_rows) * 1.2
-        fig_to.update_layout(height=300, yaxis_title="One-way turnover (%)",
+        fig_to.update_layout(height=300, yaxis_title="Two-way turnover (%)",
                              yaxis_range=[0, max(max_to_pct * 1.5, max_to_shown)],
-                             margin=dict(l=0, r=60, t=10, b=10))
+                             margin=dict(l=0, r=100, t=10, b=10))
         st.plotly_chart(fig_to, use_container_width=True)
+        n_relaxed = sum(1 for r in to_rows if r["relaxed"])
+        relaxed_note = f"  🟡 = {n_relaxed} period(s) where turnover limit was auto-relaxed to find a feasible solution." if n_relaxed else ""
         st.caption(
-            f"First period is 100% turnover (portfolio built from scratch). "
-            f"Constraint: {max_to_pct}% one-way."
+            f"Two-way turnover = buys + sells as % of portfolio. "
+            f"First period is 100% (built from scratch). Requested constraint: {max_to_pct}% two-way.{relaxed_note}"
         )
+
+        st.divider()
+        pt2c1, pt2c2 = st.columns(2)
+        with pt2c1:
+            st.subheader("Position count")
+            pos_rows = [{"Period": p["snap_date"][:10], "Positions": p["n_positions"]} for p in period_log]
+            fig_pos = go.Figure(go.Scatter(
+                x=[r["Period"] for r in pos_rows], y=[r["Positions"] for r in pos_rows],
+                mode="lines+markers", line=dict(color="#2563EB", width=2), marker=dict(size=6),
+            ))
+            fig_pos.update_layout(height=240, yaxis_title="# positions",
+                                  hovermode="x unified", margin=dict(l=0, r=20, t=10, b=10))
+            st.plotly_chart(fig_pos, use_container_width=True)
+        with pt2c2:
+            st.subheader("Transaction costs")
+            tc_rows = [{"Period": p["snap_date"][:10], "TC (€)": round(p["tc_pct"] * portfolio_eur, 0),
+                        "Trades": p["n_trades"]} for p in period_log]
+            fig_tc = go.Figure(go.Bar(
+                x=[r["Period"] for r in tc_rows], y=[r["TC (€)"] for r in tc_rows],
+                marker_color="#6366F1",
+                text=[f"€{r['TC (€)']:.0f}" for r in tc_rows], textposition="outside",
+                customdata=[r["Trades"] for r in tc_rows],
+                hovertemplate="%{x}<br>TC: €%{y:,.0f}<br>Trades: %{customdata}<extra></extra>",
+            ))
+            fig_tc.update_layout(height=240, yaxis_title="TC (€)",
+                                 margin=dict(l=0, r=20, t=10, b=10))
+            st.plotly_chart(fig_tc, use_container_width=True)
 
         st.divider()
         st.subheader("Sector weights over time")
@@ -1167,38 +1276,68 @@ with tab2:
 
     with pt3:
         st.subheader("Holdings snapshot")
-        snap_labels = [p["snap_date"][:10] for p in period_log]
-        sel_snap    = st.selectbox("Rebalance date", snap_labels,
-                                   index=len(snap_labels) - 1, key="opt_bt_snap")
-        sel_entry   = next((p for p in period_log if p["snap_date"][:10] == sel_snap), period_log[-1])
+        h3c1, h3c2 = st.columns([2, 1])
+        with h3c1:
+            snap_labels = [p["snap_date"][:10] for p in period_log]
+            sel_snap    = st.selectbox("Rebalance date", snap_labels,
+                                       index=len(snap_labels) - 1, key="opt_bt_snap")
+        with h3c2:
+            sec_view = st.segmented_control(
+                "Sector / industry view", ["Absolute", "Active"], default="Active", key="opt_bt_sec_view"
+            )
+        sel_entry = next((p for p in period_log if p["snap_date"][:10] == sel_snap), period_log[-1])
+        has_bm_weights = bool(sel_entry.get("bm_sector_weights"))
 
         h_df = pd.DataFrame([
-            {"Ticker":  ticker_map.get(isin, isin),
-             "Company": name_map.get(isin, ""),
-             "Sector":  sector_map.get(isin, "Unknown"),
-             "Weight":  w}
+            {"Ticker":   ticker_map.get(isin, isin),
+             "Company":  name_map.get(isin, ""),
+             "Sector":   sector_map.get(isin, "Unknown"),
+             "Industry": industry_map.get(isin, ""),
+             "Weight %": round(w * 100, 3),
+             "Value (€)": round(w * portfolio_eur, 0)}
             for isin, w in sorted(sel_entry["weights"].items(), key=lambda x: -x[1])
         ])
 
         hc1, hc2 = st.columns([3, 2])
         with hc1:
             st.markdown(f"**{len(h_df)} positions** — {sel_snap}")
-            max_w = h_df["Weight"].max() if not h_df.empty else 0.05
+            max_w = h_df["Weight %"].max() if not h_df.empty else 5.0
             st.dataframe(h_df, hide_index=True, use_container_width=True, column_config={
-                "Weight": st.column_config.ProgressColumn(
-                    "Weight", format="%.2%%", min_value=0, max_value=max_w
+                "Weight %": st.column_config.ProgressColumn(
+                    "Weight %", format="%.2f%%", min_value=0, max_value=max_w
                 ),
+                "Value (€)": st.column_config.NumberColumn("Value (€)", format="€%,.0f"),
             })
         with hc2:
-            sec_w = h_df.groupby("Sector")["Weight"].sum().reset_index().sort_values("Weight")
-            fig_sec = go.Figure(go.Bar(
-                x=sec_w["Weight"], y=sec_w["Sector"], orientation="h", marker_color="#2563EB",
-                text=[f"{v:.1%}" for v in sec_w["Weight"]], textposition="outside",
-            ))
-            fig_sec.update_layout(title="Sector weights",
-                                  height=max(200, len(sec_w) * 30 + 60),
-                                  xaxis_tickformat=".0%",
-                                  margin=dict(l=0, r=60, t=40, b=10))
+            # Sector chart
+            port_sec = sel_entry["sector_weights"]
+            bm_sec   = sel_entry.get("bm_sector_weights", {})
+            all_secs = sorted(set(port_sec) | set(bm_sec))
+            if sec_view == "Active" and has_bm_weights:
+                act_sec = {s: port_sec.get(s, 0.0) - bm_sec.get(s, 0.0) for s in all_secs}
+                act_sec_s = sorted(act_sec.items(), key=lambda x: x[1])
+                colors_s = ["#EF4444" if v < 0 else "#2563EB" for _, v in act_sec_s]
+                fig_sec = go.Figure(go.Bar(
+                    x=[v for _, v in act_sec_s], y=[s for s, _ in act_sec_s],
+                    orientation="h", marker_color=colors_s,
+                    text=[f"{v:+.1%}" for _, v in act_sec_s], textposition="outside",
+                ))
+                fig_sec.add_vline(x=0, line_color="#64748B", line_width=1)
+                fig_sec.update_layout(title="Sector active weights",
+                                      height=max(200, len(act_sec_s) * 30 + 60),
+                                      xaxis_tickformat=".0%",
+                                      margin=dict(l=0, r=70, t=40, b=10))
+            else:
+                sec_items = sorted(port_sec.items(), key=lambda x: x[1])
+                fig_sec = go.Figure(go.Bar(
+                    x=[v for _, v in sec_items], y=[s for s, _ in sec_items],
+                    orientation="h", marker_color="#2563EB",
+                    text=[f"{v:.1%}" for _, v in sec_items], textposition="outside",
+                ))
+                fig_sec.update_layout(title="Sector weights",
+                                      height=max(200, len(sec_items) * 30 + 60),
+                                      xaxis_tickformat=".0%",
+                                      margin=dict(l=0, r=60, t=40, b=10))
             st.plotly_chart(fig_sec, use_container_width=True)
 
             m = sel_entry["metrics"]
@@ -1221,6 +1360,44 @@ with tab2:
                     ("TC",           f"€{sel_entry['tc_pct'] * portfolio_eur:,.0f}"),
                     ("Risk model",   "Barra" if sel_entry["used_barra"] else "Ledoit-Wolf"),
                     ("Constraints",  "Relaxed (no max_positions)" if sel_entry["relaxed_integer"] else "Full"),
+                    ("Turnover",     "⚠ Auto-relaxed" if sel_entry.get("turnover_relaxed") else "Within limit"),
                     ("Alpha date",   sel_entry.get("alpha_date", sel_entry["snap_date"])),
                 ]
                 _metrics_table(dict(rows_m))
+
+        # Industry chart below
+        st.divider()
+        port_ind = sel_entry.get("industry_weights", {})
+        bm_ind   = sel_entry.get("bm_industry_weights", {})
+        all_inds = sorted(set(port_ind) | set(bm_ind))
+        if sec_view == "Active" and has_bm_weights:
+            act_ind = {i: port_ind.get(i, 0.0) - bm_ind.get(i, 0.0) for i in all_inds}
+            # Show top 15 over + top 15 under by active weight
+            sorted_ind = sorted(act_ind.items(), key=lambda x: x[1])
+            bottom15 = sorted_ind[:15]
+            top15    = sorted_ind[-15:][::-1]
+            show_ind = list(dict.fromkeys(bottom15 + top15))  # preserve order, dedupe
+            show_ind_s = sorted(show_ind, key=lambda x: x[1])
+            colors_i = ["#EF4444" if v < 0 else "#2563EB" for _, v in show_ind_s]
+            fig_ind = go.Figure(go.Bar(
+                x=[v for _, v in show_ind_s], y=[i for i, _ in show_ind_s],
+                orientation="h", marker_color=colors_i,
+                text=[f"{v:+.1%}" for _, v in show_ind_s], textposition="outside",
+            ))
+            fig_ind.add_vline(x=0, line_color="#64748B", line_width=1)
+            fig_ind.update_layout(title="Industry active weights (top 15 over/under)",
+                                  height=max(300, len(show_ind_s) * 22 + 60),
+                                  xaxis_tickformat=".0%",
+                                  margin=dict(l=0, r=70, t=40, b=10))
+        else:
+            ind_items = sorted(port_ind.items(), key=lambda x: x[1])[-30:]
+            fig_ind = go.Figure(go.Bar(
+                x=[v for _, v in ind_items], y=[i for i, _ in ind_items],
+                orientation="h", marker_color="#2563EB",
+                text=[f"{v:.1%}" for _, v in ind_items], textposition="outside",
+            ))
+            fig_ind.update_layout(title="Industry weights (top 30)",
+                                  height=max(300, len(ind_items) * 22 + 60),
+                                  xaxis_tickformat=".0%",
+                                  margin=dict(l=0, r=60, t=40, b=10))
+        st.plotly_chart(fig_ind, use_container_width=True)
