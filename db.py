@@ -343,26 +343,37 @@ def get_available_benchmark_indices() -> list[str]:
 @st.cache_data
 def get_sp500_isins_at_date(snapshot_date: str) -> list[str]:
     """Return ISINs in the S&P 500 universe at the given snapshot_date."""
+    return get_universe_isins_at_date("sp500", snapshot_date)
+
+
+@st.cache_data
+def get_sp500_weights_at_date(snapshot_date: str) -> dict[str, float]:
+    """Return {isin: weight} for S&P 500 at snapshot_date, normalised to sum=1."""
+    return get_universe_weights_at_date("sp500", snapshot_date)
+
+
+@st.cache_data
+def get_universe_isins_at_date(index_name: str, snapshot_date: str) -> list[str]:
+    """Return ISINs for any tracked index at the given snapshot_date."""
     with get_db(UNIVERSE_DB) as conn:
         rows = conn.execute(
-            "SELECT isin FROM universe_snapshots "
-            "WHERE snapshot_date = ? AND index_name = 'sp500'",
-            (snapshot_date,),
+            "SELECT isin FROM universe_snapshots WHERE snapshot_date = ? AND index_name = ?",
+            (snapshot_date, index_name),
         ).fetchall()
     return [r[0] for r in rows]
 
 
 @st.cache_data
-def get_sp500_weights_at_date(snapshot_date: str) -> dict[str, float]:
+def get_universe_weights_at_date(index_name: str, snapshot_date: str) -> dict[str, float]:
     """
-    Return {isin: weight} for S&P 500 at snapshot_date, normalised to sum=1.
+    Return {isin: weight} for any tracked index at snapshot_date, normalised to sum=1.
     Weights come from universe_snapshots.weight (iShares N-PORT-P % weights).
     """
     with get_db(UNIVERSE_DB) as conn:
         rows = conn.execute(
             "SELECT isin, weight FROM universe_snapshots "
-            "WHERE snapshot_date = ? AND index_name = 'sp500' AND weight IS NOT NULL",
-            (snapshot_date,),
+            "WHERE snapshot_date = ? AND index_name = ? AND weight IS NOT NULL",
+            (snapshot_date, index_name),
         ).fetchall()
     if not rows:
         return {}
@@ -371,3 +382,15 @@ def get_sp500_weights_at_date(snapshot_date: str) -> dict[str, float]:
     if total <= 0:
         return {}
     return {isin: w / total for isin, w in raw.items()}
+
+
+@st.cache_data
+def get_available_universe_indices() -> list[str]:
+    """Return index_name values that have universe snapshots (usable as optimizer universe)."""
+    if not UNIVERSE_DB.exists():
+        return []
+    with get_db(UNIVERSE_DB) as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT index_name FROM universe_snapshots ORDER BY index_name"
+        ).fetchall()
+    return [r[0] for r in rows]

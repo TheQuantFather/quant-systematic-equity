@@ -1,5 +1,5 @@
 """
-app.py — Home page for the Quant Factor Dashboard.
+app.py — Home page for the Systematic Equity Investment Framework.
 Run with: streamlit run app.py
 """
 
@@ -10,14 +10,14 @@ from config import FACTORS_DB
 from utils import get_db, inject_css
 
 st.set_page_config(
-    page_title="Quant Factor Dashboard",
+    page_title="Systematic Equity Investment Framework",
     page_icon="📊",
     layout="wide",
 )
 inject_css()
 
-st.title("Quant Factor Dashboard")
-st.markdown("Systematic factor analysis across the US equity universe.")
+st.title("Systematic Equity Investment Framework")
+st.markdown("End-to-end quantitative equity pipeline: factor research, risk modelling, and portfolio optimisation.")
 
 # ---------------------------------------------------------------------------
 # Summary stats

@@ -13,9 +13,10 @@ header and start from (total - BACKFILL_BUFFER) for backfill, or
 (total - INCREMENTAL_BUFFER) for daily updates.
 
 Usage:
-  python create_svr.py               # incremental update (last date → today)
-  python create_svr.py --backfill    # fetch last ~90 trading days from scratch
-  python create_svr.py --check       # print coverage stats, no fetch
+  python create_svr.py                   # incremental update (last date → today)
+  python create_svr.py --backfill        # fetch last ~90 trading days from scratch
+  python create_svr.py --deep-backfill   # walk full FINRA API from offset 0 (~12-14 months)
+  python create_svr.py --check           # print coverage stats, no fetch
 """
 
 import argparse
@@ -122,15 +123,38 @@ def _detect_fields(sample: dict) -> tuple[str, str, str, str]:
 # Fetch and aggregate
 # ---------------------------------------------------------------------------
 
+def _aggregate(raw_rows: list[dict]) -> pd.DataFrame:
+    """Aggregate raw FINRA rows across reporting facilities → one row per (isin, date)."""
+    if not raw_rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(raw_rows)
+    df["short_vol"] = pd.to_numeric(df["short_vol"], errors="coerce")
+    df["total_vol"] = pd.to_numeric(df["total_vol"], errors="coerce")
+    agg = (
+        df.groupby(["isin", "date"])
+        .agg(short_vol=("short_vol", "sum"), total_vol=("total_vol", "sum"))
+        .reset_index()
+    )
+    agg["svr"] = agg["short_vol"] / agg["total_vol"].clip(lower=1)
+    return agg
+
+
 def fetch_svr(
     start_offset: int,
     cutoff_date: str,
     ticker_to_isin: dict[str, str],
+    flush_conn: sqlite3.Connection | None = None,
+    flush_every_pages: int = 100,
 ) -> pd.DataFrame:
     """
     Page through FINRA from start_offset, keep rows with date > cutoff_date
     that match our universe tickers. Returns an aggregated DataFrame with
     columns [isin, date, short_vol, total_vol, svr].
+
+    If `flush_conn` is provided, accumulated rows are aggregated and upserted
+    every `flush_every_pages` pages so progress survives crashes/kills.  The
+    returned DataFrame then contains only the tail buffer (committed by the
+    caller's final upsert).  PK is (isin, date) so re-flushing is idempotent.
     """
     # Probe first page at start_offset to detect field names
     probe = _fetch_page(start_offset, retries=5)
@@ -169,29 +193,22 @@ def fetch_svr(
 
         if pages % 20 == 0:
             latest = max(str(r.get(date_f, "")) for r in page)
-            log.info("Page %d, offset %s | universe rows: %s | latest date: %s",
+            log.info("Page %d, offset %s | buffer rows: %s | latest date: %s",
                      pages, f"{offset:,}", f"{len(raw_rows):,}", latest)
+
+        if flush_conn is not None and pages > 0 and pages % flush_every_pages == 0 and raw_rows:
+            batch = _aggregate(raw_rows)
+            n = upsert_svr(flush_conn, batch)
+            log.info("Flushed checkpoint — %s rows committed (offset %s)",
+                     f"{n:,}", f"{offset:,}")
+            raw_rows.clear()
 
         if len(page) < PAGE_SIZE:
             break  # last page
 
         time.sleep(0.05)
 
-    if not raw_rows:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(raw_rows)
-    df["short_vol"] = pd.to_numeric(df["short_vol"], errors="coerce")
-    df["total_vol"] = pd.to_numeric(df["total_vol"], errors="coerce")
-
-    # Aggregate across FINRA reporting facilities (multiple rows per ticker per day)
-    agg = (
-        df.groupby(["isin", "date"])
-        .agg(short_vol=("short_vol", "sum"), total_vol=("total_vol", "sum"))
-        .reset_index()
-    )
-    agg["svr"] = agg["short_vol"] / agg["total_vol"].clip(lower=1)
-    return agg
+    return _aggregate(raw_rows)
 
 
 # ---------------------------------------------------------------------------
@@ -240,6 +257,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Fetch FINRA SVR data into returns.db")
     parser.add_argument("--backfill", action="store_true",
                         help="Fetch last ~90 trading days (ignores existing data)")
+    parser.add_argument("--deep-backfill", action="store_true", dest="deep_backfill",
+                        help="Walk full FINRA API from offset 0 (~12-14 months, 45-60 min)")
     parser.add_argument("--check",   action="store_true",
                         help="Print coverage stats only, no fetch")
     args = parser.parse_args()
@@ -264,7 +283,15 @@ def main() -> None:
         total_records = _get_total_records()
         log.info("Total FINRA records: %s", f"{total_records:,}")
 
-        if args.backfill:
+        if args.deep_backfill:
+            # Block 1 is date-descending; INSERT OR REPLACE on (isin,date) PK
+            # handles overlap with Block 2 cleanly.  Permissive cutoff so every
+            # row that matches a universe ticker is kept.
+            start_offset = 0
+            cutoff_date  = "1900-01-01"
+            log.info("Deep backfill mode: walking full FINRA API from offset 0 (%s records)",
+                     f"{total_records:,}")
+        elif args.backfill:
             start_offset = max(0, total_records - BACKFILL_BUFFER)
             cutoff_date  = (date.today() - timedelta(days=95)).isoformat()
             log.info("Backfill mode: offset %s, cutoff %s", f"{start_offset:,}", cutoff_date)
@@ -283,7 +310,9 @@ def main() -> None:
                      f"{start_offset:,}", cutoff_date)
 
         log.info("Fetching SVR data ...")
-        df = fetch_svr(start_offset, cutoff_date, ticker_to_isin)
+        # Deep backfill is the only mode long enough to need periodic flush.
+        flush_conn = conn if args.deep_backfill else None
+        df = fetch_svr(start_offset, cutoff_date, ticker_to_isin, flush_conn=flush_conn)
 
         if df.empty:
             log.info("No new rows to insert.")

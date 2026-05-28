@@ -4,6 +4,7 @@ daily_update.py — Automated pipeline update.
 
 Schedule:
   Daily   — update prices (create_returns.py --update)
+  Daily   — FINRA short volume ratio (create_svr.py)
   Daily   — EDGAR filing index: process companies that actually filed (10-K + 10-Q)
   Weekly  — on Fridays: rebuild factors, models, risk, Barra, portfolio
              using today's date as the snapshot so everything is aligned
@@ -45,6 +46,7 @@ REPO_DIR = Path(__file__).parent.resolve()
 # than "expected runtime."
 TIMEOUTS: dict[str, int] = {
     "returns":   3600,   # 1h — yfinance bulk pull
+    "svr":       1800,   # 30m — FINRA short volume incremental
     "filings":   3600,   # 1h — EDGAR index + per-company fetches
     "factors":   2700,   # 45m
     "models":     900,   # 15m
@@ -186,6 +188,8 @@ def main() -> None:
                         help="Run the full weekly rebuild today regardless of day")
     parser.add_argument("--skip-returns",   action="store_true",
                         help="Skip price update (downstream runs against existing DB)")
+    parser.add_argument("--skip-svr",       action="store_true",
+                        help="Skip FINRA SVR update")
     parser.add_argument("--skip-filings",   action="store_true",
                         help="Skip EDGAR filings (downstream runs against existing DB)")
     parser.add_argument("--skip-portfolio", action="store_true",
@@ -218,6 +222,13 @@ def main() -> None:
         results["returns"] = True
     else:
         step("returns", "create_returns.py", "--update")
+
+    # SVR writes to returns.db too — must run after returns to avoid lock conflict.
+    if args.skip_svr:
+        log.info("SKIP    svr (--skip-svr)")
+        results["svr"] = True
+    else:
+        step("svr", "create_svr.py", depends_on=("returns",))
 
     if args.skip_filings:
         log.info("SKIP    filings (--skip-filings; downstream uses existing DB)")

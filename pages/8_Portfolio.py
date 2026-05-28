@@ -71,13 +71,23 @@ def load_latest(strategy_id: str) -> tuple[pd.DataFrame | None, dict | None]:
     return df, summary
 
 
-def run_optimizer(strategy_id: str):
-    import subprocess, sys
-    result = subprocess.run(
-        [sys.executable, "optimize_portfolio.py", "--strategy", strategy_id],
-        capture_output=True, text=True,
+def run_optimizer(strategy_id: str) -> tuple[bool, pd.DataFrame | None, dict | None, str]:
+    """
+    Run optimization in-process (no subprocess). Returns (ok, df, summary, error_log).
+    Results are also persisted to portfolio_output/ so they survive page refreshes.
+    """
+    from optimize_portfolio import (
+        run_optimization, load_strategy_params, save_results,
     )
-    return result.returncode == 0, result.stdout + result.stderr
+    try:
+        strategies = load_strategy_params(strategy_id)
+        if not strategies:
+            return False, None, None, f"Strategy '{strategy_id}' not found in params file."
+        results_df, summary = run_optimization(strategies[0])
+        save_results(results_df, summary)
+        return True, results_df, summary, ""
+    except Exception as exc:
+        return False, None, None, str(exc)
 
 
 @st.cache_data(ttl=300)
@@ -401,25 +411,27 @@ if not strategies:
 selected = st.sidebar.selectbox("Select strategy", strategies)
 
 if st.sidebar.button("▶  Run Optimisation", use_container_width=True, type="primary"):
-    with st.spinner("Optimising..."):
-        ok, log = run_optimizer(selected)
+    with st.spinner("Optimising…"):
+        ok, _df, _summary, _log = run_optimizer(selected)
     if ok:
+        st.session_state[f"port_{selected}"] = (_df, _summary)
         st.success("Optimisation complete.")
-        st.cache_data.clear()
     else:
         st.error("Optimisation failed.")
-        st.code(log)
+        st.code(_log)
 
 st.sidebar.markdown("---")
-st.sidebar.caption("Results saved to `data/portfolio_output/`. "
-                   "Re-run after changing `strategy_params.xlsx`.")
+st.sidebar.caption("Re-run after changing `strategy_params.xlsx`.")
 
-# ── Load results ──────────────────────────────────────────────────────────────
+# ── Load results — session state first, then file fallback ───────────────────
 
-df, summary = load_latest(selected)
+if f"port_{selected}" in st.session_state:
+    df, summary = st.session_state[f"port_{selected}"]
+else:
+    df, summary = load_latest(selected)
 
 if df is None:
-    st.info(f"No results yet for **{selected}**. Click **Run Optimisation** in the sidebar.")
+    st.info(f"No results yet for **{selected}**. Click **▶ Run Optimisation** in the sidebar.")
     st.stop()
 
 # ── Summary metrics ───────────────────────────────────────────────────────────

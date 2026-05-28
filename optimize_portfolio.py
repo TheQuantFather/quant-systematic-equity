@@ -479,9 +479,9 @@ def _optimize_alpha(strategy, investable, alpha, b, Sigma, L,
     # Absolute sector constraints (excluded_sectors, min/max_sector_weight)
     _add_sector_constraints(cvx, w, 1.0, sectors, B_sector, c)
 
-    # One-way turnover constraint: sum(|w - w_prev|) / 2 ≤ max_turnover
+    # Two-way turnover constraint: sum(|w - w_prev|) ≤ max_turnover
     if prev_weights_arr is not None and max_turnover is not None:
-        cvx.append(cp.sum(cp.abs(w - prev_weights_arr)) / 2 <= max_turnover)
+        cvx.append(cp.sum(cp.abs(w - prev_weights_arr)) <= max_turnover)
 
     prob = cp.Problem(cp.Maximize(alpha @ w), cvx)
     _solve(prob, strategy["solver"])
@@ -562,10 +562,10 @@ def _optimize_sharpe(strategy, investable, alpha, Sigma, L,
     if max_vol is not None:
         cvx.append(cp.norm(L.T @ y, 2) <= max_vol * t)
 
-    # One-way turnover in Charnes-Cooper space:
-    # sum(|w - w_prev|)/2 ≤ T  ⟺  sum(|y - w_prev·t|) ≤ 2·T·t
+    # Two-way turnover in Charnes-Cooper space:
+    # sum(|w - w_prev|) ≤ T  ⟺  sum(|y - w_prev·t|) ≤ T·t
     if prev_weights_arr is not None and max_turnover is not None:
-        cvx.append(cp.sum(cp.abs(y - prev_weights_arr * t)) <= 2 * max_turnover * t)
+        cvx.append(cp.sum(cp.abs(y - prev_weights_arr * t)) <= max_turnover * t)
 
     prob = cp.Problem(cp.Maximize(alpha @ y), cvx)
     _solve(prob, strategy["solver"])
@@ -629,9 +629,9 @@ def _optimize_min_variance(strategy, investable, b, Sigma, L,
         for g in range(len(industries)):
             cvx.append(B_ind[g] @ w <= max_ind)
 
-    # One-way turnover constraint: sum(|w - w_prev|) / 2 ≤ max_turnover
+    # Two-way turnover constraint: sum(|w - w_prev|) ≤ max_turnover
     if prev_weights_arr is not None and max_turnover is not None:
-        cvx.append(cp.sum(cp.abs(w - prev_weights_arr)) / 2 <= max_turnover)
+        cvx.append(cp.sum(cp.abs(w - prev_weights_arr)) <= max_turnover)
 
     prob = cp.Problem(cp.Minimize(cp.sum_squares(L.T @ w)), cvx)
     _solve(prob, strategy["solver"])
@@ -731,7 +731,7 @@ def optimize_for_backtest(
                     pass {} for equal-weight fallback
     prev_weights  : {isin: weight} from previous period (None → first period,
                     no turnover constraint applied)
-    max_turnover  : one-way turnover fraction, e.g. 0.10 for 10%
+    max_turnover  : two-way turnover fraction, e.g. 0.60 for 60% round-trip
     solver        : CVXPY solver name
     min_weight    : minimum position weight; positions below this are zeroed and
                     the portfolio is renormalised (post-processing, no MIP required)
@@ -794,21 +794,67 @@ def optimize_for_backtest(
         sectors, industries, B_sector, B_ind, _sector_fn, _industry_fn = \
             _sector_industry_matrices(investable, gics_df)
 
-        # Integer constraints (max_positions, min_position_if_held) require MOSEK and are
-        # operational construction constraints, not alpha/risk constraints.  In the backtest
-        # context the strategy is often evaluated against a different universe than it was
-        # designed for (e.g. Core Active vs S&P 500 instead of Russell 1000), which makes the
-        # MIP geometrically infeasible.  Strip them here; all continuous constraints apply.
+        # Integer constraints (max_positions, min_position_if_held) require a MIP-capable
+        # solver (MOSEK). Strip them when CLARABEL is selected; pass through for MOSEK.
         _INTEGER_CONSTRAINT_KEYS = ("max_positions", "min_position_if_held")
-        relaxed_integer = any(constraints.get(k) is not None for k in _INTEGER_CONSTRAINT_KEYS)
-        effective_constraints = {k: v for k, v in constraints.items()
-                                 if k not in _INTEGER_CONSTRAINT_KEYS}
+        has_integer = any(constraints.get(k) is not None for k in _INTEGER_CONSTRAINT_KEYS)
+        if solver.upper() != "MOSEK" and has_integer:
+            relaxed_integer       = True
+            effective_constraints = {k: v for k, v in constraints.items()
+                                     if k not in _INTEGER_CONSTRAINT_KEYS}
+        else:
+            relaxed_integer       = False
+            effective_constraints = constraints
 
         strategy = {
             "constraints": effective_constraints,
             "solver":      solver,
             "objective":   objective,
         }
+
+        # LP pre-screen for MIP: run fast LP relaxation (CLARABEL) and keep only
+        # top max_positions candidates before handing off to MOSEK. Without this,
+        # MOSEK receives ~478 binary variables and times out (~2.5 min per period).
+        max_pos_n = effective_constraints.get("max_positions")
+        if max_pos_n is not None and solver.upper() == "MOSEK" and len(investable) > int(max_pos_n):
+            n_cand = int(max_pos_n)
+            lp_idx = _lp_prescreen(
+                strategy, investable, alpha_arr, b, Sigma, L,
+                sectors, industries, B_sector, B_ind, n_cand,
+            )
+            if lp_idx is not None:
+                lp_arr      = np.array(lp_idx)
+                # Save full-universe sector info before subsetting for rescaling below
+                b_full_pre        = b.copy()
+                B_sector_full_pre = B_sector.copy()
+                sectors_full_pre  = list(sectors)
+                investable  = [investable[i] for i in lp_idx]
+                alpha_arr   = alpha_arr[lp_arr]
+                b           = b[lp_arr]
+                if prev_w_arr is not None:
+                    raw_sub   = prev_w_arr[lp_arr]
+                    sub_total = raw_sub.sum()
+                    prev_w_arr = raw_sub / sub_total if sub_total > 1e-10 else None
+                Sigma, L = _covariance_submatrix(risk_cov, risk_isin_idx, investable)
+                if used_barra and barra_date is not None:
+                    L_b2 = load_barra_L(barra_date, investable)
+                    if L_b2 is not None:
+                        L     = L_b2
+                        Sigma = None
+                sectors, industries, B_sector, B_ind, _sector_fn, _industry_fn = \
+                    _sector_industry_matrices(investable, gics_df)
+                # Rescale b so each sector's benchmark weight matches the full-universe
+                # level. Without this, b sums to ~0.4 (the weight of the 100 selected
+                # stocks), making sum(w-b) ≈ 0.6 and the TE constraint instantly infeasible.
+                for s_idx, sector in enumerate(sectors):
+                    if sector not in sectors_full_pre:
+                        continue
+                    s_full     = sectors_full_pre.index(sector)
+                    full_sec_w = float(B_sector_full_pre[s_full] @ b_full_pre)
+                    incl_sec_w = float(B_sector[s_idx] @ b)
+                    if incl_sec_w > 1e-10 and full_sec_w > 0:
+                        b[B_sector[s_idx].astype(bool)] *= full_sec_w / incl_sec_w
+                log.info("MIP pre-screen: %d → %d candidates", len(lp_idx) + (N - n_cand), len(investable))
 
         # Run optimizer with stdout suppressed (internal prints not relevant in backtest)
         buf = _io.StringIO()
