@@ -433,8 +433,20 @@ def build_snapshots(
 # Historical universe snapshots from EDGAR N-PORT-P
 # ---------------------------------------------------------------------------
 
-def _fetch_nport_isins(acc: str, cik: str, known_isins: set[str]) -> list[dict]:
-    """Fetch one N-PORT-P filing and return matched equity holdings as dicts."""
+def _fetch_nport_isins(acc: str, cik: str, known_isins: set[str] | None = None) -> list[dict]:
+    """
+    Fetch one N-PORT-P filing and return ALL equity holdings as dicts.
+
+    Universe-snapshots stores the true historical R1000 membership — we want
+    every ISIN listed in the filing, regardless of whether it's currently in
+    the `companies` table. Downstream consumers (Barra PIT filter, etc.)
+    intersect with their own data at usage time.
+
+    The `known_isins` parameter is accepted for backwards compatibility but
+    is no longer used as a filter. Filtering it out at parse time would leak
+    *scrape-time* universe state into the historical record and produced the
+    under-counted snapshots (~749 vs ~1000) seen in pre-2024 dates.
+    """
     acc_clean = acc.replace("-", "")
     url = f"https://www.sec.gov/Archives/edgar/data/{cik}/{acc_clean}/primary_doc.xml"
     xml_data = _edgar_fetch_bytes(url, timeout=60)
@@ -450,8 +462,6 @@ def _fetch_nport_isins(acc: str, cik: str, known_isins: set[str]) -> list[dict]:
         if not isin or isin == "N/A":
             continue
         if (cat_el.text if cat_el is not None else "") != "EC":
-            continue
-        if isin not in known_isins:
             continue
         holdings.append({
             "isin":         isin,
@@ -1009,6 +1019,133 @@ def _write_snapshots_only(snapshots: pd.DataFrame) -> None:
              n_reg, n_acc, f"{len(snapshots):,}")
 
 
+def _find_latest_nport_for_iwb(snap_date_iso: str, max_candidates: int = 20) -> tuple[str, str] | None:
+    """
+    Discover the IWB N-PORT-P filing with the most recent period_of_report ≤ snap_date.
+
+    iShares Trust files separate N-PORT-P documents for each fund series on the
+    same date; we must disambiguate by series_id (IWB = S000004347) by reading
+    each candidate's primary_doc.xml.
+
+    Returns (accession_number, period_of_report_iso) or None if not found.
+    """
+    try:
+        from edgar import set_identity
+        from edgar.funds import find_fund
+    except ImportError:
+        log.error("edgar library not installed — cannot discover N-PORT accessions.")
+        return None
+
+    set_identity("universe-builder shivam3125@gmail.com")
+    fund = find_fund("IWB")
+    df = fund.series.get_filings(form="NPORT-P").to_pandas()
+    df["rd"] = pd.to_datetime(df["reportDate"]).dt.date.astype(str)
+
+    candidates = df[df["rd"] <= snap_date_iso].copy()
+    if candidates.empty:
+        log.warning("No IWB N-PORT-P with period_of_report ≤ %s on EDGAR", snap_date_iso)
+        return None
+    # Most recent period first; within a period, largest filing first (IWB is large)
+    candidates = candidates.sort_values(["rd", "size"], ascending=[False, False])
+
+    cik = "1100663"   # iShares Trust
+    iwb_series = "S000004347"
+    for _, row in candidates.head(max_candidates).iterrows():
+        acc = row["accession_number"]
+        try:
+            url = f"https://www.sec.gov/Archives/edgar/data/{cik}/{acc.replace('-','')}/primary_doc.xml"
+            xml_data = _edgar_fetch_bytes(url, timeout=20)
+            root = ET.fromstring(xml_data)
+            ns = {"n": "http://www.sec.gov/edgar/nport"}
+            sid_el = root.find(".//n:seriesId", ns)
+            if sid_el is not None and sid_el.text == iwb_series:
+                return acc, row["rd"]
+        except Exception as e:
+            log.debug("  skip acc %s (%s)", acc, e)
+            continue
+        time.sleep(0.15)
+
+    log.warning("Did not find IWB filing in top %d candidates for snap %s",
+                max_candidates, snap_date_iso)
+    return None
+
+
+def ensure_snapshot(snap_date_iso: str) -> None:
+    """
+    Make `universe_snapshots` current for `snap_date_iso`.
+
+    Phase 1 (discovery): if `nport_accessions` lacks a row for
+    (russell_1000, snap_date), query EDGAR for the latest IWB N-PORT-P with
+    period_of_report ≤ snap_date and insert it.
+
+    Phase 2 (rebuild): call `rebuild_snapshots()` to refresh
+    `universe_snapshots` from EDGAR + CSVs.
+
+    Idempotent. If the accession is already known, only Phase 2 runs.
+    """
+    log.info("=== ENSURE SNAPSHOT %s ===", snap_date_iso)
+    with get_db(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT accession FROM nport_accessions "
+            "WHERE index_name='russell_1000' AND snapshot_date=?",
+            (snap_date_iso,),
+        ).fetchone()
+        if row:
+            log.info("Already have accession %s for snap %s", row[0], snap_date_iso)
+        else:
+            log.info("Looking up IWB N-PORT-P on EDGAR for %s ...", snap_date_iso)
+            result = _find_latest_nport_for_iwb(snap_date_iso)
+            if result is None:
+                log.error("Could not discover N-PORT accession for %s — aborting.",
+                          snap_date_iso)
+                return
+            accession, period = result
+            log.info("Found IWB N-PORT-P: acc=%s  period_of_report=%s", accession, period)
+            conn.execute(
+                "INSERT INTO nport_accessions (index_name, snapshot_date, accession, period_ending) "
+                "VALUES ('russell_1000', ?, ?, ?)",
+                (snap_date_iso, accession, period),
+            )
+            conn.commit()
+
+    rebuild_snapshots()
+
+
+def _audit_pit_coverage() -> None:
+    """
+    Log R1000 members at the most recent universe_snapshots date that are missing
+    from `companies` (i.e. silently excluded from Barra's PIT R1000 filter).
+
+    Informational only — does not fail. Run at the end of rebuild_snapshots()
+    so each weekly --ensure-snapshot run flags new entrants we haven't ingested.
+    Backfill missing names with `update_constituents.py --ticker <T>`.
+    """
+    with get_db(DB_PATH) as conn:
+        latest = conn.execute(
+            "SELECT MAX(snapshot_date) FROM universe_snapshots WHERE index_name='russell_1000'"
+        ).fetchone()[0]
+        if latest is None:
+            return
+        rows = conn.execute(
+            "SELECT us.isin FROM universe_snapshots us "
+            "LEFT JOIN companies c ON us.isin = c.isin "
+            "WHERE us.index_name='russell_1000' AND us.snapshot_date=? AND c.isin IS NULL "
+            "ORDER BY us.isin",
+            (latest,),
+        ).fetchall()
+    if not rows:
+        log.info("PIT audit (%s): all R1000 members are in companies ✓", latest)
+        return
+    log.warning(
+        "PIT audit (%s): %d R1000 member(s) missing from companies — "
+        "they will be silently excluded from Barra. Backfill via "
+        "`python update_constituents.py --ticker <T>`.",
+        latest, len(rows),
+    )
+    for (isin,) in rows:
+        log.warning("  orphan: %s", isin)
+
+
 def rebuild_snapshots() -> None:
     """Rebuild universe_snapshots from CSVs + EDGAR N-PORT-P. Does not touch companies."""
     log.info("=== REBUILD UNIVERSE SNAPSHOTS ===")
@@ -1050,6 +1187,7 @@ def rebuild_snapshots() -> None:
             n = (sub["snapshot_date"] == d).sum()
             log.info("  %s: %d companies", d, n)
 
+    _audit_pit_coverage()
     log.info("Done.")
 
 
@@ -1066,6 +1204,14 @@ def main() -> None:
         help="Rebuild universe_snapshots from CSVs + EDGAR only (leaves companies table intact)",
     )
     parser.add_argument(
+        "--ensure-snapshot", metavar="YYYY-MM-DD",
+        help=(
+            "Discover the latest IWB N-PORT-P accession for the given snapshot date "
+            "(if missing from nport_accessions), then rebuild universe_snapshots. "
+            "Used by daily_update.py weekly cadence."
+        ),
+    )
+    parser.add_argument(
         "--refresh-isins", action="store_true",
         help="Fetch ISINs from FMP for all tickers in universe_index CSVs and write to isin_patch table",
     )
@@ -1080,6 +1226,10 @@ def main() -> None:
 
     if args.rebuild_snapshots:
         rebuild_snapshots()
+        return
+
+    if args.ensure_snapshot:
+        ensure_snapshot(args.ensure_snapshot)
         return
 
     if args.refresh_isins:

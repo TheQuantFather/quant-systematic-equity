@@ -90,5 +90,8 @@ local_settings.py
 # ── Exploratory scripts (not part of core pipeline) ──────────────────────────
 exploratory/
 
+# ── Generated single-name reports (from /single-name) ────────────────────────
+reports/
+
 # ── License files (MOSEK kept at ~/mosek/mosek.lic, not in source control) ──
 *.lic

@@ -24,18 +24,22 @@ from config import (
 )
 from utils import get_db, inject_css
 
-# Build BARRA_GROUPS dynamically from factors_reference.csv
+# Build BARRA_GROUPS dynamically from factors_reference.csv.
+# Layout: [market | sectors | styles | beta | fundamentals]  (K = 30).
 _ref_csv  = pd.read_csv(str(FACTORS_REF))
+_N_MARKET = 1
 _N_SECTOR = len(_BARRA_SECTORS)
 _N_STYLE  = len(_ref_csv[_ref_csv["barra_factor_type"] == "style"])
 _N_BETA   = 1
 _N_FUND   = len(_ref_csv[_ref_csv["barra_factor_type"] == "fundamental"])
 _BARRA_GROUPS = {
-    "Sector":      slice(0, _N_SECTOR),
-    "Style":       slice(_N_SECTOR, _N_SECTOR + _N_STYLE),
-    "Beta":        _N_SECTOR + _N_STYLE,
-    "Fundamental": slice(_N_SECTOR + _N_STYLE + _N_BETA,
-                         _N_SECTOR + _N_STYLE + _N_BETA + _N_FUND),
+    "Market":      0,
+    "Sector":      slice(_N_MARKET, _N_MARKET + _N_SECTOR),
+    "Style":       slice(_N_MARKET + _N_SECTOR,
+                         _N_MARKET + _N_SECTOR + _N_STYLE),
+    "Beta":        _N_MARKET + _N_SECTOR + _N_STYLE,
+    "Fundamental": slice(_N_MARKET + _N_SECTOR + _N_STYLE + _N_BETA,
+                         _N_MARKET + _N_SECTOR + _N_STYLE + _N_BETA + _N_FUND),
 }
 
 # Base model IDs and display names — read from models_reference.csv, not hardcoded.
