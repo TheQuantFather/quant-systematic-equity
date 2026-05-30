@@ -1019,13 +1019,20 @@ def _write_snapshots_only(snapshots: pd.DataFrame) -> None:
              n_reg, n_acc, f"{len(snapshots):,}")
 
 
-def _find_latest_nport_for_iwb(snap_date_iso: str, max_candidates: int = 20) -> tuple[str, str] | None:
+def _find_latest_nport(
+    snap_date_iso: str,
+    etf_ticker: str,
+    series_id: str,
+    cik: str,
+    max_candidates: int = 20,
+) -> tuple[str, str] | None:
     """
-    Discover the IWB N-PORT-P filing with the most recent period_of_report ≤ snap_date.
+    Discover the N-PORT-P filing for `etf_ticker` with the most recent
+    period_of_report ≤ snap_date.
 
-    iShares Trust files separate N-PORT-P documents for each fund series on the
-    same date; we must disambiguate by series_id (IWB = S000004347) by reading
-    each candidate's primary_doc.xml.
+    iShares Trust (CIK 1100663) files one N-PORT-P per fund series per
+    reporting period. We disambiguate by reading each candidate's
+    primary_doc.xml and matching the <seriesId> element.
 
     Returns (accession_number, period_of_report_iso) or None if not found.
     """
@@ -1037,19 +1044,18 @@ def _find_latest_nport_for_iwb(snap_date_iso: str, max_candidates: int = 20) -> 
         return None
 
     set_identity("universe-builder shivam3125@gmail.com")
-    fund = find_fund("IWB")
+    fund = find_fund(etf_ticker)
     df = fund.series.get_filings(form="NPORT-P").to_pandas()
     df["rd"] = pd.to_datetime(df["reportDate"]).dt.date.astype(str)
 
     candidates = df[df["rd"] <= snap_date_iso].copy()
     if candidates.empty:
-        log.warning("No IWB N-PORT-P with period_of_report ≤ %s on EDGAR", snap_date_iso)
+        log.warning("No %s N-PORT-P with period_of_report ≤ %s on EDGAR",
+                    etf_ticker, snap_date_iso)
         return None
-    # Most recent period first; within a period, largest filing first (IWB is large)
+    # Most recent period first; within a period, largest filing first
     candidates = candidates.sort_values(["rd", "size"], ascending=[False, False])
 
-    cik = "1100663"   # iShares Trust
-    iwb_series = "S000004347"
     for _, row in candidates.head(max_candidates).iterrows():
         acc = row["accession_number"]
         try:
@@ -1058,55 +1064,82 @@ def _find_latest_nport_for_iwb(snap_date_iso: str, max_candidates: int = 20) -> 
             root = ET.fromstring(xml_data)
             ns = {"n": "http://www.sec.gov/edgar/nport"}
             sid_el = root.find(".//n:seriesId", ns)
-            if sid_el is not None and sid_el.text == iwb_series:
+            if sid_el is not None and sid_el.text == series_id:
                 return acc, row["rd"]
         except Exception as e:
             log.debug("  skip acc %s (%s)", acc, e)
             continue
         time.sleep(0.15)
 
-    log.warning("Did not find IWB filing in top %d candidates for snap %s",
-                max_candidates, snap_date_iso)
+    log.warning("Did not find %s filing in top %d candidates for snap %s",
+                etf_ticker, max_candidates, snap_date_iso)
     return None
+
+
+# Indexes we auto-discover N-PORT accessions for.
+# Each entry must match a row in index_registry with a valid series_id + cik.
+_NPORT_AUTO_INDEXES: list[dict] = [
+    {
+        "index_name": "russell_1000",
+        "etf_ticker":  "IWB",
+        "series_id":   "S000004347",
+        "cik":         "1100663",
+    },
+    {
+        "index_name": "sp500",
+        "etf_ticker":  "IVV",
+        "series_id":   "S000004310",
+        "cik":         "1100663",
+    },
+]
 
 
 def ensure_snapshot(snap_date_iso: str) -> None:
     """
-    Make `universe_snapshots` current for `snap_date_iso`.
+    Make `universe_snapshots` current for `snap_date_iso` across all
+    auto-discovered indexes (russell_1000 + sp500).
 
-    Phase 1 (discovery): if `nport_accessions` lacks a row for
-    (russell_1000, snap_date), query EDGAR for the latest IWB N-PORT-P with
-    period_of_report ≤ snap_date and insert it.
+    For each index in _NPORT_AUTO_INDEXES:
+      Phase 1 (discovery): if `nport_accessions` lacks a row for
+      (index_name, snap_date), query EDGAR for the latest N-PORT-P with
+      period_of_report ≤ snap_date and insert it.
 
-    Phase 2 (rebuild): call `rebuild_snapshots()` to refresh
-    `universe_snapshots` from EDGAR + CSVs.
+    Phase 2 (rebuild): call `rebuild_snapshots()` once to refresh
+    `universe_snapshots` from all accessions + CSVs.
 
-    Idempotent. If the accession is already known, only Phase 2 runs.
+    Idempotent: if all accessions are already known, only Phase 2 runs.
     """
     log.info("=== ENSURE SNAPSHOT %s ===", snap_date_iso)
     with get_db(DB_PATH) as conn:
-        row = conn.execute(
-            "SELECT accession FROM nport_accessions "
-            "WHERE index_name='russell_1000' AND snapshot_date=?",
-            (snap_date_iso,),
-        ).fetchone()
-        if row:
-            log.info("Already have accession %s for snap %s", row[0], snap_date_iso)
-        else:
-            log.info("Looking up IWB N-PORT-P on EDGAR for %s ...", snap_date_iso)
-            result = _find_latest_nport_for_iwb(snap_date_iso)
-            if result is None:
-                log.error("Could not discover N-PORT accession for %s — aborting.",
-                          snap_date_iso)
-                return
-            accession, period = result
-            log.info("Found IWB N-PORT-P: acc=%s  period_of_report=%s", accession, period)
-            conn.execute(
-                "INSERT INTO nport_accessions (index_name, snapshot_date, accession, period_ending) "
-                "VALUES ('russell_1000', ?, ?, ?)",
-                (snap_date_iso, accession, period),
+        for idx in _NPORT_AUTO_INDEXES:
+            iname = idx["index_name"]
+            row = conn.execute(
+                "SELECT accession FROM nport_accessions "
+                "WHERE index_name=? AND snapshot_date=?",
+                (iname, snap_date_iso),
+            ).fetchone()
+            if row:
+                log.info("[%s] Already have accession %s for %s",
+                         iname, row[0], snap_date_iso)
+                continue
+            log.info("[%s] Looking up %s N-PORT-P on EDGAR for %s ...",
+                     iname, idx["etf_ticker"], snap_date_iso)
+            result = _find_latest_nport(
+                snap_date_iso, idx["etf_ticker"], idx["series_id"], idx["cik"]
             )
-            conn.commit()
+            if result is None:
+                log.error("[%s] Could not discover N-PORT accession for %s — skipping.",
+                          iname, snap_date_iso)
+                continue
+            accession, period = result
+            log.info("[%s] Found: acc=%s  period_of_report=%s", iname, accession, period)
+            conn.execute(
+                "INSERT INTO nport_accessions "
+                "(index_name, snapshot_date, accession, period_ending) "
+                "VALUES (?, ?, ?, ?)",
+                (iname, snap_date_iso, accession, period),
+            )
+        conn.commit()
 
     rebuild_snapshots()
 
