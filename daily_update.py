@@ -192,8 +192,7 @@ def main() -> None:
                         help="Skip FINRA SVR update")
     parser.add_argument("--skip-filings",   action="store_true",
                         help="Skip EDGAR filings (downstream runs against existing DB)")
-    parser.add_argument("--skip-portfolio", action="store_true",
-                        help="Skip portfolio optimiser")
+
     args = parser.parse_args()
 
     today       = date.today()
@@ -253,11 +252,9 @@ def main() -> None:
         step("barra",   "create_barra.py",
              depends_on=("factors", "returns", "universe"))
 
-        if args.skip_portfolio:
-            log.info("SKIP    portfolio (--skip-portfolio)")
-        else:
-            step("portfolio", "optimize_portfolio.py",
-                 depends_on=("models", "risk", "barra"))
+        # Portfolio optimiser is on-demand only — run manually when needed.
+        # Excluded from automated weekly to avoid long MOSEK MIP runtimes
+        # and to allow reviewing risk model output before re-optimising.
 
     # ── Summary ────────────────────────────────────────────────────────────
     log.info("=" * 60)
