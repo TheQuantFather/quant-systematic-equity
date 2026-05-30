@@ -1,6 +1,6 @@
 # Systematic Equity Investment Framework
 
-A systematic quantitative investing framework covering ~994 US equities from the **iShares Russell 1000 ETF** universe. Includes 28+ factors across 9 models, a Barra-style factor risk model (K=29), and a CVXPY portfolio optimiser with 9 configurable strategies.
+A systematic quantitative investing framework covering ~994 US equities from the **iShares Russell 1000 ETF** universe. Includes 28+ factors across 9 models, a Barra-style factor risk model, and a CVXPY portfolio optimiser with 9 configurable strategies.
 
 ## Architecture
 
@@ -134,22 +134,30 @@ Barra-style factor covariance decomposition: **Σ = X F X' + Δ**
 
 | Symbol | Description |
 |--------|-------------|
-| X (N×K) | Factor exposure matrix — sector dummies, style z-scores, beta, fundamentals |
-| F (K×K) | Factor covariance — EWMA (hl=90d) + Newey-West (5 lags), annualised |
+| X (N×K) | Factor exposure matrix — market intercept, sector dummies, style z-scores, beta, fundamentals |
+| F (K×K) | Factor covariance — two-half-life EWMA. Variances (diag): hl=90d + Newey-West (5 lags). Correlations (off-diag): hl=240d. Reassembled F = D^½ R D^½, annualised. |
 | Δ (N×N) | Diagonal idiosyncratic variance — EWMA (hl=60d), Bayesian-shrunk, annualised |
 
-### Factor structure (K = 29)
+### Factor structure
 
 | Group | Count | Factors |
 |-------|-------|---------|
-| Sector | 11 | All GICS sectors (no reference dropped; SVD handles rank deficiency) |
+| Market | 1 | Intercept column (all 1s). Captures universe-wide return premium so sector factors are pure deviations from market. |
+| Sector | 11 | All GICS sectors with cap-weighted sum-to-zero constraint: Σ_s w_s_cap · f_sec_s = 0. Resolves rank deficiency vs the Market column. |
 | Style | 5 | Log Market Cap, 12M momentum, 6M momentum, realized vol, 52-week high ratio |
 | Beta | 1 | beta_60d vs equal-weight universe |
 | Fundamental | 12 | Selected quality, value, growth, and leverage factors |
 
+### Regression
+
+Daily cross-sectional constrained WLS: `r_t = X_t f_t + ε_t` subject to `Σ_s w_s_cap · f_sec_s = 0`. WLS weights = **√mktcap** (canonical Barra USE4 — anchors estimates on large, liquid names).
+
 ### Volatility Regime Adjustment (VRA)
 
-Bias statistic B² = realized_var_ew / predicted_var_ew over 60-day window, clipped [0.25, 4.0]. Scales both F and Δ. Healthy values: ~0.8–0.9 (calm), ~1.2–1.3 (stress).
+Two bias-statistic scalars, each clipped to **[0.5, 2.0]**:
+- **B²_factor** = mean over factors k and last 60 days of `(f_t^k / σ̂_k_daily)²` → scales **F**.
+- **B²_specific** = mean over stocks i and last 60 days of `(ε_t^i / σ̂_i_daily)²` → scales **Δ**.
+Healthy values: ~0.8–1.2; consistent values >1 indicate forecast under-prediction.
 
 ### Optimizer integration
 

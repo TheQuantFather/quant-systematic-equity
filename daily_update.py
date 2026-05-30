@@ -240,6 +240,10 @@ def main() -> None:
     if run_weekly:
         log.info("--- Weekly rebuild: snapshot %s ---", snap_date)
 
+        # Discover latest IWB N-PORT-P accession for this snapshot date and
+        # refresh universe_snapshots. Required for Barra's PIT R1000 filter.
+        step("universe", "create_universe.py", "--ensure-snapshot", snap_date,
+             depends_on=("filings",))
         step("factors", "create_factors.py", "--date", snap_date,
              depends_on=("returns", "filings"))
         step("models",  "create_models.py",  "--date", snap_date,
@@ -247,7 +251,7 @@ def main() -> None:
         step("risk",    "create_risk.py",    "--date", snap_date,
              depends_on=("returns",))
         step("barra",   "create_barra.py",
-             depends_on=("factors", "returns"))
+             depends_on=("factors", "returns", "universe"))
 
         if args.skip_portfolio:
             log.info("SKIP    portfolio (--skip-portfolio)")

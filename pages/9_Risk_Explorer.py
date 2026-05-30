@@ -45,19 +45,24 @@ _STYLE_IDS = set(
 _FUND_IDS = set(
     _ref_csv[_ref_csv["barra_factor_type"] == "fundamental"]["factor_id"].tolist()
 )
+_N_MARKET = 1
 _N_SECTOR = len(BARRA_SECTORS)
 _N_STYLE  = len(_STYLE_IDS)
 _N_BETA   = 1
 _N_FUND   = len(_FUND_IDS)
 
-# Factor group slices into the K-length Barra factor vector
-_SECTOR_COLS = slice(0, _N_SECTOR)
-_STYLE_COLS  = slice(_N_SECTOR, _N_SECTOR + _N_STYLE)
-_BETA_COL    = _N_SECTOR + _N_STYLE
-_FUND_COLS   = slice(_N_SECTOR + _N_STYLE + _N_BETA,
-                     _N_SECTOR + _N_STYLE + _N_BETA + _N_FUND)
+# Factor group slices into the K-length Barra factor vector.
+# Layout: [market | sectors | styles | beta | fundamentals]  (K = 30).
+_MARKET_COL  = 0
+_SECTOR_COLS = slice(_N_MARKET, _N_MARKET + _N_SECTOR)
+_STYLE_COLS  = slice(_N_MARKET + _N_SECTOR,
+                     _N_MARKET + _N_SECTOR + _N_STYLE)
+_BETA_COL    = _N_MARKET + _N_SECTOR + _N_STYLE
+_FUND_COLS   = slice(_N_MARKET + _N_SECTOR + _N_STYLE + _N_BETA,
+                     _N_MARKET + _N_SECTOR + _N_STYLE + _N_BETA + _N_FUND)
 
 _GROUP_LABELS = {
+    "Market":      _MARKET_COL,
     "Sector":      _SECTOR_COLS,
     "Style":       _STYLE_COLS,
     "Beta":        _BETA_COL,
@@ -65,6 +70,7 @@ _GROUP_LABELS = {
 }
 
 def _factor_group(fid: str) -> str:
+    if fid == "market":          return "Market"
     if fid.startswith("sec_"):   return "Sector"
     if fid == "beta_60d":        return "Beta"
     if fid in _STYLE_IDS:        return "Style"
@@ -105,6 +111,8 @@ def _pretty_factor(name: str, _cache: dict = {}) -> str:
     """Convert a Barra factor_id to a human-readable display name."""
     if not _cache:
         _cache.update(_load_factor_name_map())
+    if name == "market":
+        return "Market"
     if name.startswith("sec_"):
         return name.replace("sec_", "").replace("_", " ").title()
     if name == "beta_60d":
@@ -569,8 +577,9 @@ with tab_stock:
             fig_exp = px.bar(
                 exp_df, x="exposure", y="factor", color="group",
                 orientation="h",
-                color_discrete_map={"Sector": "#4C78A8", "Style": "#F58518",
-                                    "Beta": "#E45756", "Fundamental": "#72B7B2"},
+                color_discrete_map={"Market": "#54A24B", "Sector": "#4C78A8",
+                                    "Style": "#F58518", "Beta": "#E45756",
+                                    "Fundamental": "#72B7B2"},
                 labels={"exposure": "Factor exposure (z-score / dummy)", "factor": ""},
                 title=f"{sel_ticker} — Factor Exposures",
             )

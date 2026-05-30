@@ -83,15 +83,16 @@ LW_WINSOR_CLIP   = 0.50  # clip daily returns at ±50% before LW estimation
 # Barra factor risk model hyperparameters
 # ---------------------------------------------------------------------------
 
-HL_FACTOR_COV = 90       # EWMA half-life: factor covariance (trading days)
-HL_IDIO       = 60       # EWMA half-life: idiosyncratic variance
-NW_LAGS       = 5        # Newey-West autocorrelation correction lags
-VRA_WINDOW    = 60       # VRA bias-statistic look-back (trading days)
-SHRINK_IDIO   = 0.10     # Bayesian shrinkage weight toward cross-sectional mean
-EIGENFLOOR    = 1e-6     # spectral floor for factor covariance (ensures PSD)
-VRA_MIN       = 0.25     # lower clip for VRA bias statistic B²
-VRA_MAX       = 4.00     # upper clip for B²
-MIN_STOCKS    = 50       # minimum stocks per day to run cross-sectional regression
+HL_FACTOR_VAR  = 90      # EWMA half-life: factor variances (diag of F) — Newey-West applied here
+HL_FACTOR_CORR = 240     # EWMA half-life: factor correlations (off-diag) — longer memory, no NW
+HL_IDIO        = 60      # EWMA half-life: idiosyncratic variance
+NW_LAGS        = 5       # Newey-West autocorrelation correction lags (variance only)
+VRA_WINDOW     = 60      # VRA bias-statistic look-back (trading days)
+SHRINK_IDIO    = 0.10    # Bayesian shrinkage weight toward cross-sectional mean
+EIGENFLOOR     = 1e-6    # spectral floor for factor covariance (ensures PSD)
+VRA_MIN        = 0.50    # lower clip for VRA bias statistic B² (factor & specific)
+VRA_MAX        = 2.00    # upper clip for B²
+MIN_STOCKS     = 50      # minimum stocks per day to run cross-sectional regression
 
 # ---------------------------------------------------------------------------
 # Barra sector definitions — order determines column indices 0-10 in X matrix.
