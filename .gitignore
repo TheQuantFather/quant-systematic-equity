@@ -65,8 +65,8 @@ ipython_config.py
 .spyproject
 .ropeproject
 
-# ── Claude Code (commands, settings — private repo only) ─────────────────────
-.claude/
+# ── Claude Code local settings (machine-specific) ─────────────────────────────
+.claude/settings.local.json
 
 # ── OS ────────────────────────────────────────────────────────────────────────
 .DS_Store
