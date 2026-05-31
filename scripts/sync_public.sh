@@ -25,6 +25,7 @@ rsync -av --delete \
   --exclude='*.db' \
   --exclude='*.log' \
   --exclude='*.lic' \
+  --exclude='update_constituents.py' \
   "$PRIVATE/" "$PUBLIC/"
 
 echo ""

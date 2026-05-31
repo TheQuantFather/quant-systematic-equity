@@ -62,6 +62,16 @@ m1.metric("Sector", sector)
 m2.metric("Industry", industry)
 m3.metric("ISIN", security_id)
 
+# Business summary (from universe.db). Long ones get an expander; short ones render inline.
+company_info = db.get_company_info(security_id)
+biz = (company_info.get("business_summary") or "").strip()
+if biz:
+    if len(biz) > 500:
+        with st.expander("Business summary", expanded=False):
+            st.markdown(biz)
+    else:
+        st.caption(biz)
+
 st.divider()
 
 # ---------------------------------------------------------------------------
@@ -90,24 +100,71 @@ else:
     plot_df = plot_df.copy()
     plot_df["cum_return"] = (np.cumprod(1 + plot_df["total_return"].values) - 1) * 100
 
+    window_start = plot_df["date"].min()
+    window_end = plot_df["date"].max()
+
+    def _rebase_to_window(data) -> pd.DataFrame:
+        """Accepts a DataFrame with date/total_return columns or a date-indexed Series
+        (the legacy benchmark_returns shape) and returns a windowed cum-return frame."""
+        if isinstance(data, pd.Series):
+            seg = data.dropna()
+            seg = seg[(seg.index >= window_start) & (seg.index <= window_end)]
+            if seg.empty:
+                return pd.DataFrame(columns=["date", "cum_return"])
+            cum = (np.cumprod(1 + seg.values) - 1) * 100
+            return pd.DataFrame({"date": seg.index, "cum_return": cum})
+        # DataFrame path (industry composite)
+        if data is None or data.empty or "date" not in data.columns:
+            return pd.DataFrame(columns=["date", "cum_return"])
+        seg = data[(data["date"] >= window_start) & (data["date"] <= window_end)].copy()
+        seg = seg.dropna(subset=["total_return"]).sort_values("date")
+        if seg.empty:
+            return pd.DataFrame(columns=["date", "cum_return"])
+        seg["cum_return"] = (np.cumprod(1 + seg["total_return"].values) - 1) * 100
+        return seg[["date", "cum_return"]]
+
     fig_ret = go.Figure()
     fig_ret.add_trace(go.Scatter(
         x=plot_df["date"],
         y=plot_df["cum_return"],
         mode="lines",
-        line=dict(color="#2563EB", width=2),
+        name=ticker or company_name,
+        line=dict(color="#2563EB", width=2.4),
         fill="tozeroy",
         fillcolor="rgba(37,99,235,0.08)",
-        hovertemplate="%{x|%Y-%m-%d}<br><b>%{y:.2f}%</b><extra></extra>",
+        hovertemplate="%{x|%Y-%m-%d}<br><b>%{y:+.1f}%</b><extra>" + (ticker or company_name) + "</extra>",
     ))
+
+    # Industry equal-weight composite — uses existing screener industry mapping.
+    if industry and industry != "N/A":
+        ind_df = _rebase_to_window(db.get_industry_composite(industry))
+        if not ind_df.empty:
+            fig_ret.add_trace(go.Scatter(
+                x=ind_df["date"], y=ind_df["cum_return"],
+                mode="lines", name=f"{industry} (eq-wt)",
+                line=dict(color="#10B981", width=1.6, dash="dot"),
+                hovertemplate="%{x|%Y-%m-%d}<br><b>%{y:+.1f}%</b><extra>industry</extra>",
+            ))
+
+    # S&P 500 — broad market reference.
+    sp = _rebase_to_window(db.get_benchmark_returns("sp500"))
+    if not sp.empty:
+        fig_ret.add_trace(go.Scatter(
+            x=sp["date"], y=sp["cum_return"],
+            mode="lines", name="S&P 500",
+            line=dict(color="#64748B", width=1.4, dash="dot"),
+            hovertemplate="%{x|%Y-%m-%d}<br><b>%{y:+.1f}%</b><extra>S&P 500</extra>",
+        ))
+
     fig_ret.add_hline(y=0, line_dash="dot", line_color="#94A3B8", line_width=1)
     fig_ret.update_layout(
-        height=320,
-        margin=dict(l=0, r=0, t=10, b=10),
+        height=360,
+        margin=dict(l=0, r=0, t=20, b=10),
         xaxis_title="",
         yaxis_title="Cumulative return (%)",
         yaxis_ticksuffix="%",
         hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
     )
     st.plotly_chart(fig_ret, use_container_width=True)
 
@@ -156,31 +213,63 @@ model_scores = {m: row[m] for m in MODEL_COLS if pd.notna(row.get(m))}
 
 if model_scores:
     st.subheader("Model scores (latest snapshot)")
-    st.caption("Direction-adjusted composite z-scores — higher is always better.")
+    st.caption("Direction-adjusted composite z-scores — higher is always better. "
+               "Bar shows magnitudes; radar shows the company's overall shape across the cross-section.")
 
     models_df = pd.DataFrame(
         {"Model": [MODEL_DISPLAY.get(m, m) for m in model_scores.keys()], "Score": list(model_scores.values())}
-    ).sort_values("Score", ascending=True)
+    )
 
-    fig_models = px.bar(
-        models_df,
-        x="Score",
-        y="Model",
-        orientation="h",
-        color="Score",
-        color_continuous_scale="RdYlGn",
-        color_continuous_midpoint=0,
-        text=models_df["Score"].map(lambda x: f"{x:.3f}"),
-    )
-    fig_models.update_traces(textposition="outside")
-    fig_models.update_layout(
-        height=max(250, len(model_scores) * 42),
-        coloraxis_showscale=False,
-        margin=dict(l=0, r=60, t=10, b=10),
-        xaxis_title="Z-score",
-        yaxis_title="",
-    )
-    st.plotly_chart(fig_models, use_container_width=True)
+    bar_col, radar_col = st.columns([0.55, 0.45])
+
+    with bar_col:
+        bar_df = models_df.sort_values("Score", ascending=True)
+        fig_models = px.bar(
+            bar_df,
+            x="Score",
+            y="Model",
+            orientation="h",
+            color="Score",
+            color_continuous_scale="RdYlGn",
+            color_continuous_midpoint=0,
+            text=bar_df["Score"].map(lambda x: f"{x:.3f}"),
+        )
+        fig_models.update_traces(textposition="outside")
+        fig_models.update_layout(
+            height=max(250, len(model_scores) * 42),
+            coloraxis_showscale=False,
+            margin=dict(l=0, r=60, t=10, b=10),
+            xaxis_title="Z-score",
+            yaxis_title="",
+        )
+        st.plotly_chart(fig_models, use_container_width=True)
+
+    with radar_col:
+        # Canonical radar order — keeps shapes visually comparable across stocks
+        radar_order = ["Quality", "Value", "Growth", "Momentum", "Size",
+                       "Low Volatility", "Liquidity", "Short Interest", "LT Reversal"]
+        radar_df = models_df.set_index("Model").reindex(radar_order).dropna()
+        if not radar_df.empty:
+            z = radar_df["Score"].tolist()
+            theta = radar_df.index.tolist()
+            radar_max = max(2.2, max(abs(v) for v in z) * 1.05)
+            fig_radar = go.Figure()
+            fig_radar.add_trace(go.Scatterpolar(
+                r=z + [z[0]],
+                theta=theta + [theta[0]],
+                fill="toself",
+                line=dict(color="#C44E52", width=2),
+                fillcolor="rgba(196,78,82,0.18)",
+                name=ticker or company_name,
+            ))
+            fig_radar.update_layout(
+                polar=dict(radialaxis=dict(visible=True, range=[-radar_max, radar_max],
+                                          tickfont=dict(size=10), gridcolor="#dddddd")),
+                showlegend=False,
+                height=max(250, len(model_scores) * 42),
+                margin=dict(l=20, r=20, t=10, b=10),
+            )
+            st.plotly_chart(fig_radar, use_container_width=True)
 
 # ---------------------------------------------------------------------------
 # Score history across snapshot dates
@@ -550,33 +639,159 @@ else:
                 st.dataframe(raw, hide_index=True, use_container_width=True)
 
 # ---------------------------------------------------------------------------
-# Peer comparison
+# Peer comparison — color-coded across model z-scores and direction-aware factors
 # ---------------------------------------------------------------------------
+
+def _lerp(a: tuple, b: tuple, t: float) -> tuple:
+    return tuple(int(round(a[i] + (b[i] - a[i]) * t)) for i in range(3))
+
+
+def _diverging_rgb(z: float, vmax: float = 2.0) -> str:
+    """Red→Yellow→Green diverging colour. No matplotlib dependency."""
+    if pd.isna(z):
+        return ""
+    t = max(-1.0, min(1.0, float(z) / vmax))  # clip to [-1, 1]
+    red, yellow, green = (215, 48, 39), (255, 255, 191), (26, 152, 80)
+    if t < 0:
+        r, g, b = _lerp(red, yellow, t + 1.0)   # t=-1 → red, t=0 → yellow
+    else:
+        r, g, b = _lerp(yellow, green, t)       # t=0 → yellow, t=+1 → green
+    return f"background-color: rgb({r},{g},{b})"
+
+
+def _column_diverging(series: pd.Series, direction: int = 1) -> list[str]:
+    """Map a column to diverging colours by relative rank within the column.
+    Direction = -1 flips the polarity (lower raw value = better)."""
+    s = pd.to_numeric(series, errors="coerce")
+    if s.notna().sum() < 2:
+        return ["" for _ in series]
+    lo, hi = s.min(), s.max()
+    if hi == lo:
+        return ["" for _ in series]
+    # Centre at the median so the palette is symmetric around the cohort centre
+    normed = (s - s.median()) / max((hi - s.median()), (s.median() - lo))
+    if direction == -1:
+        normed = -normed
+    return [_diverging_rgb(v * 2.0, vmax=2.0) for v in normed]
+
 
 st.subheader("Peer comparison")
 _composite_cols = [f"{m} Model" for m in model_meta[model_meta["IsComposite"] == 1]["Model"]]
 MODEL_SORT = next((n for n in _composite_cols if n in screener.columns), MODEL_COLS[0] if MODEL_COLS else None)
 _sort_label = MODEL_DISPLAY.get(MODEL_SORT, MODEL_SORT) if MODEL_SORT else "model"
-st.caption(f"Top 10 peers in **{industry}** ranked by {_sort_label} score.")
+st.caption(
+    f"Top 10 peers in **{industry}** ranked by {_sort_label}. Focal row highlighted. "
+    "Model columns use a z-score scale centered on 0 (green = favourable, red = unfavourable); "
+    "factor columns use a direction-aware gradient (higher = better unless direction = ↓)."
+)
 
 if MODEL_SORT and industry != "N/A":
-    peers = (
-        screener[screener["industry"] == industry]
-        .sort_values(MODEL_SORT, ascending=False)
-        .head(10)
-    )
+    industry_pool = screener[screener["industry"] == industry].copy()
+    top_peers = industry_pool.sort_values(MODEL_SORT, ascending=False).head(10)
 
-    peer_display = (
-        ["ticker", "company_name"] + MODEL_COLS +
-        [c for c in ["Gross Margin", "ROE", "Earnings Yield", "Revenue Growth"] if c in screener.columns]
-    )
+    # Always include the focal company even if it falls outside the top 10
+    if security_id not in top_peers["security_id"].astype(str).values:
+        focal_row = industry_pool[industry_pool["security_id"].astype(str) == security_id]
+        if not focal_row.empty:
+            top_peers = pd.concat([focal_row, top_peers]).drop_duplicates("security_id")
+
+    peers = top_peers.sort_values(MODEL_SORT, ascending=False).reset_index(drop=True)
+
+    FACTOR_COLS_DESIRED = [
+        "Gross Margin", "Operating Margin", "Net Margin", "FCF Margin",
+        "ROE", "ROIC", "Earnings Yield", "Revenue Growth", "Earnings Growth",
+    ]
+    factor_cols = [c for c in FACTOR_COLS_DESIRED if c in peers.columns]
+    model_cols_present = [c for c in MODEL_COLS if c in peers.columns]
+    peer_display = ["ticker", "company_name"] + model_cols_present + factor_cols
     peer_display = [c for c in peer_display if c in peers.columns]
 
-    styled_peers = peers[peer_display].copy()
-    for c in [col for col in MODEL_COLS if col in styled_peers.columns]:
-        styled_peers[c] = styled_peers[c].map(lambda x: f"{x:.3f}" if pd.notna(x) else "")
-    styled_peers = styled_peers.rename(columns=MODEL_DISPLAY)
+    peers_styled = peers[peer_display + ["security_id"]].copy()
+    peers_styled = peers_styled.rename(columns=MODEL_DISPLAY)
+    model_display_cols = [MODEL_DISPLAY.get(c, c) for c in model_cols_present]
 
-    st.dataframe(styled_peers, use_container_width=True, hide_index=True)
+    # Direction lookup (factors only — models always direction-positive)
+    direction_map = dict(zip(factor_meta["factor_name"], factor_meta["direction"]))
+
+    # Build Styler with column-wise gradients
+    focal_flag = peers_styled["security_id"].astype(str).eq(security_id)
+    # Factor columns are stored as decimal fractions (e.g. 0.683 = 68.3% gross margin).
+    # Display as percentages with 1 decimal for legibility.
+    factor_fmt = {c: (lambda v: "—" if pd.isna(v) else f"{v*100:+.1f}%") for c in factor_cols}
+    model_fmt = {c: (lambda v: "—" if pd.isna(v) else f"{v:+.1f}") for c in model_display_cols}
+
+    styler = (
+        peers_styled.drop(columns=["security_id"])
+        .style
+        .format(model_fmt)
+        .format(factor_fmt)
+    )
+
+    # Model z-scores: fixed scale centred on 0 (z ∈ [-2, +2])
+    for col in model_display_cols:
+        styler = styler.apply(
+            lambda s: [_diverging_rgb(v, vmax=2.0) for v in pd.to_numeric(s, errors="coerce")],
+            subset=[col],
+        )
+
+    # Factor columns: relative gradient within the column, flipped when direction = -1
+    for col in factor_cols:
+        d = direction_map.get(col, 1)
+        styler = styler.apply(lambda s, _d=d: _column_diverging(s, direction=_d), subset=[col])
+
+    # Highlight the focal company row
+    if focal_flag.any():
+        focal_idx = peers_styled.index[focal_flag].tolist()
+        styler = styler.set_properties(
+            subset=pd.IndexSlice[focal_idx, :],
+            **{"font-weight": "600", "border-left": "3px solid #C44E52"},
+        )
+
+    st.dataframe(styler, use_container_width=True, hide_index=True)
+
+    # Peer × model heatmap — visual companion to the table
+    if model_cols_present:
+        st.markdown("**Model z-score heatmap**")
+        st.caption("Each row is a peer, each column a model. Cells show the direction-adjusted z; "
+                   "a green column means the cohort is strong on that dimension, a red column means weak.")
+
+        heat_df = peers[["ticker", "company_name"] + model_cols_present].copy()
+        heat_df["label"] = heat_df["ticker"].where(heat_df["ticker"].astype(bool), heat_df["company_name"])
+        z_values = heat_df[model_cols_present].astype(float).values
+        labels = heat_df["label"].tolist()
+        x_models = [MODEL_DISPLAY.get(c, c) for c in model_cols_present]
+
+        fig_heat = go.Figure(go.Heatmap(
+            z=z_values,
+            x=x_models,
+            y=labels,
+            colorscale="RdYlGn",
+            zmid=0, zmin=-2, zmax=2,
+            text=[[f"{v:+.2f}" if pd.notna(v) else "" for v in row] for row in z_values],
+            texttemplate="%{text}",
+            textfont=dict(size=11),
+            colorbar=dict(title="z", tickfont=dict(size=10)),
+            hovertemplate="%{y} — %{x}: %{z:+.2f}<extra></extra>",
+        ))
+        # Highlight focal company row with a shape (annotate the y-axis tick)
+        if focal_flag.any():
+            focal_label = peers.loc[focal_flag.values, "ticker"].iloc[0] or peers.loc[focal_flag.values, "company_name"].iloc[0]
+            fig_heat.update_layout(
+                shapes=[dict(
+                    type="rect",
+                    xref="paper", yref="y",
+                    x0=0, x1=1,
+                    y0=focal_label, y1=focal_label,
+                    line=dict(color="#C44E52", width=3),
+                    fillcolor="rgba(0,0,0,0)",
+                )]
+            )
+        fig_heat.update_layout(
+            height=max(280, 36 * len(labels) + 80),
+            margin=dict(l=20, r=20, t=10, b=40),
+            xaxis=dict(side="top", tickangle=-30, tickfont=dict(size=11)),
+            yaxis=dict(autorange="reversed"),
+        )
+        st.plotly_chart(fig_heat, use_container_width=True)
 else:
     st.info("Insufficient data for peer comparison.")

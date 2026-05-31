@@ -21,6 +21,7 @@ import sqlite3
 import subprocess
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -117,9 +118,16 @@ def update_from_yahoo(
     ticker_to_isin: dict[str, str] = {}
     if UNIVERSE_DB.exists():
         with get_db(UNIVERSE_DB) as uc:
+            # delisted_date IS NULL → live / still-trading names (incl. those that
+            # merely dropped out of the index). Truly-delisted names (delisted_date
+            # set) have no Yahoo data and are sourced from FMP via --backfill-delisted;
+            # fetching them here would only rack up failures and risk the abort guard.
+            has_col = any(r[1] == "delisted_date"
+                          for r in uc.execute("PRAGMA table_info(companies)").fetchall())
+            where_live = "AND delisted_date IS NULL" if has_col else ""
             ticker_to_isin = dict(uc.execute(
                 "SELECT ticker, isin FROM companies "
-                "WHERE ticker IS NOT NULL AND ticker != '' AND isin IS NOT NULL"
+                f"WHERE ticker IS NOT NULL AND ticker != '' AND isin IS NOT NULL {where_live}"
             ).fetchall())
 
     # Per-isin last date in returns table
@@ -642,6 +650,188 @@ def _int(val) -> int | None:
 
 
 # ---------------------------------------------------------------------------
+# Delisted-name price backfill from FMP  (--backfill-delisted)
+#
+# Truly-delisted names (companies.delisted_date IS NOT NULL) have no Yahoo data —
+# Yahoo purges delisted tickers and recycles them.  FMP retains dividend-adjusted
+# history for delisted symbols, so they are sourced here, keyed by their (dead)
+# ISIN so universe_snapshots membership resolves.  Resumable: only names still
+# missing from returns are fetched, and FMP's daily quota simply caps how many
+# land per run — re-run on subsequent days to finish.
+# ---------------------------------------------------------------------------
+
+_FMP_BASE = "https://financialmodelingprep.com/stable"
+
+# FMP keys that hit their daily cap (429) this run — skipped thereafter.
+_FMP_EXHAUSTED: set[str] = set()
+
+
+def _load_fmp_api_keys() -> list[str]:
+    """All FMP keys from .env (FMP_API_KEY, FMP_API_KEY_SECOND, …) — free keys
+    multiply the daily quota; rotation falls through when one hits its cap."""
+    env = Path(".env")
+    if not env.exists():
+        return []
+    keys: list[str] = []
+    for line in env.read_text().splitlines():
+        s = line.strip()
+        if s.startswith("FMP_API_KEY") and "=" in s:
+            val = s.split("=", 1)[1].strip()
+            if val and val not in keys:
+                keys.append(val)
+    return keys
+
+
+def _fmp_eod_adjusted(ticker: str, from_date: str, to_date: str, keys: list[str]) -> list | None:
+    """Fetch FMP dividend-adjusted daily EOD for one ticker, rotating across keys.
+
+    Returns [(date, adj_close, volume), ...] oldest-first, [] if no data, or None
+    when all keys are exhausted / error (caller treats None as 'resume next run').
+    """
+    sym = urllib.parse.quote(ticker.replace("/", "-"))
+    data = None
+    for k in keys:
+        if k in _FMP_EXHAUSTED:
+            continue
+        url = (f"{_FMP_BASE}/historical-price-eod/dividend-adjusted"
+               f"?symbol={sym}&from={from_date}&to={to_date}&apikey={k}")
+        broke = False
+        for attempt in range(3):
+            try:
+                with urllib.request.urlopen(url, timeout=30) as resp:
+                    data = json.load(resp)
+                broke = True
+                break
+            except urllib.error.HTTPError as e:
+                if e.code == 429:
+                    if attempt < 2:
+                        time.sleep(15)  # transient per-minute throttle — wait, retry
+                        continue
+                    _FMP_EXHAUSTED.add(k)  # sustained 429 → daily cap; next key
+                    break
+                return None
+            except Exception as e:
+                log.warning("FMP fetch failed for %s: %s", ticker, e)
+                return None
+        if broke:
+            break
+    if data is None:
+        return None  # all keys exhausted
+    if not isinstance(data, list) or not data:
+        return []
+    rows = []
+    for d in data:
+        ac = d.get("adjClose")
+        if ac is None or ac <= 0:
+            continue
+        rows.append((d["date"], float(ac), d.get("volume")))
+    rows.sort(key=lambda r: r[0])
+    return rows
+
+
+# Tiingo is the working free source for *delisted* daily history (FMP free
+# premium-locks delisted symbols; Yahoo purges them). Free tier ≈ 50 symbols/hour,
+# so the backfill paces conservatively and is resumable.
+_TIINGO_BASE = "https://api.tiingo.com/tiingo/daily"
+
+
+def _load_tiingo_token() -> str | None:
+    env = Path(".env")
+    if not env.exists():
+        return None
+    for line in env.read_text().splitlines():
+        s = line.strip()
+        if s.startswith("TIINGO_API_KEY") and "=" in s:
+            return s.split("=", 1)[1].strip() or None
+    return None
+
+
+def _tiingo_eod(ticker: str, from_date: str, to_date: str, token: str) -> list | None:
+    """Fetch Tiingo split/dividend-adjusted daily EOD for one ticker.
+
+    Returns [(date, adj_close, volume), ...] oldest-first, [] if no data, or None
+    on rate-limit (429) / hard error so the caller can stop and resume next run.
+    """
+    sym = urllib.parse.quote(ticker.replace("/", "-"))
+    url = f"{_TIINGO_BASE}/{sym}/prices?startDate={from_date}&endDate={to_date}&token={token}"
+    req = urllib.request.Request(url, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.load(resp)
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            log.warning("Tiingo rate-limit (429) on %s — stopping; re-run later to resume", ticker)
+            return None
+        log.warning("Tiingo %s for %s", e.code, ticker)
+        return []          # 404 / not found — treat as no data, keep going
+    except Exception as e:
+        log.warning("Tiingo fetch failed for %s: %s", ticker, e)
+        return None
+    if not isinstance(data, list) or not data:
+        return []
+    rows = []
+    for d in data:
+        ac = d.get("adjClose")
+        if ac is None or ac <= 0:
+            continue
+        rows.append((d["date"][:10], float(ac), d.get("adjVolume") or d.get("volume")))
+    rows.sort(key=lambda r: r[0])
+    return rows
+
+
+def backfill_delisted(conn: sqlite3.Connection, history_start: str = HISTORY_START) -> None:
+    """Backfill delisted-name daily prices (Tiingo) for names missing from returns."""
+    token = _load_tiingo_token()
+    if not token:
+        log.error("TIINGO_API_KEY not found in .env — cannot backfill delisted prices.")
+        return
+
+    today_str = date.today().strftime("%Y-%m-%d")
+    have = {r[0] for r in conn.execute("SELECT DISTINCT isin FROM returns").fetchall()}
+    with get_db(UNIVERSE_DB) as uc:
+        targets = [
+            (r[0], r[1]) for r in uc.execute(
+                "SELECT isin, ticker FROM companies "
+                "WHERE delisted_date IS NOT NULL AND ticker IS NOT NULL AND ticker != ''"
+            ).fetchall()
+            if r[0] not in have
+        ]
+    log.info("Delisted price backfill (Tiingo): %d names missing from returns", len(targets))
+
+    n_done = n_rows = n_empty = 0
+    for isin, ticker in targets:
+        eod = _tiingo_eod(ticker, history_start, today_str, token)
+        if eod is None:
+            conn.commit()
+            log.warning("Stopped after %d names (Tiingo unavailable). Committed %d rows. Re-run to resume.",
+                        n_done, n_rows)
+            return
+        if not eod:
+            n_empty += 1
+            continue
+        ret_rows = []
+        for j, (d, ac, vol) in enumerate(eod):
+            tr = None if j == 0 else (ac / eod[j - 1][1] - 1 if eod[j - 1][1] > 0 else None)
+            # close stored = adjusted close (Tiingo adjClose; delisted names feed no
+            # market-cap factors, and the backtest uses total_return).
+            ret_rows.append((isin, d, tr, ac, vol, "USD"))
+        conn.executemany(
+            "INSERT OR IGNORE INTO returns (isin, date, total_return, close, volume, ccy) "
+            "VALUES (?, ?, ?, ?, ?, ?)", ret_rows,
+        )
+        n_rows += len(ret_rows)
+        n_done += 1
+        conn.commit()  # commit each name — slow paced run, keep progress durable
+        if n_done % 10 == 0:
+            log.info("  %d / %d names | %s rows", n_done, len(targets), f"{n_rows:,}")
+        time.sleep(95)  # ~38/hour — comfortably under Tiingo free 50/hour (rolling window)
+
+    conn.commit()
+    log.info("Delisted backfill done: %d names, %s rows (%d had no FMP data)",
+             n_done, f"{n_rows:,}", n_empty)
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -653,11 +843,14 @@ def main():
                         help="Pull latest/missing prices from Yahoo Finance")
     parser.add_argument("--check",         action="store_true",
                         help="Run integrity checks only")
+    parser.add_argument("--backfill-delisted", action="store_true",
+                        help="Backfill FMP dividend-adjusted prices for delisted names "
+                             "(companies.delisted_date set) missing from returns")
     parser.add_argument("--history-start", default=HISTORY_START,
                         help=f"Start date for tickers with no existing data (default {HISTORY_START})")
     args = parser.parse_args()
 
-    if not any([args.update, args.check]):
+    if not any([args.update, args.check, args.backfill_delisted]):
         parser.print_help()
         return
 
@@ -667,6 +860,9 @@ def main():
             update_from_yahoo(conn, history_start=args.history_start)
             log.info("Updating index returns ...")
             update_index_returns(conn)
+
+        if args.backfill_delisted:
+            backfill_delisted(conn, history_start=args.history_start)
 
         if args.check or args.update:
             run_checks(conn)
