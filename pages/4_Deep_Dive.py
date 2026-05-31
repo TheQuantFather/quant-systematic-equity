@@ -245,9 +245,8 @@ if model_scores:
         st.plotly_chart(fig_models, use_container_width=True)
 
     with radar_col:
-        # Canonical radar order — keeps shapes visually comparable across stocks
-        radar_order = ["Quality", "Value", "Growth", "Momentum", "Size",
-                       "Low Volatility", "Liquidity", "Short Interest", "LT Reversal"]
+        # Base model names in CSV order — keeps shapes visually comparable across stocks
+        radar_order = model_meta[model_meta["IsComposite"] == 0]["Model"].tolist()
         radar_df = models_df.set_index("Model").reindex(radar_order).dropna()
         if not radar_df.empty:
             z = radar_df["Score"].tolist()

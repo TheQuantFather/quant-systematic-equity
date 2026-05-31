@@ -5,11 +5,12 @@ Run once to create, then edit in Excel.
 Re-running will OVERWRITE any manual edits — only use to reset.
 """
 
+import pandas as pd
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
-from config import PARAMS_FILE as OUT
+from config import PARAMS_FILE as OUT, MODELS_REF
 from utils import get_logger
 
 log = get_logger("create_strategy_params")
@@ -74,8 +75,8 @@ def build_strategies(wb):
         ["core_active_strict","Core Active (Strict)", "TRUE", "MSCI_USA_2026_05_07.csv", "ALP001","2026-04-01","2026-04-01","CLARABEL","maximize_alpha",   "benchmark_only","Tighter benchmark-aware. Max 2% active risk, ±1% per stock and sector."],
         ["abs_return",     "Absolute Return",         "TRUE", "MSCI_USA_2026_05_07.csv", "ALP001","2026-04-01","2026-04-01","CLARABEL","maximize_sharpe",  "universe",      "Maximize Sharpe. Equal sector weight ±1%, max 5% per stock, 18% vol cap."],
         ["min_variance",   "Minimum Variance",        "TRUE", "MSCI_USA_2026_05_07.csv", "ALP001","2026-04-01","2026-04-01","CLARABEL","minimize_variance","universe",      "Pure risk minimisation — no alpha signal. Capital preservation mandate."],
-        ["quality_compounder","Quality Compounder",   "TRUE", "MSCI_USA_2026_05_07.csv", "QUAL001","2026-04-01","2026-04-01","CLARABEL","maximize_sharpe", "universe",      "Quality-only alpha. Buffett-style durable businesses. Excludes Energy & Materials."],
-        ["defensive",      "Defensive Income",        "TRUE", "MSCI_USA_2026_05_07.csv", "QUAL001","2026-04-01","2026-04-01","CLARABEL","maximize_sharpe",  "universe",      "Quality + Low-Vol blend. Low vol cap (12%), sector floors to stay diversified."],
+        ["quality_compounder","Quality Compounder",   "TRUE", "MSCI_USA_2026_05_07.csv", "PROF001","2026-04-01","2026-04-01","CLARABEL","maximize_sharpe", "universe",      "Profitability-only alpha. High ROIC, FCF, margins. Buffett-style. Excludes Energy & Materials."],
+        ["defensive",      "Defensive Income",        "TRUE", "MSCI_USA_2026_05_07.csv", "DEF001","2026-04-01","2026-04-01","CLARABEL","maximize_sharpe",  "universe",      "Defensive Quality + Low-Vol blend. Low vol cap (12%), sector floors to stay diversified."],
         ["value_hunt",     "Value Hunt",              "TRUE", "MSCI_USA_2026_05_07.csv", "VAL001","2026-04-01","2026-04-01","CLARABEL","maximize_alpha",   "benchmark_only","Value-only alpha vs MSCI USA benchmark. Wider active risk budget (6%)."],
         ["momentum",       "Momentum",                "TRUE", "MSCI_USA_2026_05_07.csv", "MOM001","2026-04-01","2026-04-01","CLARABEL","maximize_sharpe",  "universe",      "Momentum-only alpha. Chases what's working. Higher vol tolerance (20%)."],
         ["all_weather",    "All-Weather GARP",        "TRUE", "MSCI_USA_2026_05_07.csv", "ALP001","2026-04-01","2026-04-01","CLARABEL","maximize_sharpe",  "universe",      "Quality + Growth + Value blend. Equal sector weight ±2%. Balanced core holding."],
@@ -195,19 +196,20 @@ def build_alpha_weights(wb):
         ["abs_return",        "ALP001",  "Alpha Composite", "1.0", "Composite alpha for Sharpe optimisation"],
         # min_variance — alpha unused but required as placeholder
         ["min_variance",      "ALP001",  "Alpha Composite", "1.0", "Placeholder — alpha is ignored for minimize_variance"],
-        # quality_compounder — pure quality
-        ["quality_compounder","QUAL001", "Quality",         "1.0", "Profitability, cash flow quality, leverage"],
-        # defensive — quality + low vol blend
-        ["defensive",         "QUAL001", "Quality",         "0.5", "Half-weight quality signal"],
-        ["defensive",         "LVOL001", "Low Volatility",  "0.5", "Half-weight low-vol signal"],
+        # quality_compounder — pure profitability
+        ["quality_compounder","PROF001", "Profitability",       "1.0", "ROIC, margins, FCF — high-quality earners"],
+        # defensive — defensive quality + low vol blend
+        ["defensive",         "DEF001",  "Defensive Quality",  "0.5", "Balance sheet strength, interest coverage, accruals"],
+        ["defensive",         "LVOL001", "Low Volatility",     "0.5", "Half-weight low-vol signal"],
         # value_hunt — pure value
         ["value_hunt",        "VAL001",  "Value",           "1.0", "Earnings yield, P/B, P/S, P/CF, EV/EBIT"],
         # momentum — pure momentum
         ["momentum",          "MOM001",  "Momentum",        "1.0", "12m and 6m price momentum"],
-        # all_weather — quality + growth + value equal blend
-        ["all_weather",       "QUAL001", "Quality",         "1.0", "One-third: profitability and balance sheet strength"],
-        ["all_weather",       "GRO001",  "Growth",          "1.0", "One-third: earnings, revenue, asset growth"],
-        ["all_weather",       "VAL001",  "Value",           "1.0", "One-third: valuation multiples"],
+        # all_weather — (profitability 2x + defensive 1x) + growth + value; normalises to 1/3 quality, 1/3 growth, 1/3 value
+        ["all_weather",       "PROF001", "Profitability",      "0.20", "Two-thirds of quality weight: earners"],
+        ["all_weather",       "DEF001",  "Defensive Quality",  "0.10", "One-third of quality weight: balance sheet"],
+        ["all_weather",       "GRO001",  "Growth",             "0.30", "One-third: earnings, revenue, asset growth"],
+        ["all_weather",       "VAL001",  "Value",              "0.30", "One-third: valuation multiples"],
     ]
 
     ws.append(headers)
@@ -223,59 +225,63 @@ def build_alpha_weights(wb):
 
 # ── Sheet 4: Reference ────────────────────────────────────────────────────────
 
+def _model_ref_rows() -> list[list]:
+    """Build model reference table rows from models_reference.csv."""
+    df = pd.read_csv(MODELS_REF)[["ModelID", "Model", "IsComposite"]].drop_duplicates()
+    rows: list[list] = [["Model ID", "Name", "Type"]]
+    for _, r in df.iterrows():
+        rows.append([r["ModelID"], r["Model"], "Composite" if int(r["IsComposite"]) else "Base"])
+    return rows
+
+
 def build_reference(wb):
     ws = wb.create_sheet("Reference")
 
-    def section(title_cell, title):
-        ws[title_cell] = title
-        ws[title_cell].font = Font(bold=True, size=12)
+    def section(row: int, title: str) -> None:
+        c = ws.cell(row=row, column=1, value=title)
+        c.font = Font(bold=True, size=12)
 
-    def table(start_row, rows):
-        for r_idx, row in enumerate(rows, start=start_row):
-            for c_idx, val in enumerate(row, start=1):
+    def table(start_row: int, rows: list[list]) -> int:
+        for r_idx, row_data in enumerate(rows, start=start_row):
+            for c_idx, val in enumerate(row_data, start=1):
                 cell = ws.cell(row=r_idx, column=c_idx, value=val)
                 if r_idx == start_row:
                     cell.fill = HEADER_FILL; cell.font = HEADER_FONT
                 cell.border = THIN_BORDER
                 if r_idx > start_row and r_idx % 2 == 0:
                     cell.fill = ALT_FILL
+        return start_row + len(rows)  # next available row
 
-    section("A1", "Strategies overview")
-    table(3, [
-        ["strategy_id",        "Objective",           "Alpha signal",               "Universe",      "Investor profile"],
-        ["core_active",        "maximize_alpha",       "Composite (all factors)",    "Benchmark",     "Institutional — benchmark-aware"],
-        ["abs_return",         "maximize_sharpe",      "Composite (all factors)",    "Full universe", "Absolute return — equal sector weight"],
-        ["min_variance",       "minimize_variance",    "None",                       "Full universe", "Capital preservation / retirees"],
-        ["quality_compounder", "maximize_sharpe",      "Quality only",               "Full universe", "Long-term buy-and-hold, Buffett-style"],
-        ["defensive",          "maximize_sharpe",      "Quality + Low Vol (50/50)",  "Full universe", "Conservative income — low drawdown"],
-        ["value_hunt",         "maximize_alpha",       "Value only",                 "Benchmark",     "Contrarian / deep-value investors"],
-        ["momentum",           "maximize_sharpe",      "Momentum only",              "Full universe", "Growth / trend-following investors"],
-        ["all_weather",        "maximize_sharpe",      "Quality + Growth + Value",   "Full universe", "Balanced core — GARP approach"],
+    r = 1
+    section(r, "Strategies overview")
+    r = table(r + 2, [
+        ["strategy_id",        "Objective",           "Alpha signal",                          "Universe",      "Investor profile"],
+        ["core_active",        "maximize_alpha",       "Composite (all factors)",               "Benchmark",     "Institutional — benchmark-aware"],
+        ["abs_return",         "maximize_sharpe",      "Composite (all factors)",               "Full universe", "Absolute return — equal sector weight"],
+        ["min_variance",       "minimize_variance",    "None",                                  "Full universe", "Capital preservation / retirees"],
+        ["quality_compounder", "maximize_sharpe",      "Profitability only",                    "Full universe", "Long-term buy-and-hold, Buffett-style"],
+        ["defensive",          "maximize_sharpe",      "Defensive Quality + Low Vol (50/50)",   "Full universe", "Conservative income — low drawdown"],
+        ["value_hunt",         "maximize_alpha",       "Value only",                            "Benchmark",     "Contrarian / deep-value investors"],
+        ["momentum",           "maximize_sharpe",      "Momentum only",                         "Full universe", "Growth / trend-following investors"],
+        ["all_weather",        "maximize_sharpe",      "Profitability + Defensive + Growth + Value", "Full universe", "Balanced core — GARP approach"],
     ])
 
-    section("A14", "Models available for Alpha_Weights")
-    table(16, [
-        ["Model ID", "Name",            "Type",      "Description"],
-        ["ALP001",   "Alpha Composite", "Composite", "Equal-weight of all 5 base models"],
-        ["QUAL001",  "Quality",         "Base",      "Profitability, cash flow, leverage"],
-        ["VAL001",   "Value",           "Base",      "Earnings yield, P/B, P/S, P/CF, EV/EBIT"],
-        ["GRO001",   "Growth",          "Base",      "Asset, earnings, revenue, equity, CF growth"],
-        ["MOM001",   "Momentum",        "Base",      "12m and 6m price momentum"],
-        ["SIZ001",   "Size",            "Base",      "Log market cap (larger = higher score)"],
-        ["LVOL001",  "Low Volatility",  "Base",      "Realized vol (lower = higher score)"],
-        ["LIQ001",   "Liquidity",       "Base",      "Amihud illiquidity (lower = more liquid = higher score)"],
-    ])
+    r += 2
+    section(r, "Models available for Alpha_Weights")
+    r = table(r + 2, _model_ref_rows())
 
-    section("A27", "Objectives")
-    table(29, [
+    r += 2
+    section(r, "Objectives")
+    r = table(r + 2, [
         ["Objective",         "Description"],
         ["maximize_alpha",    "Benchmark-aware: maximize active alpha (tracking-error constrained). Needs benchmark_file."],
         ["maximize_sharpe",   "Absolute return: maximize Sharpe via Charnes-Cooper transform. No benchmark needed."],
         ["minimize_variance", "Pure risk minimisation: ignores alpha, finds lowest-vol portfolio. No benchmark needed."],
     ])
 
-    section("A35", "Constraint reference")
-    table(37, [
+    r += 2
+    section(r, "Constraint reference")
+    table(r + 2, [
         ["Constraint",               "Applies to",               "Description"],
         ["max_active_risk",          "maximize_alpha",            "Max annual tracking error vs benchmark"],
         ["max_stock_active_weight",  "maximize_alpha",            "Max ±active weight per stock"],
