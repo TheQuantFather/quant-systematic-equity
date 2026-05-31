@@ -1,7 +1,7 @@
 """
 create_models.py — Build factor models by combining pre-computed z-scores from factors.db.
 
-Models: Quality, Value, Growth, Momentum, Size (base models) and Alpha (composite).
+Models: Profitability, Defensive Quality, Value, Growth, Momentum, Size (base models) and Alpha (composite).
 
 Factor z-scores are read from factors.db (already winsorized cross-sectionally per
 data_date/factor).  Model scores are also winsorized and z-scored within each

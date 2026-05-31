@@ -33,7 +33,8 @@ from plotly.subplots import make_subplots
 sys.path.insert(0, str(Path(__file__).parent))
 from report_utils import (  # noqa: E402
     RETURNS_DB, CONST_DB, MODELS_DB, FACTORS_DB, RISK_DB, UNIV_DB, REPORTS_DIR,
-    MODEL_NAMES, COLOR_ZS, COLOR_PEER, COLOR_POS, COLOR_NEG,
+    MODEL_NAMES, MODEL_RADAR_ORDER, MODEL_TABLE_ORDER, ALPHA_BLEND_NOTE,
+    COLOR_ZS, COLOR_PEER, COLOR_POS, COLOR_NEG,
     NARRATIVE_PLACEHOLDERS,
     short_name, lookup_company, latest_market_cap,
     load_concept_map, load_factor_reference, load_constituent_df,
@@ -255,8 +256,7 @@ def chart_price_drawdown(target_label: str, target_ret: pd.DataFrame,
 
 def chart_model_radar(target_label: str, target_isin: str, models_df: pd.DataFrame) -> str:
     zs = models_df[models_df["security_id"] == target_isin].copy()
-    order = ["Quality", "Value", "Growth", "Momentum", "Size", "Low Volatility",
-             "Liquidity", "Short Interest", "LT Reversal"]
+    order = MODEL_RADAR_ORDER
     zs = zs[zs["model"].isin(order)].set_index("model").reindex(order)
     z = zs["model_value_z"].fillna(0).tolist()
     fig = go.Figure()
@@ -412,8 +412,7 @@ def render_return_table(target_ticker: str, df: pd.DataFrame) -> str:
 
 def render_model_table(target_isin: str, models_df: pd.DataFrame) -> str:
     zs = models_df[models_df["security_id"] == target_isin].set_index("model")
-    order = ["Alpha (Composite)", "Quality", "Value", "Growth", "Momentum",
-             "Size", "Low Volatility", "Liquidity", "Short Interest", "LT Reversal"]
+    order = MODEL_TABLE_ORDER
     rows = []
     for m in order:
         if m not in zs.index:
@@ -482,11 +481,13 @@ def build_html(payload: dict) -> str:
     if biz and len(biz) > 600:
         biz = biz[:600].rsplit(" ", 1)[0] + "…"
 
+    _base_zs_str = ", ".join(
+        f"{name} {z:+.2f}" for name, z in p["base_zs"].items() if not math.isnan(z)
+    )
     quant_facts_html = f"""
     <p><strong>Quant snapshot ({p['model_snap']}):</strong>
        Composite Alpha z = <strong>{p['alpha_z']:+.2f}</strong>,
-       Quality {p['qual_z']:+.2f}, Value {p['val_z']:+.2f},
-       Growth {p['gro_z']:+.2f}, Momentum {p['mom_z']:+.2f}.
+       {_base_zs_str}.
        Barra idiosyncratic vol ~{p['idio_vol']*100:.0f}% annualised · 60d beta {p['beta_60d']:+.2f}.</p>
     <p><strong>Fundamentals (LTM):</strong> revenue {fmt_money(rev, 'M')} ({fmt_pct(rev_yoy, 1, True) if rev_yoy is not None else 'n/a YoY'}),
        gross margin {gm_pct:.1f}%, GAAP op margin {op_pct:.1f}%, R&amp;D intensity {rd_pct:.1f}%
@@ -534,7 +535,7 @@ def build_html(payload: dict) -> str:
   <div class="split">
     <div>
       {render_model_table(target_isin, p['models_df'])}
-      <p class="note">Alpha is the composite blend (30% Quality, 20% Value, 20% Growth, 20% Momentum, 10% Size).</p>
+      <p class="note">{ALPHA_BLEND_NOTE}</p>
     </div>
     <div>{p['chart_radar']}</div>
   </div>
@@ -669,10 +670,13 @@ def main() -> None:
 
     # Pull headline z-scores for the exec-summary block
     zs_models = models_df[models_df["security_id"] == company["isin"]].set_index("model_id")
-    def mz(mid):
+    def mz(mid: str) -> float:
         return float(zs_models.loc[mid, "model_value_z"]) if mid in zs_models.index else float("nan")
-    alpha_z = mz("ALP001"); qual_z = mz("QUAL001"); val_z = mz("VAL001")
-    gro_z = mz("GRO001"); mom_z = mz("MOM001")
+    alpha_z = mz("ALP001")
+    _radar_names = set(MODEL_RADAR_ORDER)
+    base_zs: dict[str, float] = {
+        name: mz(mid) for mid, name in MODEL_NAMES.items() if name in _radar_names
+    }
 
     beta_row = barra_df[barra_df["factor_id"] == "beta_60d"]
     beta_60d = float(beta_row["exposure"].iloc[0]) if not beta_row.empty else float("nan")
@@ -688,8 +692,7 @@ def main() -> None:
         "chart_price": chart_price, "chart_radar": chart_radar,
         "chart_revenue": chart_revenue, "chart_peer": chart_peer,
         "chart_factors": chart_factors,
-        "alpha_z": alpha_z, "qual_z": qual_z, "val_z": val_z,
-        "gro_z": gro_z, "mom_z": mom_z, "beta_60d": beta_60d,
+        "alpha_z": alpha_z, "base_zs": base_zs, "beta_60d": beta_60d,
     }
 
     REPORTS_DIR.mkdir(exist_ok=True)

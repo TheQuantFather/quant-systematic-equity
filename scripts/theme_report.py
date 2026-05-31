@@ -34,7 +34,8 @@ from plotly.subplots import make_subplots
 sys.path.insert(0, str(Path(__file__).parent))
 from report_utils import (  # noqa: E402
     RETURNS_DB, CONST_DB, MODELS_DB, FACTORS_DB, RISK_DB, UNIV_DB,
-    REPORTS_DIR, MODEL_NAMES, COLOR_ZS, COLOR_PEER, COLOR_POS, COLOR_NEG,
+    REPORTS_DIR, MODEL_NAMES, MODEL_RADAR_ORDER, MODEL_TABLE_ORDER,
+    COLOR_ZS, COLOR_PEER, COLOR_POS, COLOR_NEG,
     NARRATIVE_PLACEHOLDERS,
     CSS, fmt_pct, fmt_money, kpi, placeholder,
     lookup_company, short_name, latest_market_cap,
@@ -190,9 +191,7 @@ def aggregate_models(members: list[dict], weights: dict[str, float]) -> tuple[di
     df["model"] = df["model_id"].map(MODEL_NAMES).fillna(df["model_id"])
 
     pivot = df.pivot(index="ticker", columns="model", values="model_value_z")
-    order = ["Alpha (Composite)", "Quality", "Value", "Growth", "Momentum",
-             "Size", "Low Volatility", "Liquidity", "Short Interest", "LT Reversal"]
-    cols = [c for c in order if c in pivot.columns]
+    cols = [c for c in MODEL_TABLE_ORDER if c in pivot.columns]
     pivot = pivot[cols]
     # cap-weighted basket z per model
     w = pd.Series(weights).reindex(pivot.index).fillna(0)
@@ -485,12 +484,16 @@ def build_html(payload: dict) -> str:
 
     # Quant facts block — populated from data, no narrative needed
     bz = p["basket_z"]
+    _radar_set = set(MODEL_RADAR_ORDER)
+    _comp_names = [n for n in MODEL_TABLE_ORDER if n not in _radar_set]
+    _alpha_name = _comp_names[0] if _comp_names else None
+    _alpha_z = bz.get(_alpha_name, float("nan")) if _alpha_name else float("nan")
+    _base_zs_str = ", ".join(
+        f"{n} {bz[n]:+.2f}" for n in MODEL_RADAR_ORDER if n in bz and not math.isnan(bz[n])
+    )
     quant_facts_html = f"""
     <p><strong>Basket quant snapshot ({snap}):</strong>
-       cap-weighted Alpha z = <strong>{bz.get('Alpha (Composite)', float('nan')):+.2f}</strong>,
-       Quality {bz.get('Quality', float('nan')):+.2f}, Value {bz.get('Value', float('nan')):+.2f},
-       Growth {bz.get('Growth', float('nan')):+.2f}, Momentum {bz.get('Momentum', float('nan')):+.2f},
-       Size {bz.get('Size', float('nan')):+.2f}.
+       cap-weighted Alpha z = <strong>{_alpha_z:+.2f}</strong>, {_base_zs_str}.
        Cap-weighted Barra beta {p['basket_beta']:+.2f}; basket idio vol ~{p['basket_idio_vol']*100:.0f}%
        (assuming idio independence across names).</p>
     <p><strong>Aggregate fundamentals (LTM):</strong>

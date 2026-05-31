@@ -38,22 +38,37 @@ UNIV_DB     = ROOT / "data" / "universe.db"
 CMAP_XLSX   = ROOT / "data" / "edgar_concept_map.xlsx"
 FREF_CSV    = ROOT / "data" / "factors_reference.csv"
 REPORTS_DIR = ROOT / "reports"
+MREF_CSV    = ROOT / "data" / "models_reference.csv"
 
 # ---------------------------------------------------------------------------
-# Constants
+# Constants — derived dynamically from models_reference.csv so adding/
+# renaming models never requires editing this file.
 # ---------------------------------------------------------------------------
-MODEL_NAMES = {
-    "ALP001": "Alpha (Composite)",
-    "QUAL001": "Quality",
-    "VAL001": "Value",
-    "GRO001": "Growth",
-    "MOM001": "Momentum",
-    "SIZ001": "Size",
-    "LVOL001": "Low Volatility",
-    "LIQ001": "Liquidity",
-    "SHI001": "Short Interest",
-    "LTR001": "LT Reversal",
-}
+_mref = pd.read_csv(MREF_CSV)[["ModelID", "Model", "IsComposite"]].drop_duplicates()
+
+# model_id → display name  (e.g. "PROF001" → "Profitability")
+MODEL_NAMES: dict[str, str] = dict(zip(_mref["ModelID"], _mref["Model"]))
+
+# Base model display names in CSV order — used for radar charts and filtering
+_base_ids = _mref.loc[_mref["IsComposite"] == 0, "ModelID"].tolist()
+_comp_ids = _mref.loc[_mref["IsComposite"] == 1, "ModelID"].tolist()
+MODEL_RADAR_ORDER: list[str] = [MODEL_NAMES[m] for m in _base_ids]
+
+# Composite-first full order — used for model tables (Alpha at top, then base models)
+MODEL_TABLE_ORDER: list[str] = [MODEL_NAMES[m] for m in _comp_ids + _base_ids]
+
+# Human-readable Alpha composition note — derived from Alpha rows in the CSV
+def _build_alpha_note() -> str:
+    _alpha = pd.read_csv(MREF_CSV)
+    rows = _alpha[_alpha["IsComposite"] == 1][["Factors", "Weights"]].drop_duplicates()
+    total = rows["Weights"].sum()
+    parts = [
+        f"{int(round(r['Weights'] / total * 100))}% {MODEL_NAMES.get(r['Factors'], r['Factors'])}"
+        for _, r in rows.iterrows()
+    ]
+    return f"Alpha is the composite blend ({', '.join(parts)})."
+
+ALPHA_BLEND_NOTE: str = _build_alpha_note()
 
 COLOR_ZS   = "#C44E52"
 COLOR_PEER = "#4C72B0"
