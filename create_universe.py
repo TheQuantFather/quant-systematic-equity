@@ -25,6 +25,7 @@ Add a new index snapshot:
 import json
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 
@@ -895,6 +896,20 @@ def write_db(companies: pd.DataFrame, snapshots: pd.DataFrame) -> None:
         # seed_all_reference_tables uses CREATE TABLE IF NOT EXISTS + INSERT OR IGNORE.
         seed_all_reference_tables(conn)
 
+        # Preserve recovered delisted/dropped securities (delisted_date IS NOT NULL)
+        # across the hard rebuild below — build_companies only knows the *current*
+        # index CSVs, so without this the survivorship-bias coverage would be wiped.
+        preserved = pd.DataFrame()
+        has_companies = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='companies'"
+        ).fetchone()
+        if has_companies:
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(companies)").fetchall()]
+            if "delisted_date" in cols:
+                preserved = pd.read_sql(
+                    "SELECT * FROM companies WHERE delisted_date IS NOT NULL", conn
+                )
+
         conn.executescript("""
             DROP TABLE IF EXISTS universe_snapshots;
             DROP TABLE IF EXISTS companies;
@@ -920,7 +935,8 @@ def write_db(companies: pd.DataFrame, snapshots: pd.DataFrame) -> None:
                 simfin_sector       TEXT,
                 simfin_industry     TEXT,
                 data_date           TEXT,
-                update_date         TEXT
+                update_date         TEXT,
+                delisted_date       TEXT
             );
 
             CREATE TABLE universe_snapshots (
@@ -941,6 +957,15 @@ def write_db(companies: pd.DataFrame, snapshots: pd.DataFrame) -> None:
 
         companies.to_sql("companies",         conn, if_exists="append", index=False)
         snapshots.to_sql("universe_snapshots", conn, if_exists="append", index=False)
+
+        # Re-insert preserved delisted rows whose ISIN the current build did not
+        # already cover (a name that re-entered the live universe wins).
+        if not preserved.empty:
+            current_isins = set(companies["isin"].dropna())
+            preserved = preserved[~preserved["isin"].isin(current_isins)]
+            if not preserved.empty:
+                preserved.to_sql("companies", conn, if_exists="append", index=False)
+                log.info("Preserved %d delisted/dropped securities across rebuild", len(preserved))
         conn.commit()
 
         n_alias = conn.execute("SELECT COUNT(*) FROM ticker_alias").fetchone()[0]
@@ -1228,6 +1253,311 @@ def rebuild_snapshots() -> None:
 # Main
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Delisted / dropped-name recovery  (--recover-delisted)
+#
+# Historical R1000/S&P500 members that were acquired, went bankrupt, or simply
+# fell out of the index are present in universe_snapshots (PIT membership) but
+# absent from the companies metadata table and returns.db — the classic
+# survivorship hole.  This resolves ISIN→ticker via OpenFIGI (free) and enriches
+# metadata via FMP, writing rows into companies so the PIT universe is fully
+# covered.  Price history is then backfilled by create_returns.py --backfill-delisted.
+# ---------------------------------------------------------------------------
+
+_OPENFIGI_URL = "https://api.openfigi.com/v3/mapping"
+
+# FMP sector taxonomy → the GICS sector strings used by live rows in companies.
+# Without this remap, dead names land in phantom sector buckets and the
+# optimiser's sector-neutrality constraints break.
+_FMP_TO_GICS_SECTOR: dict[str, str] = {
+    "Technology":             "Information Technology",
+    "Healthcare":             "Health Care",
+    "Financial Services":     "Financials",
+    "Consumer Cyclical":      "Consumer Discretionary",
+    "Consumer Defensive":     "Consumer Staples",
+    "Basic Materials":        "Materials",
+    "Industrials":            "Industrials",
+    "Energy":                 "Energy",
+    "Utilities":              "Utilities",
+    "Real Estate":            "Real Estate",
+    "Communication Services": "Communication Services",
+}
+
+# US-listing exchange codes in OpenFIGI (composite "US" + venue codes).
+_OPENFIGI_US_EXCH = {"US", "UN", "UW", "UQ", "UA", "UR", "UP", "UV", "UD"}
+
+# Currency suffixes OpenFIGI appends to synthetic foreign listings (MRVLUSD → MRVL).
+_CCY_SUFFIX = ("USD", "EUR", "GBP", "CHF", "CAD", "JPY", "AUD", "HKD", "SGD", "SEK", "NOK", "DKK")
+
+
+def _openfigi_map_isins(isins: list[str], figi_key: str | None = None) -> dict[str, str]:
+    """Resolve ISIN→US-listed ticker via OpenFIGI /v3/mapping (free, no paid key).
+
+    Batched (≤10 jobs/request unkeyed) and throttled to stay under the 25 req/min
+    public limit.  Prefers a US-composite Common Stock listing.
+    Returns {isin: ticker} only for ISINs that resolve to a US equity.
+    """
+    headers = {"Content-Type": "application/json"}
+    if figi_key:
+        headers["X-OPENFIGI-APIKEY"] = figi_key
+    batch_size = 100 if figi_key else 10
+    pause      = 0.3 if figi_key else 2.6  # keyed: 250/min, unkeyed: ~23/min
+
+    def _pick(data: list[dict]) -> str | None:
+        eq = [d for d in data if d.get("marketSector") == "Equity"]
+        common = [d for d in eq if d.get("securityType2") == "Common Stock"] or eq
+        # 1. Clean US composite / venue listing → use its ticker directly.
+        for codes in (("US",), tuple(_OPENFIGI_US_EXCH)):
+            us = [d for d in common if d.get("exchCode") in codes]
+            if us:
+                return us[0].get("ticker")
+        # 2. Redomiciled / foreign-domiciled name (old ISIN): OpenFIGI only carries
+        #    synthetic currency-suffixed lines (e.g. "MRVLUSD" on exch XB/XS). Strip
+        #    the trailing currency code to recover the real US ticker (MRVL). Caller
+        #    validates it against companies (copy) or FMP.
+        for d in common:
+            tk = d.get("ticker") or ""
+            for suf in _CCY_SUFFIX:
+                if tk.endswith(suf) and len(tk) > len(suf):
+                    return tk[: -len(suf)]
+        return None
+
+    out: dict[str, str] = {}
+    for i in range(0, len(isins), batch_size):
+        chunk = isins[i:i + batch_size]
+        body  = json.dumps([{"idType": "ID_ISIN", "idValue": x} for x in chunk]).encode()
+        result = None
+        for attempt in range(4):
+            try:
+                req = urllib.request.Request(_OPENFIGI_URL, data=body, headers=headers)
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    result = json.load(resp)
+                break
+            except urllib.error.HTTPError as e:
+                if e.code == 429:
+                    time.sleep(8)
+                    continue
+                break
+            except Exception:
+                time.sleep(2)
+        if result:
+            for isin, rr in zip(chunk, result):
+                data = rr.get("data") if isinstance(rr, dict) else None
+                if data:
+                    tk = _pick(data)
+                    if tk:
+                        out[isin] = tk
+        time.sleep(pause)
+    return out
+
+
+# FMP keys that returned a daily-cap 429 during this run — skipped thereafter so we
+# never hammer an exhausted key (the user runs free tiers; quota is precious).
+_FMP_EXHAUSTED: set[str] = set()
+
+
+def _load_fmp_api_keys() -> list[str]:
+    """Return all FMP keys from .env (FMP_API_KEY, FMP_API_KEY_SECOND, …), in order.
+
+    Multiple free keys multiply the daily quota; rotation falls through to the next
+    when one hits its cap. Tolerant of `KEY = value` spacing.
+    """
+    env = Path(".env")
+    if not env.exists():
+        return []
+    keys: list[str] = []
+    for line in env.read_text().splitlines():
+        s = line.strip()
+        if s.startswith("FMP_API_KEY") and "=" in s:
+            val = s.split("=", 1)[1].strip()
+            if val and val not in keys:
+                keys.append(val)
+    return keys
+
+
+def _fmp_profile(ticker: str, keys: list[str]) -> dict | None:
+    """Fetch FMP /stable/profile, rotating across keys.
+
+    A 429 may be a transient per-minute throttle OR the daily cap. Wait-and-retry
+    the same key a few times; only mark it exhausted after sustained 429s, so a
+    momentary burst limit doesn't waste the remaining daily quota.
+    """
+    fmp_ticker = _FMP_TICKER_ALIAS.get(ticker, ticker).replace("/", "-")
+    sym = urllib.parse.quote(fmp_ticker)
+    for k in keys:
+        if k in _FMP_EXHAUSTED:
+            continue
+        for attempt in range(3):
+            try:
+                data = _edgar_fetch(f"{_FMP_BASE}/profile?symbol={sym}&apikey={k}", timeout=15)
+                return data[0] if isinstance(data, list) and data else None
+            except urllib.error.HTTPError as e:
+                if e.code == 429:
+                    if attempt < 2:
+                        time.sleep(15)   # transient per-minute throttle — wait, retry
+                        continue
+                    _FMP_EXHAUSTED.add(k)  # sustained 429 → daily cap; try next key
+                    break
+                return None
+            except Exception:
+                return None
+    return None
+
+
+def _fmp_keys_available(keys: list[str]) -> bool:
+    """Probe each not-yet-exhausted key once; returns True if any has quota left."""
+    for k in keys:
+        if k in _FMP_EXHAUSTED:
+            continue
+        try:
+            _edgar_fetch(f"{_FMP_BASE}/profile?symbol=AAPL&apikey={k}", timeout=15)
+            return True
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                continue  # maybe transient — don't kill the key here; per-call retry decides
+            return True
+        except Exception:
+            return True
+    return False
+
+
+def _ensure_delisted_column(conn: "sqlite3.Connection") -> None:
+    """Idempotently add the delisted_date column to an existing companies table."""
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(companies)").fetchall()]
+    if "delisted_date" not in cols:
+        conn.execute("ALTER TABLE companies ADD COLUMN delisted_date TEXT")
+        log.info("Added delisted_date column to companies table")
+
+
+def recover_delisted_securities(limit: int | None = None) -> None:
+    """Resolve and insert historical universe members missing from companies.
+
+    Targets every ISIN that appears in universe_snapshots (any index) but has no
+    companies row.  Resolves ticker via OpenFIGI, enriches via FMP, maps the FMP
+    sector to GICS, and writes the row with delisted_date set (NULL if the name is
+    still actively trading, else its last index-membership date).
+    """
+    keys = _load_fmp_api_keys()
+    if not keys:
+        raise RuntimeError("FMP_API_KEY not found in .env")
+    figi_key = _load_openfigi_api_key()
+
+    with get_db(DB_PATH) as conn:
+        _ensure_delisted_column(conn)
+        have = {r[0] for r in conn.execute("SELECT isin FROM companies").fetchall()}
+        last_seen = dict(conn.execute(
+            "SELECT isin, MAX(snapshot_date) FROM universe_snapshots GROUP BY isin"
+        ).fetchall())
+
+    targets = sorted(i for i in last_seen if i not in have)
+    if limit:
+        targets = targets[:limit]
+    log.info("Delisted recovery: %d universe ISINs missing from companies", len(targets))
+    if not targets:
+        return
+
+    log.info("Resolving ISIN→ticker via OpenFIGI ...")
+    isin2ticker = _openfigi_map_isins(targets, figi_key=figi_key)
+    log.info("  OpenFIGI resolved %d / %d tickers", len(isin2ticker), len(targets))
+
+    fmp_ok = _fmp_keys_available(keys)
+    if not fmp_ok:
+        log.warning("FMP quota exhausted — this run inserts only names whose metadata can be "
+                    "copied from existing live rows. Re-run after the daily reset to finish.")
+
+    # Many dead ISINs resolve to a ticker that is ALREADY a live company under a
+    # different ISIN (corporate action changed the ISIN — the BlackRock pattern).
+    # Copy that row's metadata for free and consistently, sparing an FMP call.
+    with get_db(DB_PATH) as conn:
+        live_by_ticker: dict[str, tuple] = {}
+        for row in conn.execute(
+            "SELECT ticker, company_name, gics_sector, simfin_industry, country, "
+            "       exchange, currency, cik, cusip FROM companies "
+            "WHERE delisted_date IS NULL AND ticker IS NOT NULL AND ticker != ''"
+        ).fetchall():
+            live_by_ticker.setdefault(row[0], row)
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    cols = ["isin", "ticker", "company_name", "gics_sector", "simfin_industry",
+            "country", "exchange", "currency", "cik", "cusip",
+            "data_date", "update_date", "delisted_date"]
+    insert_sql = (f"INSERT OR REPLACE INTO companies ({','.join(cols)}) "
+                  f"VALUES ({','.join('?' * len(cols))})")
+
+    n_inserted = n_active = n_delisted = n_no_sector = n_copied = n_fmp = 0
+    buf: list[tuple] = []
+    # Commit incrementally so an interruption (ENOSPC, FMP circuit-breaker) keeps
+    # everything resolved so far — the run is then fully resumable.
+    with get_db(DB_PATH) as conn:
+        _ensure_delisted_column(conn)
+        for n, isin in enumerate(targets, 1):
+            tk = isin2ticker.get(isin)
+            if not tk:
+                continue
+            live = live_by_ticker.get(tk)
+            if live is not None:
+                # Alive under a changed ISIN — copy metadata, still trading.
+                _, nm, gics, ind, country, exch, ccy, cik, cusip = live
+                active = True
+                n_copied += 1
+            else:
+                if not fmp_ok:
+                    continue  # defer to a later run when FMP quota is available
+                prof = _fmp_profile(tk, keys)
+                n_fmp += 1
+                if not prof:
+                    continue  # resumable: re-run after FMP quota resets
+                sector_raw = prof.get("sector") or ""
+                gics  = _FMP_TO_GICS_SECTOR.get(sector_raw, sector_raw or None)
+                nm    = prof.get("companyName") or ""
+                ind   = prof.get("industry") or None
+                country = prof.get("country") or None
+                exch  = prof.get("exchange") or None
+                ccy   = prof.get("currency") or None
+                cik   = prof.get("cik") or None
+                cusip = prof.get("cusip") or None
+                active = bool(prof.get("isActivelyTrading"))
+                time.sleep(0.25)  # ~4 req/s — only when we actually call FMP
+            if not nm:
+                continue  # require at least a name to insert a usable row
+            if not gics:
+                n_no_sector += 1
+            n_active   += int(active)
+            n_delisted += int(not active)
+            buf.append((isin, tk, nm, gics, ind, country, exch, ccy, cik, cusip,
+                        today, today, None if active else last_seen.get(isin)))
+            n_inserted += 1
+            if len(buf) >= 25:
+                conn.executemany(insert_sql, buf)
+                conn.commit()
+                buf.clear()
+                log.info("  inserted %d / %d  (copied=%d, fmp=%d)",
+                         n_inserted, len(targets), n_copied, n_fmp)
+        if buf:
+            conn.executemany(insert_sql, buf)
+            conn.commit()
+
+    n_unresolved = len(targets) - n_inserted
+    log.info("=== Delisted recovery complete ===")
+    log.info("  inserted into companies: %d  (still-trading=%d, delisted=%d)",
+             n_inserted, n_active, n_delisted)
+    log.info("  metadata via copy=%d, via FMP=%d", n_copied, n_fmp)
+    log.info("  no GICS sector resolved:  %d", n_no_sector)
+    log.info("  still missing (no ticker / FMP unavailable): %d  — re-run to resume", n_unresolved)
+
+
+def _load_openfigi_api_key() -> str | None:
+    """Read OPENFIGI_API_KEY from .env (optional — raises OpenFIGI rate limit)."""
+    env = Path(".env")
+    if not env.exists():
+        return None
+    for line in env.read_text().splitlines():
+        line = line.strip()
+        if line.startswith("OPENFIGI_API_KEY="):
+            return line.split("=", 1)[1].strip() or None
+    return None
+
+
 def main() -> None:
     import argparse
 
@@ -1255,6 +1585,19 @@ def main() -> None:
             "EDGAR EFTS CUSIP search, and write authoritative ISINs to isin_patch"
         ),
     )
+    parser.add_argument(
+        "--recover-delisted", action="store_true",
+        help=(
+            "Resolve historical universe members missing from companies (acquired / "
+            "bankrupt / dropped from index) via OpenFIGI + FMP and insert them with "
+            "delisted_date set. Fixes survivorship coverage. Then run "
+            "create_returns.py --backfill-delisted for prices."
+        ),
+    )
+    parser.add_argument(
+        "--limit", type=int, default=None,
+        help="Cap the number of names processed (debug; applies to --recover-delisted)",
+    )
     args = parser.parse_args()
 
     if args.rebuild_snapshots:
@@ -1274,6 +1617,11 @@ def main() -> None:
     if args.fix_isins:
         log.info("=== FIX ISINs via N-PORT + FMP validation ===")
         fix_isins()
+        return
+
+    if args.recover_delisted:
+        log.info("=== RECOVER DELISTED / DROPPED SECURITIES ===")
+        recover_delisted_securities(limit=args.limit)
         return
 
     log.info("=== CREATE UNIVERSE ===")

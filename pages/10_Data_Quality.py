@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 from datetime import datetime, date
 
+import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -109,6 +110,110 @@ def _factor_fill(snapshot_date: str) -> pd.DataFrame:
     df["n_extreme"] = df["n_extreme"].fillna(0).astype(int)
     df["fill_pct"]  = (df["filled"] / df["total"] * 100).round(1)
     return df.sort_values("fill_pct")
+
+
+# --- Factor anomaly detection (two unsupervised lenses) --------------------
+# Surfaces individual suspect (security, factor) cells likely caused by XBRL
+# mis-tagging or near-zero denominators — values that distort cross-sectional
+# z-scores but pass the aggregate fill-rate / |z|>4 checks above.
+#
+#   cross_sectional — robust-z (median/MAD) on the RAW factor_value within each
+#                     factor's peer group; catches extremes that winsorization
+#                     hides once they become factor_value_z.
+#   time_series     — robust-z of a value vs the security's own factor history,
+#                     with the own-history MAD floored by the factor's pooled
+#                     cross-sectional MAD so a genuine small change in a low-
+#                     dispersion factor isn't mistaken for a mis-tag.
+XSECTION_Z     = 10.0   # raw value this many MADs from peer median
+TIMESERIES_Z   = 6.0    # value this many (floored) MADs from own history
+MIN_HISTORY    = 5      # snapshots required before the time-series lens applies
+MAD_FLOOR_FRAC = 0.5    # own-history MAD floored at this × the factor's pooled MAD
+
+
+@st.cache_data(ttl=300)
+def _security_map() -> pd.DataFrame:
+    """factors.db security_id (ISIN or simfin_id) → ticker, sector."""
+    with get_db(UNIVERSE_DB) as conn:
+        comp = pd.read_sql(
+            "SELECT isin, ticker, gics_sector, simfin_id FROM companies", conn
+        )
+    comp["simfin_str"] = comp["simfin_id"].apply(
+        lambda x: str(int(x)) if pd.notna(x) else None
+    )
+    by_isin   = comp[["isin", "ticker", "gics_sector"]].rename(
+        columns={"isin": "security_id", "gics_sector": "sector"})
+    by_simfin = (comp.dropna(subset=["simfin_str"])[["simfin_str", "ticker", "gics_sector"]]
+                 .rename(columns={"simfin_str": "security_id", "gics_sector": "sector"}))
+    return pd.concat([by_isin, by_simfin], ignore_index=True).drop_duplicates("security_id")
+
+
+def _add_med_mad(df: pd.DataFrame, by: list[str], col: str, prefix: str) -> pd.DataFrame:
+    """Attach group median and MAD columns (two vectorised transforms, no lambda)."""
+    med = df.groupby(by, sort=False)[col].transform("median")
+    df[f"{prefix}_med"] = med
+    df[f"{prefix}_mad"] = (df[col] - med).abs().groupby(
+        [df[c] for c in by], sort=False
+    ).transform("median")
+    return df
+
+
+@st.cache_data(ttl=300)
+def _factor_anomalies(snapshot_date: str) -> pd.DataFrame:
+    """
+    Ranked suspect cells for one snapshot. Both lenses share a robust-z scale;
+    the merged table is ordered by within-lens percentile so neither lens
+    dominates, and cells flagged by both lenses are marked high-confidence.
+    """
+    with get_db(FACTORS_DB) as conn:
+        panel = pd.read_sql(
+            "SELECT data_date, factor_id, security_id, factor_value FROM factors "
+            "WHERE factor_value IS NOT NULL", conn
+        )
+    panel["security_id"] = panel["security_id"].astype(str)
+    names = dict(pd.read_csv(FACTORS_REF)[["factor_id", "factor_name"]].values)
+
+    # --- Lens 1: cross-sectional, on the selected snapshot only ---
+    xs = panel[panel["data_date"] == snapshot_date].copy()
+    xs = _add_med_mad(xs, ["factor_id"], "factor_value", "xs")
+    xs["rz"] = 0.6745 * (xs["factor_value"] - xs["xs_med"]) / xs["xs_mad"].replace(0, np.nan)
+    xs_hit = xs[xs["rz"].abs() >= XSECTION_Z].copy()
+    xs_hit["lens"]     = "cross_sectional"
+    xs_hit["severity"] = xs_hit["rz"].abs()
+    xs_hit["detail"]   = xs_hit.apply(
+        lambda r: f"raw {r['factor_value']:.3g} is {abs(r['rz']):.0f}×MAD "
+                  f"from peer median {r['xs_med']:.3g}", axis=1)
+
+    # --- Lens 2: time-series, full history, reported on the snapshot ---
+    ts = _add_med_mad(panel.copy(), ["security_id", "factor_id"], "factor_value", "own")
+    pooled_mad = (panel["factor_value"] - panel.groupby("factor_id", sort=False)["factor_value"]
+                  .transform("median")).abs().groupby(panel["factor_id"], sort=False).transform("median")
+    ts["mad_eff"] = np.maximum(ts["own_mad"], MAD_FLOOR_FRAC * pooled_mad)
+    ts["n_hist"]  = ts.groupby(["security_id", "factor_id"], sort=False)["factor_value"].transform("size")
+    ts["rz"] = 0.6745 * (ts["factor_value"] - ts["own_med"]) / ts["mad_eff"].replace(0, np.nan)
+    ts_hit = ts[(ts["rz"].abs() >= TIMESERIES_Z)
+                & (ts["n_hist"] >= MIN_HISTORY)
+                & (ts["data_date"] == snapshot_date)].copy()
+    ts_hit["lens"]     = "time_series"
+    ts_hit["severity"] = ts_hit["rz"].abs()
+    ts_hit["detail"]   = ts_hit.apply(
+        lambda r: f"{r['factor_value']:.3g} is {abs(r['rz']):.0f}×MAD "
+                  f"from own-history median {r['own_med']:.3g}", axis=1)
+
+    cols = ["lens", "security_id", "factor_id", "factor_value", "severity", "detail"]
+    hits = pd.concat([xs_hit[cols], ts_hit[cols]], ignore_index=True)
+    if hits.empty:
+        return hits.assign(ticker=None, sector=None, factor_name=None,
+                           rank_pct=None, confidence=None)
+
+    hits["factor_name"] = hits["factor_id"].map(names)
+    hits = hits.merge(_security_map(), on="security_id", how="left")
+    hits["ticker"] = hits["ticker"].fillna(hits["security_id"])
+
+    # within-lens percentile so the two robust-z scales interleave fairly
+    hits["rank_pct"] = hits.groupby("lens")["severity"].rank(pct=True)
+    dup = hits.groupby(["security_id", "factor_id"])["lens"].transform("nunique")
+    hits["confidence"] = np.where(dup > 1, "both lenses", "single")
+    return hits.sort_values(["rank_pct", "severity"], ascending=False, ignore_index=True)
 
 
 @st.cache_data(ttl=300)
@@ -688,6 +793,46 @@ with tab_factor:
         st.success("✅ All factors have ≥ 80% fill and no extreme z-scores.")
 
     st.dataframe(tbl_f.sort_values("Fill %"), hide_index=True, use_container_width=True)
+
+    # --- Factor value anomalies ---------------------------------------
+    st.subheader("Factor value anomalies")
+    st.caption(
+        "Suspect individual values from two unsupervised lenses — cross-sectional "
+        "outliers (raw value vs peers) and time-series jumps (value vs the company's "
+        "own history). Catches XBRL mis-tags and near-zero-denominator blow-ups that "
+        "distort z-scores but slip past the aggregate fill/|z| checks above. "
+        "“Both lenses” = highest confidence."
+    )
+
+    with st.spinner("Scanning factor values…"):
+        anom = _factor_anomalies(sel_date_f)
+
+    if anom.empty:
+        st.success("✅ No factor value anomalies detected at this snapshot.")
+    else:
+        n_xs   = int((anom["lens"] == "cross_sectional").sum())
+        n_ts   = int((anom["lens"] == "time_series").sum())
+        n_both = int((anom["confidence"] == "both lenses").sum()) // 2  # counted per lens row
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Suspect cells", f"{len(anom):,}")
+        c2.metric("Cross-sectional / time-series", f"{n_xs} / {n_ts}")
+        c3.metric("Flagged by both lenses", f"{n_both}")
+        st.warning(
+            f"⚠️ {len(anom):,} suspect value(s). Top offenders below — review the "
+            "highest-severity and “both lenses” rows first."
+        )
+
+        show = anom.head(50)[
+            ["lens", "ticker", "sector", "factor_name", "factor_value",
+             "severity", "confidence", "detail"]
+        ].rename(columns={
+            "lens": "Lens", "ticker": "Ticker", "sector": "Sector",
+            "factor_name": "Factor", "factor_value": "Value",
+            "severity": "Robust-z", "confidence": "Confidence", "detail": "Detail",
+        })
+        show["Value"]    = show["Value"].map(lambda v: f"{v:.3g}")
+        show["Robust-z"] = show["Robust-z"].round(0).astype(int)
+        st.dataframe(show, hide_index=True, use_container_width=True, height=460)
 
 
 # ============================================================

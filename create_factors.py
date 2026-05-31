@@ -588,8 +588,9 @@ def select_ltm_data(
     _check_consecutive(recent_4, "LTM")
     _check_consecutive(prior_4,  "prior-LTM")
 
-    def build_ltm(quarters: list) -> dict:
+    def build_ltm(quarters: list, min_flow_quarters: int) -> dict:
         ltm: dict = {}
+        flow_counts: dict = {}
         for q in quarters:
             # Derive Gross Profit per-quarter when absent but Revenue and Cost of Revenue
             # are both available. Sign convention is normalised (both positive) so
@@ -617,9 +618,22 @@ def select_ltm_data(
                     ltm[name] = val          # later quarter overwrites — sorted asc, so last = most recent
                 else:
                     ltm[name] = ltm.get(name, 0.0) + val
+                    flow_counts[name] = flow_counts.get(name, 0) + 1
+
+        # Require a complete window for Flow items.  An LTM (or prior-LTM) summed
+        # over fewer than `min_flow_quarters` quarters is understated and yields
+        # spurious level/growth factors — e.g. a 1-quarter prior-year base
+        # inflating YoY growth (LNT: prior-LTM = 1 quarter → Revenue Growth +292%).
+        # Nulling the item makes downstream factors NaN so they drop out of the
+        # cross-section instead of polluting it.  Quarterly mode requires 4;
+        # annual-only filers require 1 (a single FY period is already a full year).
+        for name, cnt in flow_counts.items():
+            if cnt < min_flow_quarters:
+                ltm[name] = None
         return ltm
 
-    return build_ltm(recent_4), build_ltm(prior_4)
+    min_flow = 1 if is_annual_only else 4
+    return build_ltm(recent_4, min_flow), build_ltm(prior_4, min_flow)
 
 
 # ---------------------------------------------------------------------------

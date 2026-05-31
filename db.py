@@ -173,6 +173,23 @@ def get_screener_df() -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 @st.cache_data
+def get_company_info(isin: str) -> dict:
+    """Company-level metadata for the Deep Dive header — name, sectors, business summary, etc."""
+    with get_db(UNIVERSE_DB) as conn:
+        row = conn.execute(
+            "SELECT ticker, company_name, gics_sector, gics_industry, simfin_industry, "
+            "       country, exchange, num_employees, business_summary "
+            "FROM companies WHERE isin = ?",
+            (isin,),
+        ).fetchone()
+    if not row:
+        return {}
+    keys = ["ticker", "company_name", "gics_sector", "gics_industry", "simfin_industry",
+            "country", "exchange", "num_employees", "business_summary"]
+    return dict(zip(keys, row))
+
+
+@st.cache_data
 def get_constituents_for_security(security_id: str) -> pd.DataFrame:
     # Historical SimFin data is stored under simfin_id; EDGAR updates use ISIN.
     # Query both so the full history is returned for every company.
@@ -198,6 +215,37 @@ def get_constituents_for_security(security_id: str) -> pd.DataFrame:
     df["report_date"] = pd.to_datetime(df["report_date"], errors="coerce")
     df = df.sort_values(["statement_type", "constituent_name", "fiscal_year", "fiscal_period"])
     return df
+
+
+@st.cache_data
+def get_industry_composite(industry: str) -> pd.DataFrame:
+    """Equal-weighted daily total-return series for all stocks in `industry`
+    (industry as stored in companies.simfin_industry). Returns columns date, total_return."""
+    if not industry:
+        return pd.DataFrame(columns=["date", "total_return"])
+    with get_db(UNIVERSE_DB) as conn:
+        rows = conn.execute(
+            "SELECT isin FROM companies WHERE simfin_industry = ?", (industry,)
+        ).fetchall()
+    isins = [r[0] for r in rows if r[0]]
+    if not isins:
+        return pd.DataFrame(columns=["date", "total_return"])
+    ph = ",".join("?" * len(isins))
+    with get_db(RETURNS_DB) as conn:
+        df = pd.read_sql(
+            f"SELECT date, isin, total_return FROM returns WHERE isin IN ({ph})",
+            conn, params=isins,
+        )
+    if df.empty:
+        return df
+    df["date"] = pd.to_datetime(df["date"])
+    composite = (
+        df.dropna(subset=["total_return"])
+          .groupby("date")["total_return"].mean()
+          .reset_index()
+          .rename(columns={"total_return": "total_return"})
+    )
+    return composite
 
 
 @st.cache_data
