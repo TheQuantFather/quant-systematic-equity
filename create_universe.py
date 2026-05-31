@@ -34,7 +34,10 @@ import sqlite3
 from pathlib import Path
 from datetime import datetime
 
-from config import DATA_DIR, SIMFIN_DIR, UNIVERSE_DB as DB_PATH
+from config import (
+    DATA_DIR, SIMFIN_DIR, UNIVERSE_DB as DB_PATH, FACTORS_DB,
+    SCHEDULE_MONTHLY_START, SCHEDULE_WEEKLY_CUTOVER,
+)
 from utils import get_db, get_logger
 
 log = get_logger("create_universe")
@@ -131,6 +134,76 @@ def seed_registry_tables(conn: "sqlite3.Connection") -> None:
     conn.commit()
 
 
+def seed_snapshot_schedule_table(conn: "sqlite3.Connection") -> None:
+    """Create the snapshot_schedule table — the single source of truth for snapshot dates."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS snapshot_schedule (
+            data_date           TEXT PRIMARY KEY,
+            cadence             TEXT NOT NULL,        -- 'monthly' | 'weekly' | 'legacy'
+            factors_computed_at TEXT,                 -- stamped by create_factors when computed
+            created_at          TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+
+
+def rebuild_snapshot_schedule(
+    monthly_start: str = SCHEDULE_MONTHLY_START,
+    weekly_cutover: str = SCHEDULE_WEEKLY_CUTOVER,
+) -> None:
+    """
+    (Re)build the canonical snapshot calendar in universe.db — the single source of
+    truth that create_factors / create_risk / create_barra all read.
+
+    Rule:
+      - 'monthly' : month-end of every month from monthly_start up to weekly_cutover.
+      - 'weekly'  : existing computed snapshot dates on/after weekly_cutover (the
+                    weekly cadence added by daily_update.py — left as-is, not generated).
+      - 'legacy'  : existing computed snapshot dates before weekly_cutover that are not
+                    month-ends (the old 15th-quarterly / April-1-annual grid) — kept,
+                    tagged, never recomputed.
+
+    Idempotent: re-running updates cadence tags but preserves factors_computed_at
+    (which create_factors stamps as it computes each date).
+    """
+    month_ends = [d.strftime("%Y-%m-%d")
+                  for d in pd.date_range(monthly_start, weekly_cutover, freq="ME")]
+
+    # Discover already-computed dates from factors.db to tag weekly/legacy and to
+    # bootstrap factors_computed_at for dates that already exist.
+    computed: set[str] = set()
+    try:
+        with get_db(FACTORS_DB) as fconn:
+            computed = {r[0] for r in fconn.execute("SELECT data_date FROM snapshot_dates").fetchall()}
+    except Exception as exc:                       # factors.db / table may not exist yet
+        log.warning("Could not read factors.db snapshot_dates (%s) — schedule built from rule only", exc)
+
+    cadence: dict[str, str] = {d: "monthly" for d in month_ends}
+    for d in computed:
+        if d >= weekly_cutover:
+            cadence[d] = "weekly"
+        elif d not in cadence:
+            cadence[d] = "legacy"
+
+    now = datetime.now().isoformat(timespec="seconds")
+    with get_db(DB_PATH) as conn:
+        seed_snapshot_schedule_table(conn)
+        for d, cad in sorted(cadence.items()):
+            conn.execute(
+                "INSERT INTO snapshot_schedule (data_date, cadence, factors_computed_at, created_at) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(data_date) DO UPDATE SET cadence = excluded.cadence",
+                (d, cad, now if d in computed else None, now),
+            )
+        conn.commit()
+        counts = dict(conn.execute(
+            "SELECT cadence, COUNT(*) FROM snapshot_schedule GROUP BY cadence").fetchall())
+        n_pending = conn.execute(
+            "SELECT COUNT(*) FROM snapshot_schedule WHERE factors_computed_at IS NULL").fetchone()[0]
+    log.info("snapshot_schedule rebuilt: %s | %d date(s) pending factor computation",
+             counts, n_pending)
+
+
 def load_index_registry() -> dict[str, dict]:
     """Load index registry from universe.db index_registry + nport_accessions tables."""
     with get_db(DB_PATH) as conn:
@@ -157,6 +230,7 @@ def seed_all_reference_tables(conn: "sqlite3.Connection") -> None:
     seed_isin_patch_table(conn)
     seed_ticker_alias_table(conn)
     seed_registry_tables(conn)
+    seed_snapshot_schedule_table(conn)
 
 
 # ---------------------------------------------------------------------------
@@ -1595,10 +1669,22 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--rebuild-schedule", action="store_true",
+        help=(
+            "(Re)build the snapshot_schedule table — the single source of truth for "
+            "snapshot dates (month-end monthly grid + weekly/legacy tags). Idempotent."
+        ),
+    )
+    parser.add_argument(
         "--limit", type=int, default=None,
         help="Cap the number of names processed (debug; applies to --recover-delisted)",
     )
     args = parser.parse_args()
+
+    if args.rebuild_schedule:
+        log.info("=== REBUILD SNAPSHOT SCHEDULE ===")
+        rebuild_snapshot_schedule()
+        return
 
     if args.rebuild_snapshots:
         rebuild_snapshots()

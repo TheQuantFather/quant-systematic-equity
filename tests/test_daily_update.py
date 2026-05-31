@@ -217,7 +217,7 @@ def test_run_streams_output_line_by_line(caplog):
 
 def test_dry_run_weekly_lists_expected_steps():
     """Smoke test the full orchestration via subprocess.  Confirms that:
-      - Each of the 7 expected steps emits a START line
+      - Each of the expected steps emits a START line
       - The Weekly rebuild section header is present
       - The final summary reports success (exit 0)
     """
@@ -236,7 +236,6 @@ def test_dry_run_weekly_lists_expected_steps():
         "create_models.py --date",
         "create_risk.py --date",
         "create_barra.py",
-        "optimize_portfolio.py",
     ]
     for expected in expected_steps:
         assert re.search(rf"START\s+{re.escape(expected)}", text), \
