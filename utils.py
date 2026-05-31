@@ -122,6 +122,52 @@ def get_db(path: str | Path) -> Generator[sqlite3.Connection, None, None]:
         conn.close()
 
 
+def get_snapshot_schedule(
+    cadence: str | tuple[str, ...] | None = None,
+    computed_only: bool = False,
+) -> list[str]:
+    """
+    Read the canonical snapshot dates from universe.db `snapshot_schedule` — the
+    single source of truth for the pipeline.  Returns dates sorted ascending.
+
+    cadence       — restrict to one cadence ('monthly'/'weekly'/'legacy') or a tuple.
+    computed_only — only dates whose factors have been computed (factors_computed_at
+                    set).  Used by create_risk / create_barra (they need factors first).
+    """
+    from config import UNIVERSE_DB   # lazy import to avoid import-time coupling
+
+    sql = "SELECT data_date FROM snapshot_schedule"
+    conds, params = [], []
+    if computed_only:
+        conds.append("factors_computed_at IS NOT NULL")
+    if cadence is not None:
+        cads = (cadence,) if isinstance(cadence, str) else tuple(cadence)
+        conds.append(f"cadence IN ({','.join('?' * len(cads))})")
+        params.extend(cads)
+    if conds:
+        sql += " WHERE " + " AND ".join(conds)
+    sql += " ORDER BY data_date"
+    with get_db(UNIVERSE_DB) as conn:
+        return [r[0] for r in conn.execute(sql, params).fetchall()]
+
+
+def mark_snapshot_computed(data_date: str) -> None:
+    """Stamp factors_computed_at for a snapshot date in the schedule (called by create_factors)."""
+    from datetime import datetime
+    from config import UNIVERSE_DB
+
+    with get_db(UNIVERSE_DB) as conn:
+        # Insert if the date isn't in the schedule yet (e.g. ad-hoc --date runs), else stamp.
+        conn.execute(
+            "INSERT INTO snapshot_schedule (data_date, cadence, factors_computed_at, created_at) "
+            "VALUES (?, 'adhoc', ?, ?) "
+            "ON CONFLICT(data_date) DO UPDATE SET factors_computed_at = excluded.factors_computed_at",
+            (data_date, datetime.now().isoformat(timespec="seconds"),
+             datetime.now().isoformat(timespec="seconds")),
+        )
+        conn.commit()
+
+
 def classify_sector(sector: str | None, industry: str | None) -> str:
     """Map SimFin sector/industry to one of: 'reit', 'financial', 'general'."""
     s = (sector   or "").lower()

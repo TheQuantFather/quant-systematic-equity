@@ -33,9 +33,11 @@ from typing import Optional
 from config import (
     UNIVERSE_DB, CONSTITUENTS_DB, RETURNS_DB, FACTORS_DB,
     FACTORS_REF, CONSTITUENTS_REF,
-    BACKFILL_DATES, QUARTERLY_BACKFILL_DATES,
 )
-from utils import classify_sector, get_db, get_logger, winsorized_zscore
+from utils import (
+    classify_sector, get_db, get_logger, winsorized_zscore,
+    get_snapshot_schedule, mark_snapshot_computed,
+)
 
 log = get_logger("create_factors")
 
@@ -620,19 +622,18 @@ def select_ltm_data(
                     ltm[name] = ltm.get(name, 0.0) + val
                     flow_counts[name] = flow_counts.get(name, 0) + 1
 
-        # Require a complete window for Flow items.  An LTM (or prior-LTM) summed
-        # over fewer than `min_flow_quarters` quarters is understated and yields
-        # spurious level/growth factors — e.g. a 1-quarter prior-year base
-        # inflating YoY growth (LNT: prior-LTM = 1 quarter → Revenue Growth +292%).
-        # Nulling the item makes downstream factors NaN so they drop out of the
-        # cross-section instead of polluting it.  Quarterly mode requires 4;
-        # annual-only filers require 1 (a single FY period is already a full year).
+        # Require a minimum number of quarters for Flow items.  A window built
+        # from only 1 quarter produces a badly understated LTM that inflates YoY
+        # growth factors (LNT case: prior-LTM = 1 quarter → Revenue Growth +292%).
+        # Threshold = 2: blocks degenerate 1-quarter windows while allowing
+        # 3-quarter windows (Q4 not yet filed at snapshot — very common PIT lag).
+        # Annual-only filers require 1 (a single FY period already covers 12 months).
         for name, cnt in flow_counts.items():
             if cnt < min_flow_quarters:
                 ltm[name] = None
         return ltm
 
-    min_flow = 1 if is_annual_only else 4
+    min_flow = 1 if is_annual_only else 2
     return build_ltm(recent_4, min_flow), build_ltm(prior_4, min_flow)
 
 
@@ -1264,19 +1265,28 @@ def main():
     grp = parser.add_mutually_exclusive_group()
     grp.add_argument('--date',              metavar='YYYY-MM-DD', action='append', dest='dates',
                      help='Snapshot date (repeatable: --date D1 --date D2)')
+    grp.add_argument('--schedule',          action='store_true',
+                     help='Compute all scheduled dates not yet computed (the snapshot_schedule '
+                          'table in universe.db is the single source of truth)')
+    grp.add_argument('--schedule-all',      action='store_true',
+                     help='Recompute EVERY date in the schedule (full restatement)')
     grp.add_argument('--backfill',          action='store_true',
-                     help='Run all annual April-1 backfill dates')
+                     help='[deprecated alias for --schedule]')
     grp.add_argument('--quarterly-backfill', action='store_true',
-                     help='Run all quarterly snapshot dates (May/Aug/Nov/Feb)')
+                     help='[deprecated alias for --schedule]')
     parser.add_argument('--clean', action='store_true',
                         help='Drop and rebuild the factors table before running')
     args = parser.parse_args()
 
-    if args.backfill:
-        dates_to_run = [datetime.strptime(d, '%Y-%m-%d').date() for d in BACKFILL_DATES]
-    elif args.quarterly_backfill:
-        all_dates = sorted(set(BACKFILL_DATES + QUARTERLY_BACKFILL_DATES))
-        dates_to_run = [datetime.strptime(d, '%Y-%m-%d').date() for d in all_dates]
+    if args.schedule_all:
+        scheduled = get_snapshot_schedule()
+        dates_to_run = [datetime.strptime(d, '%Y-%m-%d').date() for d in scheduled]
+    elif args.schedule or args.backfill or args.quarterly_backfill:
+        # Pending = scheduled but factors not yet computed (single source of truth).
+        computed = set(get_snapshot_schedule(computed_only=True))
+        pending  = [d for d in get_snapshot_schedule() if d not in computed]
+        dates_to_run = [datetime.strptime(d, '%Y-%m-%d').date() for d in pending]
+        log.info("Schedule: %d pending date(s) of %d total", len(pending), len(get_snapshot_schedule()))
     elif args.dates:
         dates_to_run = sorted({datetime.strptime(d, '%Y-%m-%d').date() for d in args.dates})
     else:
@@ -1313,6 +1323,8 @@ def main():
                 (str(snapshot),),
             )
             conn.commit()
+            # Stamp the single source of truth (universe.db snapshot_schedule).
+            mark_snapshot_computed(str(snapshot))
 
     log.info("Done — %s total factor rows across %d date(s)", f"{total_rows:,}", len(dates_to_run))
 

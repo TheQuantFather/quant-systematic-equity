@@ -24,6 +24,7 @@ RETURNS_DB       = DATA_DIR / "returns.db"
 FACTORS_DB       = DATA_DIR / "factors.db"
 MODELS_DB        = DATA_DIR / "models.db"
 RISK_DB          = DATA_DIR / "risk.db"   # Ledoit-Wolf covariance + Barra tables
+MACRO_DB         = DATA_DIR / "macro.db"  # US macro signals: treasury yields, spreads, commodities, economic data
 
 # ---------------------------------------------------------------------------
 # Reference / mapping files
@@ -70,6 +71,21 @@ QUARTERLY_BACKFILL_DATES = [
 
 # Ledoit-Wolf risk snapshot dates align with annual backfill
 RISK_SNAPSHOT_DATES = BACKFILL_DATES
+
+# ---------------------------------------------------------------------------
+# Snapshot schedule — the SINGLE SOURCE OF TRUTH for snapshot dates is the
+# `snapshot_schedule` table in universe.db (built by `create_universe.py
+# --rebuild-schedule`, read everywhere via `utils.get_snapshot_schedule`).
+# These two parameters define the generation RULE: a month-end monthly grid from
+# SCHEDULE_MONTHLY_START up to SCHEDULE_WEEKLY_CUTOVER, beyond which the weekly
+# cadence (added by daily_update.py) takes over.  BACKFILL_DATES /
+# QUARTERLY_BACKFILL_DATES above are retained only as legacy cadence tags.
+# ---------------------------------------------------------------------------
+SCHEDULE_MONTHLY_START  = "2021-04-30"   # first month-end of the monthly grid
+SCHEDULE_WEEKLY_CUTOVER = "2026-05-01"   # weekly cadence takes over on/after this date
+
+# Macro signal backfill dates
+MACRO_BACKFILL_START = "2015-01-01"  # 10 years of history
 
 # ---------------------------------------------------------------------------
 # Ledoit-Wolf covariance hyperparameters

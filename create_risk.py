@@ -27,13 +27,23 @@ from config import (
     LW_MIN_HISTORY   as MIN_HISTORY,
     LW_WINSOR_CLIP   as WINSOR_CLIP,
 )
-from utils import get_db, get_logger
+from utils import get_db, get_logger, get_snapshot_schedule
 
 log = get_logger("create_risk")
 
 
 def _get_snapshot_dates() -> list[str]:
-    """Discover snapshot dates from factors.db — snapshot_dates table, then factors table."""
+    """
+    Snapshot dates from the single source of truth — universe.db snapshot_schedule,
+    restricted to dates whose factors have been computed (risk needs factors first).
+    Falls back to factors.db (snapshot_dates, then the factors table) for robustness.
+    """
+    try:
+        dates = get_snapshot_schedule(computed_only=True)
+        if dates:
+            return dates
+    except Exception:
+        pass
     try:
         with get_db(FACTORS_DB) as conn:
             rows = conn.execute(
@@ -41,7 +51,6 @@ def _get_snapshot_dates() -> list[str]:
             ).fetchall()
             if rows:
                 return [r[0] for r in rows]
-            # Fallback: derive from factors table itself (handles pre-snapshot_dates era)
             rows = conn.execute(
                 "SELECT DISTINCT data_date FROM factors ORDER BY data_date"
             ).fetchall()
@@ -50,7 +59,7 @@ def _get_snapshot_dates() -> list[str]:
     except Exception:
         pass
     raise RuntimeError(
-        "No snapshot dates found in factors.db. Run create_factors.py first."
+        "No snapshot dates found. Run create_universe.py --rebuild-schedule and create_factors.py first."
     )
 
 
