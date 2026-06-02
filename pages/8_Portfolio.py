@@ -445,6 +445,7 @@ is_alpha   = objective == "maximize_alpha"
 is_sharpe  = objective == "maximize_sharpe"
 is_min_var = objective == "minimize_variance"
 has_bm     = df["benchmark_weight"].sum() > 0
+has_mcap   = {"market_cap", "market_cap_bucket"}.issubset(df.columns)
 
 st.subheader(summary.get("name", selected))
 st.caption(
@@ -516,15 +517,30 @@ with tab1:
                           plot_bgcolor="rgba(0,0,0,0)")
         st.plotly_chart(fig, use_container_width=True)
 
-    st.markdown("**Active Weight Distribution**")
-    fig = go.Figure(go.Histogram(
-        x=df["active_weight"] * 100, nbinsx=60,
-        marker_color="#1F4E79", opacity=0.8,
-    ))
-    fig.update_layout(height=250, margin=dict(l=10, r=10, t=10, b=30),
-                      xaxis_title="Active Weight (%)", yaxis_title="# Stocks",
-                      plot_bgcolor="rgba(0,0,0,0)")
-    st.plotly_chart(fig, use_container_width=True)
+    if has_mcap:
+        held = df[df["portfolio_weight"] > 1e-5].copy()
+        cap_order = ["large", "mid", "small"]
+        cap = (
+            held.groupby("market_cap_bucket")["portfolio_weight"]
+            .sum()
+            .reindex(cap_order)
+            .fillna(0.0)
+            .reset_index()
+        )
+        cap["label"] = cap["market_cap_bucket"].str.title()
+        st.markdown("**Market-Cap Bucket Weights**")
+        fig = go.Figure(go.Bar(
+            x=cap["label"],
+            y=cap["portfolio_weight"] * 100,
+            marker_color=["#1F4E79", "#5B8DEF", "#8BC34A"],
+            text=[f"{v:.1f}%" for v in cap["portfolio_weight"] * 100],
+            textposition="outside",
+            hovertemplate="%{x}<br>Weight: %{y:.2f}%<extra></extra>",
+        ))
+        fig.update_layout(height=320, margin=dict(l=10, r=10, t=10, b=40),
+                          yaxis_title="Portfolio Weight (%)",
+                          plot_bgcolor="rgba(0,0,0,0)")
+        st.plotly_chart(fig, use_container_width=True)
 
 
 # ── Tab 2: Sector & Industry ──────────────────────────────────────────────────
@@ -985,13 +1001,27 @@ with tab5:
         "ticker", "company_name", "gics_sector", "industry",
         "benchmark_weight", "portfolio_weight", "active_weight", "alpha_score",
     ]].copy()
+    if has_mcap:
+        display_df["market_cap_bucket"] = df["market_cap_bucket"]
+        display_df["market_cap_b"] = df["market_cap"] / 1e9
     display_df["benchmark_weight"] = (display_df["benchmark_weight"] * 100).round(3)
     display_df["portfolio_weight"] = (display_df["portfolio_weight"] * 100).round(3)
     display_df["active_weight"]    = (display_df["active_weight"]    * 100).round(3)
-    display_df.columns = [
-        "Ticker", "Name", "Sector", "Industry",
-        "BM Weight %", "Port Weight %", "Active Weight %", "Alpha Score",
-    ]
+    display_df = display_df.rename(columns={
+        "ticker": "Ticker",
+        "company_name": "Name",
+        "gics_sector": "Sector",
+        "industry": "Industry",
+        "benchmark_weight": "BM Weight %",
+        "portfolio_weight": "Port Weight %",
+        "active_weight": "Active Weight %",
+        "alpha_score": "Alpha Score",
+        "market_cap_bucket": "Cap Bucket",
+        "market_cap_b": "Market Cap $B",
+    })
+    if "Cap Bucket" in display_df.columns:
+        display_df["Cap Bucket"] = display_df["Cap Bucket"].str.title()
+        display_df["Market Cap $B"] = display_df["Market Cap $B"].round(2)
 
     filter_col, _ = st.columns([2, 5])
     sector_filter = filter_col.multiselect(

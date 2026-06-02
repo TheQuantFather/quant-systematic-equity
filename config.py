@@ -30,10 +30,11 @@ MACRO_DB         = DATA_DIR / "macro.db"  # US macro signals: treasury yields, s
 # Reference / mapping files
 # ---------------------------------------------------------------------------
 
-FACTORS_REF      = DATA_DIR / "factors_reference.csv"
-MODELS_REF       = DATA_DIR / "models_reference.csv"
-CONSTITUENTS_REF = DATA_DIR / "constituents_reference.csv"
-CONCEPT_MAP_XLSX = DATA_DIR / "edgar_concept_map.xlsx"
+FACTORS_REF          = DATA_DIR / "factors_reference.csv"
+MODELS_REF           = DATA_DIR / "models_reference.csv"
+CONSTITUENTS_REF     = DATA_DIR / "constituents_reference.csv"
+STANDARD_CONCEPTS_REF = DATA_DIR / "standard_concepts_reference.csv"
+CONCEPT_MAP_XLSX     = DATA_DIR / "edgar_concept_map.xlsx"
 
 # ---------------------------------------------------------------------------
 # Portfolio files

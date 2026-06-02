@@ -135,18 +135,19 @@ def create_constituents_database(force: bool = False) -> None:
         conn.execute('DROP TABLE IF EXISTS constituents')
         conn.execute('''
             CREATE TABLE constituents (
-                data_date       TEXT,
-                constituent_id  TEXT,
-                security_id     TEXT,
-                constituent_value REAL,
-                statement_type  TEXT,
-                report_date     TEXT,
-                publish_date    TEXT,
-                available_date  TEXT,
-                update_date     TEXT,
-                fiscal_year     INTEGER,
-                fiscal_period   TEXT,
-                currency        TEXT,
+                data_date            TEXT,
+                constituent_id       TEXT,
+                security_id          TEXT,
+                constituent_value    REAL,
+                statement_type       TEXT,
+                report_date          TEXT,
+                publish_date         TEXT,
+                available_date       TEXT,
+                update_date          TEXT,
+                fiscal_year          INTEGER,
+                fiscal_period        TEXT,
+                currency             TEXT,
+                standard_concept_id  TEXT,
                 PRIMARY KEY (constituent_id, security_id, publish_date)
             )
         ''')

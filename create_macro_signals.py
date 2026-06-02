@@ -226,15 +226,29 @@ def _rows_from_data(
     return rows
 
 
+# Number of calendar days to look back when doing an incremental update.
+# Covers weekends, public holidays, and FRED's typical 1-business-day
+# publishing lag, without re-fetching more history than necessary.
+_INCREMENTAL_LOOKBACK_DAYS = 5
+
+
 def process_date(date_str: str) -> None:
     """
-    Fetch and insert all signals for a single date.
-    Used for incremental updates (--date or default today).
+    Fetch and insert all signals up to `date_str`.
+
+    Fetches a small lookback window (INCREMENTAL_LOOKBACK_DAYS) rather than a
+    single day so that FRED's 1-business-day publication lag and weekends/
+    holidays don't produce gaps. INSERT OR REPLACE handles any overlap with
+    already-stored rows.
     """
     signals_ref = load_signals_reference()
     if not signals_ref:
         log.error("No signals loaded from signals_reference")
         return
+
+    end_dt   = datetime.fromisoformat(date_str).date()
+    start_dt = end_dt - timedelta(days=_INCREMENTAL_LOOKBACK_DAYS)
+    start_str = start_dt.isoformat()
 
     update_ts = datetime.now().isoformat()
     rows: list[tuple] = []
@@ -243,13 +257,13 @@ def process_date(date_str: str) -> None:
         if meta.get("source") not in ("FRED", "Yahoo", "CBOE"):
             continue
         try:
-            data = fetch_signal(signal_id, meta, date_str, date_str)
+            data = fetch_signal(signal_id, meta, start_str, date_str)
             rows.extend(_rows_from_data(data, signal_id, update_ts))
         except Exception as e:
-            log.error("Unexpected error fetching signal %s on %s: %s", signal_id, date_str, e)
+            log.error("Unexpected error fetching signal %s: %s", signal_id, e)
 
     inserted = _bulk_insert(rows)
-    log.info("Inserted %d signal values for %s", inserted, date_str)
+    log.info("Inserted %d signal values up to %s", inserted, date_str)
 
 
 def backfill_signals() -> None:

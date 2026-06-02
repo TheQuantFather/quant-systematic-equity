@@ -48,6 +48,7 @@ TIMEOUTS: dict[str, int] = {
     "returns":   3600,   # 1h — yfinance bulk pull
     "svr":       1800,   # 30m — FINRA short volume incremental
     "filings":   3600,   # 1h — EDGAR index + per-company fetches
+    "macro":      300,   # 5m  — FRED/Yahoo: 8 series, 3 retries each
     "factors":   2700,   # 45m
     "models":     900,   # 15m
     "risk":      2700,   # 45m
@@ -191,6 +192,8 @@ def main() -> None:
                         help="Skip FINRA SVR update")
     parser.add_argument("--skip-filings",   action="store_true",
                         help="Skip EDGAR filings (downstream runs against existing DB)")
+    parser.add_argument("--skip-macro",     action="store_true",
+                        help="Skip macro signal update (e.g. FRED is down)")
 
     args = parser.parse_args()
 
@@ -233,6 +236,13 @@ def main() -> None:
         results["filings"] = True
     else:
         step("filings", "update_constituents.py")
+
+    # Macro signals are independent of the rest of the pipeline — FRED/Yahoo only.
+    if args.skip_macro:
+        log.info("SKIP    macro (--skip-macro)")
+        results["macro"] = True
+    else:
+        step("macro", "create_macro_signals.py", "--date", snap_date)
 
     # ── Weekly rebuild ─────────────────────────────────────────────────────
     if run_weekly:

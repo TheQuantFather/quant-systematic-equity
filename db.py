@@ -204,7 +204,8 @@ def get_constituents_for_security(security_id: str) -> pd.DataFrame:
 
     with get_db(CONSTITUENTS_DB) as conn:
         df = pd.read_sql(
-            f"SELECT constituent_id, constituent_value, fiscal_year, fiscal_period, report_date "
+            f"SELECT constituent_id, constituent_value, fiscal_year, fiscal_period, "
+            f"report_date, publish_date "
             f"FROM constituents WHERE security_id IN ({placeholders})",
             conn, params=ids,
         )
@@ -212,7 +213,71 @@ def get_constituents_for_security(security_id: str) -> pd.DataFrame:
     df = df.merge(const_meta, on="constituent_id", how="left")
     df["constituent_value"] = pd.to_numeric(df["constituent_value"], errors="coerce")
     df["fiscal_year"] = pd.to_numeric(df["fiscal_year"], errors="coerce").astype("Int64")
-    df["report_date"] = pd.to_datetime(df["report_date"], errors="coerce")
+    df["report_date"]  = pd.to_datetime(df["report_date"],  errors="coerce")
+    df["publish_date"] = pd.to_datetime(df["publish_date"], errors="coerce")
+
+    # Deduplicate: for the same (fiscal_year, fiscal_period, constituent_id), keep the
+    # row with the latest publish_date.  EDGAR rows are generally more recent than SimFin
+    # for overlapping periods, so this naturally prefers EDGAR data.
+    df = (
+        df.sort_values("publish_date", ascending=True)
+          .drop_duplicates(subset=["constituent_id", "fiscal_year", "fiscal_period"],
+                           keep="last")
+    )
+
+    # Derive Q4 = FY − Q1 − Q2 − Q3 for income statement and cash flow concepts where
+    # Q4 is absent.  Without this, the Deep Dive rolling LTM window hits a NaN at every
+    # Q4 position (EDGAR only has FY annual, not a separate Q4 10-Q) and the LTM chart
+    # breaks for any metric that isn't also provided by SimFin for Q4.
+    flow_stmts = {"Income Statement", "Cash Flow Statement"}
+    flow_df = df[df["statement_type"].isin(flow_stmts)].copy()
+    if not flow_df.empty:
+        fy_vals = (
+            flow_df[flow_df["fiscal_period"] == "FY"]
+            .set_index(["constituent_id", "fiscal_year"])["constituent_value"]
+        )
+        q_sums = (
+            flow_df[flow_df["fiscal_period"].isin(["Q1", "Q2", "Q3"])]
+            .groupby(["constituent_id", "fiscal_year"])["constituent_value"]
+            .sum()
+        )
+        q4_rows = []
+        for (cid, fy), fy_val in fy_vals.items():
+            if pd.isna(fy_val):
+                continue
+            q_sum = q_sums.get((cid, fy))
+            if q_sum is None or pd.isna(q_sum):
+                continue
+            # Skip if Q4 already exists
+            existing_q4 = df[
+                (df["constituent_id"] == cid) &
+                (df["fiscal_year"] == fy) &
+                (df["fiscal_period"] == "Q4")
+            ]
+            if not existing_q4.empty:
+                continue
+            # Only derive if all 3 quarterly summands are present
+            n_quarters = flow_df[
+                (flow_df["constituent_id"] == cid) &
+                (flow_df["fiscal_year"] == fy) &
+                (flow_df["fiscal_period"].isin(["Q1", "Q2", "Q3"]))
+            ]["fiscal_period"].nunique()
+            if n_quarters < 3:
+                continue
+            meta = const_meta[const_meta["constituent_id"] == cid].iloc[0] if len(const_meta[const_meta["constituent_id"] == cid]) else None
+            q4_rows.append({
+                "constituent_id":    cid,
+                "constituent_value": float(fy_val) - float(q_sum),
+                "fiscal_year":       fy,
+                "fiscal_period":     "Q4",
+                "report_date":       pd.NaT,
+                "publish_date":      pd.NaT,
+                "constituent_name":  meta["constituent_name"] if meta is not None else None,
+                "statement_type":    meta["statement_type"]   if meta is not None else None,
+            })
+        if q4_rows:
+            df = pd.concat([df, pd.DataFrame(q4_rows)], ignore_index=True)
+
     df = df.sort_values(["statement_type", "constituent_name", "fiscal_year", "fiscal_period"])
     return df
 
