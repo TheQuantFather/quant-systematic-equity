@@ -71,7 +71,7 @@ def build_strategies(wb):
     ]
     data = [
         # id               name                       active  benchmark                  alpha    a_date       r_date       solver     objective           universe         description
-        ["core_active",    "Core Active",             "TRUE", "MSCI_USA_2026_05_07.csv", "ALP001","2026-04-01","2026-04-01","CLARABEL","maximize_alpha",   "benchmark_only","Benchmark-aware. Max 4% active risk vs MSCI USA. Composite alpha."],
+        ["core_active",    "Core Active",             "TRUE", "MSCI_USA_2026_05_07.csv", "ALP001","2026-04-01","2026-04-01","MOSEK","maximize_alpha",   "benchmark_only","Live-sized core active portfolio: benchmark investable universe, 55-60 names, whole-share sizing for a 35k USD account, and 5% TE."],
         ["core_active_strict","Core Active (Strict)", "TRUE", "MSCI_USA_2026_05_07.csv", "ALP001","2026-04-01","2026-04-01","CLARABEL","maximize_alpha",   "benchmark_only","Tighter benchmark-aware. Max 2% active risk, ±1% per stock and sector."],
         ["abs_return",     "Absolute Return",         "TRUE", "MSCI_USA_2026_05_07.csv", "ALP001","2026-04-01","2026-04-01","CLARABEL","maximize_sharpe",  "universe",      "Maximize Sharpe. Equal sector weight ±1%, max 5% per stock, 18% vol cap."],
         ["min_variance",   "Minimum Variance",        "TRUE", "MSCI_USA_2026_05_07.csv", "ALP001","2026-04-01","2026-04-01","CLARABEL","minimize_variance","universe",      "Pure risk minimisation — no alpha signal. Capital preservation mandate."],
@@ -102,10 +102,30 @@ def build_constraints(wb):
         # ── core_active ──────────────────────────────────────────────────────
         ["core_active", "long_only",                   "TRUE", "TRUE",  "No short positions"],
         ["core_active", "fully_invested",              "TRUE", "TRUE",  "Weights sum to 1"],
-        ["core_active", "max_active_risk",             "0.04", "TRUE",  "Max annual tracking error (4%)"],
-        ["core_active", "max_stock_active_weight",     "0.02", "TRUE",  "Max ±2% active weight per stock"],
-        ["core_active", "max_sector_active_weight",    "0.02", "TRUE",  "Max ±2% active weight per GICS sector"],
-        ["core_active", "max_industry_active_weight",  "0.02", "TRUE",  "Max ±2% active weight per industry"],
+        ["core_active", "max_active_risk",             "0.05", "TRUE",  "Max annual tracking error 5%"],
+        ["core_active", "max_stock_active_weight",     "0.05", "TRUE",  "Max ±5% active weight per stock; TE remains binding"],
+        ["core_active", "max_sector_active_weight",    "0.03", "FALSE", "Disabled while testing whole-share live portfolio feasibility"],
+        ["core_active", "max_industry_active_weight",  "0.03", "FALSE", "Disabled while testing whole-share live portfolio feasibility"],
+        ["core_active", "min_positions",              "55",   "TRUE",  "Minimum 55 securities for lower tracking error with whole-share sizing"],
+        ["core_active", "max_positions",              "60",   "TRUE",  "Maximum 60 securities for 30k live-sized whole-share portfolio"],
+        ["core_active", "min_position_if_held",        "0.01", "TRUE",  "Minimum 1% if selected; 400 EUR trading minimum handled at broker sizing"],
+        ["core_active", "portfolio_value_usd",         "35000", "TRUE", "Approximate live/paper account value for whole-share lot-size optimisation"],
+        ["core_active", "max_cash_weight",             "0.005", "TRUE", "Max 0.5% residual cash in whole-share optimisation"],
+        ["core_active", "lot_size_max_overweight",     "0.03",  "TRUE", "Allow up to 3% extra per-name weight from whole-share lot rounding"],
+        ["core_active", "use_lp_prescreen",            "FALSE", "FALSE", "Disabled for live lot-size optimisation; full universe is cleaner while exploratory"],
+        ["core_active", "lp_prescreen_multiplier",     "10",    "FALSE", "Unused while pre-screen is disabled"],
+        ["core_active", "excluded_tickers",            "AL",    "TRUE",  "Exclude untradable/delisted tickers from live-sized optimisation"],
+        ["core_active", "large_cap_min_market_cap",    "10000000000", "TRUE", "Large cap threshold: >= $10B"],
+        ["core_active", "mid_cap_min_market_cap",      "2000000000",  "TRUE", "Mid cap threshold: >= $2B and < $10B"],
+        ["core_active", "max_large_cap_position",      "0.05", "TRUE",  "Max 5% per large-cap stock"],
+        ["core_active", "min_large_cap_weight",        "0.80", "TRUE",  "Benchmark-only live sizing: min 80% large-cap exposure"],
+        ["core_active", "max_large_cap_weight",        "1.00", "TRUE",  "Benchmark-only live sizing: allow up to 100% large-cap exposure"],
+        ["core_active", "max_mid_cap_position",        "0.04", "TRUE",  "Max 4% per mid-cap stock"],
+        ["core_active", "min_mid_cap_weight",          "0.00", "FALSE", "No mid-cap floor for benchmark-only live sizing"],
+        ["core_active", "max_mid_cap_weight",          "0.15", "TRUE",  "Benchmark-only live sizing: max 15% mid-cap exposure"],
+        ["core_active", "max_small_cap_position",      "0.03", "TRUE",  "Max 3% per small-cap or missing-cap stock"],
+        ["core_active", "min_small_cap_weight",        "0.00", "FALSE", "No small-cap floor for benchmark-only live sizing"],
+        ["core_active", "max_small_cap_weight",        "0.10", "TRUE",  "Benchmark-only live sizing: max 10% small-cap exposure"],
 
         # ── core_active_strict ───────────────────────────────────────────────
         ["core_active_strict", "long_only",                  "TRUE", "TRUE",  "No short positions"],

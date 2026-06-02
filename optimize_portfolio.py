@@ -67,7 +67,8 @@ def _ensure_mosek_symlink() -> None:
 _ensure_mosek_symlink()
 
 from config import (
-    OUTPUT_DIR, PARAMS_FILE, UNIVERSE_DB, MODELS_DB, RISK_DB, BENCHMARK_DIR,
+    OUTPUT_DIR, PARAMS_FILE, UNIVERSE_DB, CONSTITUENTS_DB, RETURNS_DB,
+    MODELS_DB, RISK_DB, BENCHMARK_DIR,
 )
 from utils import get_db, get_logger
 
@@ -153,10 +154,100 @@ def load_universe_metadata() -> pd.DataFrame:
     with get_db(UNIVERSE_DB) as conn:
         df = pd.read_sql(
             "SELECT isin, ticker, company_name, gics_sector, simfin_industry "
+            "       , simfin_id "
             "FROM companies WHERE isin IS NOT NULL",
             conn,
         )
     return df
+
+
+def load_latest_market_caps(meta_df: pd.DataFrame, investable: list[str]) -> dict[str, float]:
+    """Return latest raw-close × latest reported shares outstanding by ISIN."""
+    if not investable:
+        return {}
+
+    ph = ",".join("?" * len(investable))
+    with get_db(RETURNS_DB) as conn:
+        px = pd.read_sql(
+            f"""
+            SELECT r.isin, r.close
+            FROM returns r
+            JOIN (
+                SELECT isin, MAX(date) AS max_date
+                FROM returns
+                WHERE isin IN ({ph}) AND close IS NOT NULL AND close > 0
+                GROUP BY isin
+            ) latest
+              ON latest.isin = r.isin AND latest.max_date = r.date
+            """,
+            conn,
+            params=investable,
+        )
+    if px.empty:
+        return {}
+
+    meta = meta_df[meta_df["isin"].isin(investable)][["isin", "simfin_id"]].copy()
+    meta["simfin_key"] = meta["simfin_id"].dropna().astype(int).astype(str)
+    security_ids = sorted(set(meta["isin"]).union(set(meta["simfin_key"].dropna())))
+    if not security_ids:
+        return {}
+
+    share_ids = ("B3C4D5E6", "IIG88888")  # Shares (Basic), SimFin legacy fallback
+    sid_ph = ",".join("?" * len(security_ids))
+    cid_ph = ",".join("?" * len(share_ids))
+    with get_db(CONSTITUENTS_DB) as conn:
+        shares_raw = pd.read_sql(
+            f"""
+            SELECT security_id, constituent_value, publish_date
+            FROM constituents
+            WHERE security_id IN ({sid_ph})
+              AND constituent_id IN ({cid_ph})
+              AND constituent_value IS NOT NULL
+              AND constituent_value > 0
+            ORDER BY security_id, publish_date
+            """,
+            conn,
+            params=security_ids + list(share_ids),
+        )
+    if shares_raw.empty:
+        return {}
+
+    latest_shares = shares_raw.groupby("security_id", as_index=False).tail(1)
+    shares_by_sid = dict(zip(latest_shares["security_id"], latest_shares["constituent_value"]))
+    meta["shares"] = meta.apply(
+        lambda r: shares_by_sid.get(r["isin"]) or shares_by_sid.get(r["simfin_key"]),
+        axis=1,
+    )
+    out = meta.merge(px, on="isin", how="inner").dropna(subset=["shares", "close"])
+    out["market_cap"] = out["shares"].astype(float) * out["close"].astype(float)
+    return dict(zip(out["isin"], out["market_cap"]))
+
+
+def load_latest_prices(investable: list[str]) -> dict[str, float]:
+    """Return latest positive close by ISIN."""
+    if not investable:
+        return {}
+
+    ph = ",".join("?" * len(investable))
+    with get_db(RETURNS_DB) as conn:
+        px = pd.read_sql(
+            f"""
+            SELECT r.isin, r.close
+            FROM returns r
+            JOIN (
+                SELECT isin, MAX(date) AS max_date
+                FROM returns
+                WHERE isin IN ({ph}) AND close IS NOT NULL AND close > 0
+                GROUP BY isin
+            ) latest
+              ON latest.isin = r.isin AND latest.max_date = r.date
+            """,
+            conn,
+            params=investable,
+        )
+    if px.empty:
+        return {}
+    return dict(zip(px["isin"], px["close"].astype(float)))
 
 
 def map_tickers_to_isins(tickers: list[str]) -> dict[str, str]:
@@ -299,8 +390,32 @@ def _variance(w: np.ndarray, Sigma, L: np.ndarray) -> float:
 
 def _build_investable(strategy, bm_df, risk_isins, risk_isin_idx):
     if strategy["investable_universe"] == "benchmark_only":
-        return sorted({i for i in bm_df["isin"] if i in risk_isin_idx})
-    return sorted(set(risk_isins))
+        investable = sorted({i for i in bm_df["isin"] if i in risk_isin_idx})
+    else:
+        investable = sorted(set(risk_isins))
+
+    c = strategy.get("constraints", {})
+    excluded_isins = {
+        s.strip() for s in str(c.get("excluded_isins", "") or "").split("|")
+        if s.strip()
+    }
+    excluded_tickers = {
+        s.strip().upper() for s in str(c.get("excluded_tickers", "") or "").split("|")
+        if s.strip()
+    }
+    if excluded_tickers:
+        meta_df = load_universe_metadata()
+        ticker_excluded_isins = set(
+            meta_df.loc[
+                meta_df["ticker"].str.upper().isin(excluded_tickers),
+                "isin",
+            ]
+        )
+        excluded_isins.update(ticker_excluded_isins)
+
+    if excluded_isins:
+        investable = [isin for isin in investable if isin not in excluded_isins]
+    return investable
 
 
 def _sector_industry_matrices(investable, gics_df):
@@ -330,6 +445,81 @@ def _sector_industry_matrices(investable, gics_df):
     return sectors, industries, B_sector, B_ind, _sector, _industry
 
 
+def _market_cap_bucket_matrices(
+    investable: list[str],
+    market_caps: dict[str, float],
+    c: dict,
+) -> tuple[list[str], np.ndarray, dict[str, str]]:
+    """Build large/mid/small bucket membership from dynamic market caps."""
+    large_min = float(c.get("large_cap_min_market_cap", 10_000_000_000.0))
+    mid_min = float(c.get("mid_cap_min_market_cap", 2_000_000_000.0))
+    buckets = ["large", "mid", "small"]
+    bucket_by_isin: dict[str, str] = {}
+
+    for isin in investable:
+        mcap = market_caps.get(isin)
+        if mcap is None or not np.isfinite(mcap):
+            bucket = "small"
+        elif mcap >= large_min:
+            bucket = "large"
+        elif mcap >= mid_min:
+            bucket = "mid"
+        else:
+            bucket = "small"
+        bucket_by_isin[isin] = bucket
+
+    B_cap = np.zeros((len(buckets), len(investable)))
+    for j, isin in enumerate(investable):
+        B_cap[buckets.index(bucket_by_isin[isin]), j] = 1.0
+    return buckets, B_cap, bucket_by_isin
+
+
+def _add_market_cap_constraints(cvx, var, scale, buckets, B_cap, c):
+    """Apply absolute single-name and total weight caps by market-cap bucket."""
+    cap_cfg = {
+        "large": (
+            c.get("max_large_cap_position", None),
+            c.get("min_large_cap_weight", None),
+            c.get("max_large_cap_weight", None),
+        ),
+        "mid": (
+            c.get("max_mid_cap_position", None),
+            c.get("min_mid_cap_weight", None),
+            c.get("max_mid_cap_weight", None),
+        ),
+        "small": (
+            c.get("max_small_cap_position", None),
+            c.get("min_small_cap_weight", None),
+            c.get("max_small_cap_weight", None),
+        ),
+    }
+
+    for bucket, (max_pos, min_weight, max_weight) in cap_cfg.items():
+        if bucket not in buckets:
+            continue
+        mask = B_cap[buckets.index(bucket)].astype(bool)
+        if max_pos is not None and mask.any():
+            cvx.append(var[mask] <= float(max_pos) * scale)
+        if min_weight is not None:
+            cvx.append(B_cap[buckets.index(bucket)] @ var >= float(min_weight) * scale)
+        if max_weight is not None:
+            cvx.append(B_cap[buckets.index(bucket)] @ var <= float(max_weight) * scale)
+
+
+def _lot_size_inputs(investable: list[str], c: dict) -> tuple[np.ndarray | None, float | None]:
+    """Latest prices and configured account value for optional whole-share optimization."""
+    portfolio_value = c.get("portfolio_value_usd")
+    if portfolio_value is None:
+        return None, None
+
+    prices_lookup = load_latest_prices(investable)
+    prices = np.array([prices_lookup.get(isin, np.nan) for isin in investable], dtype=float)
+    if np.isnan(prices).any() or np.any(prices <= 0):
+        bad = int(np.isnan(prices).sum() + np.sum(prices <= 0))
+        raise RuntimeError(f"Missing latest positive prices for {bad} securities.")
+    return prices, float(portfolio_value)
+
+
 def _lp_prescreen(
     strategy: dict,
     investable: list[str],
@@ -341,6 +531,8 @@ def _lp_prescreen(
     industries: list,
     B_sector: np.ndarray,
     B_ind: np.ndarray,
+    cap_buckets: list,
+    B_cap: np.ndarray,
     n_keep: int,
 ) -> list[int] | None:
     """
@@ -348,13 +540,18 @@ def _lp_prescreen(
     the top n_keep stocks by weight. Used to build a small, constraint-aware
     candidate set before solving the full MIP.
     """
-    c_relax = {k: v for k, v in strategy["constraints"].items()
-               if k not in ("max_positions", "min_position_if_held")}
+    c_relax = {
+        k: v for k, v in strategy["constraints"].items()
+        if k not in (
+            "max_positions", "min_positions", "min_position_if_held",
+            "portfolio_value_usd", "max_cash_weight", "lot_size_max_overweight",
+        )
+    }
     s_relax = {**strategy, "constraints": c_relax, "solver": "CLARABEL"}
     try:
         lp_weights, _ = _optimize_alpha(
             s_relax, investable, alpha, b, Sigma, L,
-            sectors, industries, B_sector, B_ind)
+            sectors, industries, B_sector, B_ind, cap_buckets, B_cap)
         keep_idx = np.argsort(-lp_weights)[:n_keep]
         return sorted(keep_idx.tolist())
     except Exception:
@@ -421,7 +618,12 @@ _SIGMA_FLOOR = 0.05
 
 
 def _has_integer_constraints(c: dict) -> bool:
-    return c.get("max_positions") is not None or c.get("min_position_if_held") is not None
+    return (
+        c.get("max_positions") is not None
+        or c.get("min_positions") is not None
+        or c.get("min_position_if_held") is not None
+        or c.get("portfolio_value_usd") is not None
+    )
 
 
 def _ensure_mosek(strategy: dict) -> None:
@@ -435,30 +637,61 @@ def _ensure_mosek(strategy: dict) -> None:
 # ── Objective 1: maximize_alpha (benchmark-aware) ─────────────────────────────
 
 def _optimize_alpha(strategy, investable, alpha, b, Sigma, L,
-                    sectors, industries, B_sector, B_ind,
+                    sectors, industries, B_sector, B_ind, cap_buckets, B_cap,
                     prev_weights_arr: np.ndarray | None = None,
                     max_turnover: float | None = None):
     c = strategy["constraints"]
     N = len(investable)
+    prices, portfolio_value = _lot_size_inputs(investable, c)
+    cash_buffer = float(c.get("max_cash_weight", 0.002)) if portfolio_value is not None else None
 
     w  = cp.Variable(N, name="weights")
     aw = w - b
 
-    cvx = [cp.sum(w) == 1.0, w >= 0]
+    if portfolio_value is not None:
+        cvx = [cp.sum(w) <= 1.0, cp.sum(w) >= 1.0 - cash_buffer, w >= 0]
+    else:
+        cvx = [cp.sum(w) == 1.0, w >= 0]
+    max_saw = c.get("max_stock_active_weight", 0.02)
 
     # ── Integer: cardinality + minimum position ────────────────────────────
     max_pos_n = c.get("max_positions")
+    min_pos_n = c.get("min_positions")
     min_held  = c.get("min_position_if_held")
     z = None
-    if max_pos_n is not None or min_held is not None:
+    q = None
+    if max_pos_n is not None or min_pos_n is not None or min_held is not None:
         z = cp.Variable(N, boolean=True)
-        cvx.append(cp.sum(z) <= int(max_pos_n or N))
+        if max_pos_n is not None:
+            cvx.append(cp.sum(z) <= int(max_pos_n))
+        if min_pos_n is not None:
+            cvx.append(cp.sum(z) >= int(min_pos_n))
         cvx.append(w <= z)                      # w_i > 0 requires z_i = 1
         if min_held is not None:
             cvx.append(w >= min_held * z)       # if held, at least min_held
 
+    if prices is not None and portfolio_value is not None:
+        q = cp.Variable(N, integer=True, name="shares")
+        max_overweight = float(c.get("lot_size_max_overweight", 0.02))
+        share_weights = cp.multiply(prices / portfolio_value, q)
+        cvx += [
+            q >= 0,
+            prices @ q <= portfolio_value,
+            w == share_weights,
+            share_weights <= b + max_saw + max_overweight,
+        ]
+        if z is not None:
+            max_shares = np.floor(
+                np.maximum(b + max_saw + max_overweight, max_overweight)
+                * portfolio_value / prices
+            ).astype(int)
+            max_shares = np.maximum(max_shares, 1)
+            cvx += [
+                q <= cp.multiply(max_shares, z),
+                q >= z,
+            ]
+
     # Active-weight constraints
-    max_saw = c.get("max_stock_active_weight", 0.02)
     cvx += [aw <= max_saw, aw >= -max_saw]
 
     max_ar = c.get("max_active_risk", 0.04)
@@ -478,6 +711,7 @@ def _optimize_alpha(strategy, investable, alpha, b, Sigma, L,
 
     # Absolute sector constraints (excluded_sectors, min/max_sector_weight)
     _add_sector_constraints(cvx, w, 1.0, sectors, B_sector, c)
+    _add_market_cap_constraints(cvx, w, 1.0, cap_buckets, B_cap, c)
 
     # Two-way turnover constraint: sum(|w - w_prev|) ≤ max_turnover
     if prev_weights_arr is not None and max_turnover is not None:
@@ -489,7 +723,8 @@ def _optimize_alpha(strategy, investable, alpha, b, Sigma, L,
     weights = np.array(w.value).clip(0)
     if z is not None:
         weights *= (np.array(z.value) > 0.5).astype(float)
-    weights /= weights.sum()
+    if portfolio_value is None:
+        weights /= weights.sum()
 
     act         = weights - b
     active_risk = float(np.sqrt(_variance(act, Sigma, L)))
@@ -510,7 +745,7 @@ def _optimize_alpha(strategy, investable, alpha, b, Sigma, L,
 # ── Objective 2: maximize_sharpe (Charnes-Cooper) ────────────────────────────
 
 def _optimize_sharpe(strategy, investable, alpha, Sigma, L,
-                     sectors, industries, B_sector, B_ind,
+                     sectors, industries, B_sector, B_ind, cap_buckets, B_cap,
                      prev_weights_arr: np.ndarray | None = None,
                      max_turnover: float | None = None):
     """
@@ -535,12 +770,16 @@ def _optimize_sharpe(strategy, investable, alpha, Sigma, L,
 
     # ── Integer: cardinality + minimum position ────────────────────────────
     max_pos_n = c.get("max_positions")
+    min_pos_n = c.get("min_positions")
     min_held  = c.get("min_position_if_held")
     z = None
-    if max_pos_n is not None or min_held is not None:
+    if max_pos_n is not None or min_pos_n is not None or min_held is not None:
         z = cp.Variable(N, boolean=True)
         big_M = max_pos / _SIGMA_FLOOR          # upper bound on y_i when held
-        cvx.append(cp.sum(z) <= int(max_pos_n or N))
+        if max_pos_n is not None:
+            cvx.append(cp.sum(z) <= int(max_pos_n))
+        if min_pos_n is not None:
+            cvx.append(cp.sum(z) >= int(min_pos_n))
         cvx.append(y <= big_M * z)              # y_i > 0 requires z_i = 1
         if min_held is not None:
             # y_i >= min_held * t * z_i  linearised via big-M on (1-z_i):
@@ -550,6 +789,7 @@ def _optimize_sharpe(strategy, investable, alpha, Sigma, L,
 
     # Sector constraints (y-space: scale by t)
     _add_sector_constraints(cvx, y, t, sectors, B_sector, c)
+    _add_market_cap_constraints(cvx, y, t, cap_buckets, B_cap, c)
 
     # Industry cap
     max_ind = c.get("max_industry_weight", None)
@@ -595,7 +835,7 @@ def _optimize_sharpe(strategy, investable, alpha, Sigma, L,
 # ── Objective 3: minimize_variance ───────────────────────────────────────────
 
 def _optimize_min_variance(strategy, investable, b, Sigma, L,
-                           sectors, industries, B_sector, B_ind,
+                           sectors, industries, B_sector, B_ind, cap_buckets, B_cap,
                            prev_weights_arr: np.ndarray | None = None,
                            max_turnover: float | None = None):
     c = strategy["constraints"]
@@ -609,11 +849,15 @@ def _optimize_min_variance(strategy, investable, b, Sigma, L,
 
     # ── Integer: cardinality + minimum position ────────────────────────────
     max_pos_n = c.get("max_positions")
+    min_pos_n = c.get("min_positions")
     min_held  = c.get("min_position_if_held")
     z = None
-    if max_pos_n is not None or min_held is not None:
+    if max_pos_n is not None or min_pos_n is not None or min_held is not None:
         z = cp.Variable(N, boolean=True)
-        cvx.append(cp.sum(z) <= int(max_pos_n or N))
+        if max_pos_n is not None:
+            cvx.append(cp.sum(z) <= int(max_pos_n))
+        if min_pos_n is not None:
+            cvx.append(cp.sum(z) >= int(min_pos_n))
         cvx.append(w <= max_pos * z)            # zero-out + upper bound combined
         if min_held is not None:
             cvx.append(w >= min_held * z)
@@ -622,6 +866,7 @@ def _optimize_min_variance(strategy, investable, b, Sigma, L,
 
     # Sector constraints (w-space)
     _add_sector_constraints(cvx, w, 1.0, sectors, B_sector, c)
+    _add_market_cap_constraints(cvx, w, 1.0, cap_buckets, B_cap, c)
 
     # Industry cap
     max_ind = c.get("max_industry_weight", None)
@@ -793,10 +1038,17 @@ def optimize_for_backtest(
 
         sectors, industries, B_sector, B_ind, _sector_fn, _industry_fn = \
             _sector_industry_matrices(investable, gics_df)
+        market_caps = load_latest_market_caps(meta_df, investable)
+        cap_buckets, B_cap, _bucket_by_isin = _market_cap_bucket_matrices(
+            investable, market_caps, constraints
+        )
 
         # Integer constraints (max_positions, min_position_if_held) require a MIP-capable
         # solver (MOSEK). Strip them when CLARABEL is selected; pass through for MOSEK.
-        _INTEGER_CONSTRAINT_KEYS = ("max_positions", "min_position_if_held")
+        _INTEGER_CONSTRAINT_KEYS = (
+            "max_positions", "min_positions", "min_position_if_held",
+            "portfolio_value_usd", "max_cash_weight", "lot_size_max_overweight",
+        )
         has_integer = any(constraints.get(k) is not None for k in _INTEGER_CONSTRAINT_KEYS)
         if solver.upper() != "MOSEK" and has_integer:
             relaxed_integer       = True
@@ -820,7 +1072,7 @@ def optimize_for_backtest(
             n_cand = int(max_pos_n)
             lp_idx = _lp_prescreen(
                 strategy, investable, alpha_arr, b, Sigma, L,
-                sectors, industries, B_sector, B_ind, n_cand,
+                sectors, industries, B_sector, B_ind, cap_buckets, B_cap, n_cand,
             )
             if lp_idx is not None:
                 lp_arr      = np.array(lp_idx)
@@ -828,6 +1080,8 @@ def optimize_for_backtest(
                 b_full_pre        = b.copy()
                 B_sector_full_pre = B_sector.copy()
                 sectors_full_pre  = list(sectors)
+                B_ind_full_pre    = B_ind.copy()
+                industries_full_pre = list(industries)
                 investable  = [investable[i] for i in lp_idx]
                 alpha_arr   = alpha_arr[lp_arr]
                 b           = b[lp_arr]
@@ -843,6 +1097,10 @@ def optimize_for_backtest(
                         Sigma = None
                 sectors, industries, B_sector, B_ind, _sector_fn, _industry_fn = \
                     _sector_industry_matrices(investable, gics_df)
+                market_caps = load_latest_market_caps(meta_df, investable)
+                cap_buckets, B_cap, _bucket_by_isin = _market_cap_bucket_matrices(
+                    investable, market_caps, effective_constraints
+                )
                 # Rescale b so each sector's benchmark weight matches the full-universe
                 # level. Without this, b sums to ~0.4 (the weight of the 100 selected
                 # stocks), making sum(w-b) ≈ 0.6 and the TE constraint instantly infeasible.
@@ -854,6 +1112,14 @@ def optimize_for_backtest(
                     incl_sec_w = float(B_sector[s_idx] @ b)
                     if incl_sec_w > 1e-10 and full_sec_w > 0:
                         b[B_sector[s_idx].astype(bool)] *= full_sec_w / incl_sec_w
+                for g_idx, industry in enumerate(industries):
+                    if industry not in industries_full_pre:
+                        continue
+                    g_full     = industries_full_pre.index(industry)
+                    full_ind_w = float(B_ind_full_pre[g_full] @ b_full_pre)
+                    incl_ind_w = float(B_ind[g_idx] @ b)
+                    if incl_ind_w > 1e-10 and full_ind_w > 0:
+                        b[B_ind[g_idx].astype(bool)] *= full_ind_w / incl_ind_w
                 log.info("MIP pre-screen: %d → %d candidates", len(lp_idx) + (N - n_cand), len(investable))
 
         # Run optimizer with stdout suppressed (internal prints not relevant in backtest)
@@ -862,19 +1128,19 @@ def optimize_for_backtest(
             if objective == "maximize_sharpe":
                 weights, extra = _optimize_sharpe(
                     strategy, investable, alpha_arr, Sigma, L,
-                    sectors, industries, B_sector, B_ind,
+                    sectors, industries, B_sector, B_ind, cap_buckets, B_cap,
                     prev_weights_arr=prev_w_arr, max_turnover=max_turnover,
                 )
             elif objective == "minimize_variance":
                 weights, extra = _optimize_min_variance(
                     strategy, investable, b, Sigma, L,
-                    sectors, industries, B_sector, B_ind,
+                    sectors, industries, B_sector, B_ind, cap_buckets, B_cap,
                     prev_weights_arr=prev_w_arr, max_turnover=max_turnover,
                 )
             else:  # maximize_alpha
                 weights, extra = _optimize_alpha(
                     strategy, investable, alpha_arr, b, Sigma, L,
-                    sectors, industries, B_sector, B_ind,
+                    sectors, industries, B_sector, B_ind, cap_buckets, B_cap,
                     prev_weights_arr=prev_w_arr, max_turnover=max_turnover,
                 )
 
@@ -980,6 +1246,17 @@ def run_optimization(strategy: dict) -> tuple[pd.DataFrame, dict]:
 
     sectors, industries, B_sector, B_ind, _sector_fn, _industry_fn = \
         _sector_industry_matrices(investable, gics_df)
+    market_caps = load_latest_market_caps(meta_df, investable)
+    cap_buckets, B_cap, bucket_by_isin = _market_cap_bucket_matrices(
+        investable, market_caps, c_pre
+    )
+    log.info(
+        "Market caps: %d/%d available | buckets large=%d mid=%d small=%d",
+        len(market_caps), len(investable),
+        sum(1 for bkt in bucket_by_isin.values() if bkt == "large"),
+        sum(1 for bkt in bucket_by_isin.values() if bkt == "mid"),
+        sum(1 for bkt in bucket_by_isin.values() if bkt == "small"),
+    )
 
     # LP-guided pre-screen for MIP strategies.
     # Solve the continuous relaxation first (CLARABEL, fast), keep the top
@@ -989,12 +1266,15 @@ def run_optimization(strategy: dict) -> tuple[pd.DataFrame, dict]:
     # 1× window includes all of them while keeping the MIP size small.
     max_pos_n = c_pre.get("max_positions")
     if (max_pos_n is not None and len(investable) > int(max_pos_n)
-            and objective == "maximize_alpha"):
-        n_cand = int(max_pos_n)
+            and objective == "maximize_alpha"
+            and c_pre.get("use_lp_prescreen", False)):
+        default_mult = 3 if c_pre.get("portfolio_value_usd") is not None else 1
+        prescreen_mult = int(c_pre.get("lp_prescreen_multiplier", default_mult))
+        n_cand = min(len(investable), int(max_pos_n) * max(1, prescreen_mult))
         log.info("LP pre-screen: relaxation → top %d candidates ...", n_cand)
         lp_idx = _lp_prescreen(
             strategy, investable, alpha, b, Sigma, L,
-            sectors, industries, B_sector, B_ind, n_cand)
+            sectors, industries, B_sector, B_ind, cap_buckets, B_cap, n_cand)
         if lp_idx is not None:
             lp_arr = np.array(lp_idx)
             # Save full-universe sector matrices before subsetting — needed to
@@ -1002,6 +1282,8 @@ def run_optimization(strategy: dict) -> tuple[pd.DataFrame, dict]:
             b_full_pre        = b.copy()
             B_sector_full_pre = B_sector.copy()
             sectors_full_pre  = list(sectors)
+            B_ind_full_pre    = B_ind.copy()
+            industries_full_pre = list(industries)
 
             investable  = [investable[i] for i in lp_idx]
             alpha       = alpha[lp_arr]
@@ -1015,6 +1297,10 @@ def run_optimization(strategy: dict) -> tuple[pd.DataFrame, dict]:
                     Sigma = None
             sectors, industries, B_sector, B_ind, _sector_fn, _industry_fn = \
                 _sector_industry_matrices(investable, gics_df)
+            market_caps = load_latest_market_caps(meta_df, investable)
+            cap_buckets, B_cap, bucket_by_isin = _market_cap_bucket_matrices(
+                investable, market_caps, c_pre
+            )
 
             # Dropped stocks still have benchmark weight, so the subsetted b
             # underestimates sector benchmark weights — the MIP sector constraint
@@ -1029,6 +1315,14 @@ def run_optimization(strategy: dict) -> tuple[pd.DataFrame, dict]:
                 incl_sec_w = float(B_sector[s_idx] @ b)
                 if incl_sec_w > 1e-10 and full_sec_w > 0:
                     b[B_sector[s_idx].astype(bool)] *= full_sec_w / incl_sec_w
+            for g_idx, industry in enumerate(industries):
+                if industry not in industries_full_pre:
+                    continue
+                g_full     = industries_full_pre.index(industry)
+                full_ind_w = float(B_ind_full_pre[g_full] @ b_full_pre)
+                incl_ind_w = float(B_ind[g_idx] @ b)
+                if incl_ind_w > 1e-10 and full_ind_w > 0:
+                    b[B_ind[g_idx].astype(bool)] *= full_ind_w / incl_ind_w
 
             N = len(investable)
             log.info("LP pre-screen done (%d candidates)", N)
@@ -1057,6 +1351,10 @@ def run_optimization(strategy: dict) -> tuple[pd.DataFrame, dict]:
                     Sigma = None
             sectors, industries, B_sector, B_ind, _sector_fn, _industry_fn = \
                 _sector_industry_matrices(investable, gics_df)
+            market_caps = load_latest_market_caps(meta_df, investable)
+            cap_buckets, B_cap, bucket_by_isin = _market_cap_bucket_matrices(
+                investable, market_caps, c_pre
+            )
             N = len(investable)
             log.info("MIP pre-screen (alpha): top %d candidates (max_positions=%s)", N, max_pos_n)
 
@@ -1066,15 +1364,15 @@ def run_optimization(strategy: dict) -> tuple[pd.DataFrame, dict]:
     if objective == "maximize_sharpe":
         weights, extra = _optimize_sharpe(
             strategy, investable, alpha, Sigma, L,
-            sectors, industries, B_sector, B_ind)
+            sectors, industries, B_sector, B_ind, cap_buckets, B_cap)
     elif objective == "minimize_variance":
         weights, extra = _optimize_min_variance(
             strategy, investable, b, Sigma, L,
-            sectors, industries, B_sector, B_ind)
+            sectors, industries, B_sector, B_ind, cap_buckets, B_cap)
     else:
         weights, extra = _optimize_alpha(
             strategy, investable, alpha, b, Sigma, L,
-            sectors, industries, B_sector, B_ind)
+            sectors, industries, B_sector, B_ind, cap_buckets, B_cap)
 
     # Build results DataFrame
     isin_to_ticker = dict(zip(meta_df["isin"], meta_df["ticker"]))
@@ -1088,6 +1386,9 @@ def run_optimization(strategy: dict) -> tuple[pd.DataFrame, dict]:
             "company_name":     isin_to_name.get(isin, ""),
             "gics_sector":      _sector_fn(isin),
             "industry":         _industry_fn(isin),
+            "market_cap":       round(float(market_caps.get(isin, np.nan)), 2)
+                                if market_caps.get(isin) is not None else np.nan,
+            "market_cap_bucket": bucket_by_isin.get(isin, "small"),
             "benchmark_weight": round(float(bm_display[j]), 6),
             "portfolio_weight": round(float(weights[j]), 6),
             "active_weight":    round(float(weights[j]) - float(bm_display[j]), 6),
