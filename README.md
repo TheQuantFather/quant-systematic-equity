@@ -88,9 +88,11 @@ python optimize_portfolio.py --list                   # list all strategies
 
 Snapshot dates are defined in a `snapshot_schedule` table (`universe.db`) and stored in `factors.db`'s `snapshot_dates` table — there is no hardcoded date list. The whole pipeline (`create_factors` → `create_models` → `create_risk` → `create_barra`) discovers the dates automatically, so adding or shifting snapshots is a single-table change. The grid is month-end monthly history with annual April-1 anchors (≥ 90-day lag after each December FY-end so all filers have reported).
 
-### Point-in-time
+### Point-in-time (no look-ahead bias)
 
-Each snapshot uses the most recent annual report with `publish_date ≤ snapshot_date`. Prices as of `snapshot_date`. EDGAR rows use `acceptance_datetime`; SimFin rows use SimFin's publish_date.
+Every snapshot is reconstructed as it would have been known on `snapshot_date` — a financial statement is only eligible once `publish_date ≤ snapshot_date` (EDGAR uses the filing's `acceptance_datetime`; SimFin uses SimFin's publish date), with a `fiscal_year_end + 90d` fallback when no filing date is available. Prices are taken as of `snapshot_date`, and the Russell 1000 membership used is the point-in-time constituent set for that date, not today's. Z-scores are computed cross-sectionally within each snapshot.
+
+This is what makes the **Backtester** trustworthy: each rebalance only ever sees data that had actually been published by that date, so historical strategy performance carries no forward-looking contamination.
 
 ### Factors (28+ total)
 
@@ -206,17 +208,14 @@ Re-run `optimize_portfolio.py` (or click **▶ Run Optimisation** in the app) to
 
 | Page | Description |
 |------|-------------|
-| Home | Universe summary, factor score distributions |
-| Universe | Company search and metadata |
-| Factors | Factor distributions, time series, peer comparisons |
-| Screener | Multi-factor screener with export |
-| Deep Dive | Single-stock factor attribution |
-| Themes | Sector heatmaps, opportunity sets |
-| Backtester | Historical factor backtest and strategy simulation |
-| Database | Raw database explorer (all tables) |
+| Home | Universe summary and factor/model overview |
+| Deep Dive | Single-stock factor & model attribution, fundamentals, peer comparison |
+| Backtester | Point-in-time strategy simulation — no look-ahead bias (see below) |
+| Database | Raw database explorer (all tables, read-only SQL) |
 | Portfolio | Strategy results: weights, sector/industry, factor tilts, risk attribution |
 | Risk Explorer | Barra / Ledoit-Wolf deep-dive: correlations, factor vols, stock decomposition |
 | Data Quality | Pipeline health: factor coverage, constituent fill rates, sync status across all DBs |
+| Macro | US macro signals — yields, spreads, commodities, economic indicators |
 
 ## Databases
 
