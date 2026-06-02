@@ -21,6 +21,7 @@ import numpy as np
 import pandas as pd
 from sklearn.covariance import LedoitWolf
 
+
 from config import (
     RETURNS_DB, UNIVERSE_DB, RISK_DB, FACTORS_DB,
     LW_LOOKBACK_DAYS as LOOKBACK_DAYS,

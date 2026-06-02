@@ -10,6 +10,7 @@ import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
+
 from config import PARAMS_FILE as OUT, MODELS_REF
 from utils import get_logger
 

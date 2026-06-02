@@ -5,6 +5,7 @@ import pandas as pd
 from pathlib import Path
 from datetime import datetime
 
+
 from config import (
     DATA_DIR, SIMFIN_DIR, CONSTITUENTS_DB, UNIVERSE_DB, CONSTITUENTS_REF, MACRO_DB,
 )

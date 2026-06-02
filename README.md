@@ -1,6 +1,8 @@
 # Systematic Equity Investment Framework
 
-A systematic quantitative investing framework covering ~994 US equities from the **iShares Russell 1000 ETF** universe. Includes 28+ factors across 9 models, a Barra-style factor risk model, and a CVXPY portfolio optimiser with 9 configurable strategies.
+A systematic quantitative investing framework covering ~994 US equities from the **iShares Russell 1000 ETF** universe. Includes 28+ factors across 11 models, a Barra-style factor risk model, and a CVXPY portfolio optimiser with configurable strategies.
+
+> **Note:** This is a public display mirror of a private working repository. It documents the full architecture, but some components are intentionally excluded — all generated data (the `data/` directory and its databases), live brokerage execution tooling, and a few private data-ingestion modules. As a result, certain files referenced below (e.g. `pipeline/update_constituents.py`) are not present here, and the pipeline is not runnable end-to-end from this repo alone. It is shared to illustrate design and methodology.
 
 ## Sample report
 
@@ -10,22 +12,22 @@ A systematic quantitative investing framework covering ~994 US equities from the
 
 ```
 iShares N-PORT-P (EDGAR)
-  └─ create_universe.py      → universe.db           (company metadata, ISIN-based)
+  └─ pipeline/create_universe.py      → universe.db           (company metadata, ISIN-based)
 
 SimFin CSVs (initial load)
-  └─ create_databases.py     → constituents.db        (financial time series, PIT)
+  └─ pipeline/create_databases.py     → constituents.db        (financial time series, PIT)
 
 EDGAR 10-K filings (incremental)
-  └─ update_constituents.py  → constituents.db
+  └─ pipeline/update_constituents.py  → constituents.db
 
 SimFin CSVs
-  └─ create_returns.py       → returns.db             (daily prices)
+  └─ pipeline/create_returns.py       → returns.db             (daily prices)
 
 constituents.db + returns.db + universe.db
-  └─ create_factors.py       → factors.db             (28+ factors × 28 snapshots)
-  └─ create_models.py        → models.db              (9 models × 28 snapshots)
-  └─ create_risk.py          → risk.db                (Ledoit-Wolf covariance, all snapshots)
-  └─ create_barra.py         → risk.db                (Barra factor risk model, quarterly snapshots)
+  └─ pipeline/create_factors.py       → factors.db             (28+ factors × N snapshots)
+  └─ pipeline/create_models.py        → models.db              (11 models × N snapshots)
+  └─ pipeline/create_risk.py          → risk.db                (Ledoit-Wolf covariance, all snapshots)
+  └─ pipeline/create_barra.py         → risk.db                (Barra factor risk model, quarterly snapshots)
 
 strategy_params.xlsx + models.db + risk.db
   └─ optimize_portfolio.py   → portfolio_output/      (weights + summary per strategy)
@@ -42,34 +44,34 @@ conda activate quant   # Python 3.13.5
 
 ### Full historical build
 ```bash
-python create_universe.py
-python create_databases.py
-python create_returns.py
-python create_svr.py --backfill
-python create_factors.py --quarterly-backfill   # all quarterly snapshot dates
-python create_models.py
-python create_risk.py --backfill
-python create_barra.py --backfill               # quarterly snapshots → risk.db
-python create_strategy_params.py        # creates data/strategy_params.xlsx
+python -m pipeline.create_universe
+python -m pipeline.create_databases
+python -m pipeline.create_returns
+python -m pipeline.create_svr --backfill
+python -m pipeline.create_factors --quarterly-backfill   # all quarterly snapshot dates
+python -m pipeline.create_models
+python -m pipeline.create_risk --backfill
+python -m pipeline.create_barra --backfill               # quarterly snapshots → risk.db
+python -m pipeline.create_strategy_params        # creates data/strategy_params.xlsx
 python optimize_portfolio.py            # runs all active strategies
 streamlit run app.py
 ```
 
 ### Rebuild universe snapshots only (leaves companies table intact)
 ```bash
-python create_universe.py --rebuild-snapshots
+python -m pipeline.create_universe --rebuild-snapshots
 ```
 
 ### Weekly incremental update
 ```bash
-python update_constituents.py [--limit N] [--ticker X] [--sector-type financial] [--force]
+python -m pipeline.update_constituents [--limit N] [--ticker X] [--sector-type financial] [--force]
 # --fill-gaps: pull missing annual 10-K years for a targeted subset of companies
-python create_returns.py --update       # latest Yahoo Finance prices
-python create_svr.py                    # latest FINRA short volume ratio (incremental)
-python create_factors.py --date 2026-04-01
-python create_models.py --date 2026-04-01
-python create_risk.py --date 2026-04-01
-python create_barra.py                  # defaults to most recent Friday → risk.db
+python -m pipeline.create_returns --update       # latest Yahoo Finance prices
+python -m pipeline.create_svr                    # latest FINRA short volume ratio (incremental)
+python -m pipeline.create_factors --date 2026-04-01
+python -m pipeline.create_models --date 2026-04-01
+python -m pipeline.create_risk --date 2026-04-01
+python -m pipeline.create_barra                  # defaults to most recent Friday → risk.db
 # --date is repeatable for create_factors, create_models, create_barra: --date D1 --date D2
 python optimize_portfolio.py
 ```
@@ -84,18 +86,7 @@ python optimize_portfolio.py --list                   # list all strategies
 
 ### Snapshot dates
 
-28 snapshots: 6 annual (April 1, ≥ 90-day lag for Dec FY-end filers) + 22 quarterly mid-period (15th of Feb/May/Aug/Nov). Dates are stored in `factors.db` `snapshot_dates` table and discovered automatically by `create_risk.py` and `create_barra.py` — no config list to maintain.
-
-Annual snapshots:
-
-| Snapshot | FY covered |
-|----------|-----------|
-| 2021-04-01 | FY2020 |
-| 2022-04-01 | FY2021 |
-| 2023-04-01 | FY2022 |
-| 2024-04-01 | FY2023 |
-| 2025-04-01 | FY2024 |
-| 2026-04-01 | FY2025 |
+Snapshot dates are defined in a `snapshot_schedule` table (`universe.db`) and stored in `factors.db`'s `snapshot_dates` table — there is no hardcoded date list. The whole pipeline (`create_factors` → `create_models` → `create_risk` → `create_barra`) discovers the dates automatically, so adding or shifting snapshots is a single-table change. The grid is month-end monthly history with annual April-1 anchors (≥ 90-day lag after each December FY-end so all filers have reported).
 
 ### Point-in-time
 
@@ -116,19 +107,21 @@ Each snapshot uses the most recent annual report with `publish_date ≤ snapshot
 
 Direction is applied only at model score time (`z × weight × direction`); `factor_value_z` is always stored unsigned.
 
-### Models (9 total)
+### Models (11 total)
 
 | Model | ID | Components |
 |-------|----|-----------|
-| Quality | QUAL001 | 15 quality factors |
-| Value | VAL001 | 5 value factors |
-| Growth | GRO001 | 5 growth factors |
-| Momentum | MOM001 | 2 momentum factors |
+| Profitability | PROF001 | Margins, ROE/ROA/ROIC, FCF, cash conversion, gross profit to assets |
+| Defensive Quality | DEF001 | Leverage, debt-to-assets, interest coverage, accruals, asset turnover, working capital |
+| Value | VAL001 | Earnings/book/sales/cash yields, EV-to-EBIT, EV/EBITDA, dividend yield |
+| Growth | GRO001 | Asset, earnings, revenue, equity, cash flow, operating income, EBITDA growth |
+| Momentum | MOM001 | 12-month (60%) + 6-month (40%) risk-adjusted momentum |
 | Size | SIZ001 | Log Market Cap |
 | Low Volatility | LVOL001 | Realized volatility |
 | Liquidity | LIQ001 | Amihud illiquidity |
 | Short Interest | SHI001 | FINRA SVR 20-day avg (70%) + 90-day percentile rank (30%) |
-| Alpha (composite) | ALP001 | Equal-weight of Quality, Value, Growth, Momentum, Size |
+| Long-term Reversal | LTR001 | 36-12 risk-adjusted reversal (standalone, not in Alpha) |
+| Alpha (composite) | ALP001 | 0.25 Profitability + 0.05 Defensive + 0.25 Value + 0.20 Growth + 0.20 Momentum + 0.05 Size |
 
 ## Barra factor risk model
 
@@ -225,115 +218,134 @@ Re-run `optimize_portfolio.py` (or click **▶ Run Optimisation** in the app) to
 | Risk Explorer | Barra / Ledoit-Wolf deep-dive: correlations, factor vols, stock decomposition |
 | Data Quality | Pipeline health: factor coverage, constituent fill rates, sync status across all DBs |
 
-## Database schemas
+## Databases
 
-### risk.db
+Seven SQLite databases, each owned by one pipeline stage and consumed downstream. Raw external sources feed the base stores (left); derived analytics flow rightward into the optimiser and dashboard.
 
-Contains both Ledoit-Wolf covariance and Barra factor risk tables.
+Solid arrows are data flow; dashed arrows are reference/config tables (hexagons) that define each stage — factors, models, concept mappings and strategy parameters all live in version-controlled CSV/XLSX, not in code.
 
-```sql
--- Ledoit-Wolf shrunk covariance (one row per snapshot date)
-CREATE TABLE covariance_matrix (
-    data_date        TEXT PRIMARY KEY,
-    matrix_blob      BLOB,   -- zlib(numpy float32)
-    isin_list        TEXT,   -- JSON array of ISINs
-    n_stocks         INTEGER,
-    shrinkage_coeff  REAL,
-    lookback_days    INTEGER,
-    computation_date TEXT
-)
+```mermaid
+flowchart LR
+    EDGAR["EDGAR<br/>N-PORT-P + 10-K/10-Q"]
+    SIMFIN["SimFin CSVs"]
+    PRICES["Yahoo / Tiingo"]
+    FINRA["FINRA short volume"]
+    FRED["FRED"]
 
--- Barra: daily factor returns (used to estimate F)
-CREATE TABLE factor_returns (
-    trade_date TEXT, factor_id TEXT, factor_return REAL,
-    PRIMARY KEY (trade_date, factor_id)
-)
--- Barra: K×K factor covariance per snapshot
-CREATE TABLE factor_covariance (
-    snapshot_date TEXT PRIMARY KEY,
-    factor_names  TEXT,   -- JSON array of K factor names
-    cov_blob      BLOB    -- zlib(K×K float32), annualised
-)
--- Barra: per-stock idiosyncratic variance per snapshot
-CREATE TABLE idiosyncratic_vars (
-    snapshot_date TEXT, security_id TEXT, idio_var REAL,
-    PRIMARY KEY (snapshot_date, security_id)
-)
--- Barra: factor exposures X per snapshot
-CREATE TABLE factor_exposures (
-    snapshot_date TEXT, security_id TEXT, factor_id TEXT, exposure REAL,
-    PRIMARY KEY (snapshot_date, security_id, factor_id)
-)
+    CMAP{{"edgar_concept_map.xlsx<br/>constituents_reference.csv<br/>standard_concepts_reference.csv"}}
+    FREF{{"factors_reference.csv"}}
+    MREF{{"models_reference.csv"}}
+    SPAR{{"strategy_params.xlsx"}}
+
+    UNI[("universe.db")]
+    CON[("constituents.db")]
+    RET[("returns.db")]
+    MAC[("macro.db")]
+    FAC[("factors.db")]
+    MOD[("models.db")]
+    RISK[("risk.db")]
+    OPT["optimize_portfolio.py"]
+
+    EDGAR --> UNI
+    EDGAR --> CON
+    SIMFIN --> CON
+    CMAP -.-> CON
+    PRICES --> RET
+    FINRA --> RET
+    FRED --> MAC
+
+    UNI --> FAC
+    CON --> FAC
+    RET --> FAC
+    FREF -.-> FAC
+    FAC --> MOD
+    MREF -.-> MOD
+    FAC --> RISK
+    RET --> RISK
+    FREF -.-> RISK
+
+    MOD --> OPT
+    RISK --> OPT
+    SPAR -.-> OPT
 ```
 
-### factors.db
-```sql
-CREATE TABLE factors (
-    data_date TEXT, factor_id TEXT, security_id TEXT,
-    factor_value REAL, factor_value_z REAL,
-    update_date TEXT, computation_date TEXT,
-    PRIMARY KEY (data_date, factor_id, security_id)
-)
-```
-
-### models.db
-```sql
-CREATE TABLE models (
-    data_date TEXT, model_id TEXT, security_id TEXT,
-    model_value REAL, model_value_z REAL, is_composite INTEGER DEFAULT 0,
-    PRIMARY KEY (data_date, model_id, security_id)
-)
-```
+| Database | Primary key | Holds |
+|----------|-------------|-------|
+| `universe.db` | `isin` | Company metadata, point-in-time Russell 1000 membership, N-PORT accessions |
+| `constituents.db` | `(constituent_id, security_id, publish_date)` | Financial-statement line items (PIT anchor = publish_date) |
+| `returns.db` | `(isin, date)` | Daily adjusted prices + FINRA short-volume ratio |
+| `factors.db` | `(data_date, factor_id, security_id)` | Unsigned factor values + cross-sectional z-scores per snapshot |
+| `models.db` | `(data_date, model_id, security_id)` | Direction-applied model scores (base + Alpha composite) |
+| `risk.db` | `data_date` / `snapshot_date` | Ledoit-Wolf covariance blobs + Barra factor-risk tables |
+| `macro.db` | `(date, signal_id)` | US macro signals (yields, spreads, commodities, economic) |
 
 ## Project structure
 
 ```
-├── app.py
+├── app.py                          # Streamlit entry point
+├── daily_update.py                 # Pipeline orchestrator (runs pipeline.* as -m modules)
+├── config.py                       # Single source of truth: all paths, dates, hyperparameters
+├── db.py                           # Cached data access layer (Streamlit @st.cache_data wrappers)
+├── macro_db.py                     # Macro signal queries
+├── utils.py                        # Shared utilities: get_db, classify_sector, winsorized_zscore, get_logger
+├── optimize_portfolio.py           # CVXPY optimizer (3 objectives, configurable strategies)
+├── pipeline/                       # Build scripts — run as `python -m pipeline.<name>`
+│   ├── create_universe.py
+│   ├── create_databases.py
+│   ├── update_constituents.py      # Incremental EDGAR 10-Q/10-K fetcher (logs to pull_log table)
+│   ├── create_returns.py
+│   ├── create_svr.py               # FINRA short volume ratio
+│   ├── create_factors.py           # factors.db + snapshot_dates table
+│   ├── create_models.py
+│   ├── create_risk.py              # Ledoit-Wolf covariance → risk.db
+│   ├── create_barra.py             # Barra factor risk model → risk.db (same file)
+│   ├── create_macro_signals.py     # macro.db (FRED signals)
+│   └── create_strategy_params.py   # Reset strategy_params.xlsx template
 ├── pages/
-│   ├── 1_Universe.py
-│   ├── 2_Factors.py
-│   ├── 3_Screener.py
 │   ├── 4_Deep_Dive.py
-│   ├── 5_Themes.py
 │   ├── 6_Backtester.py
 │   ├── 7_Database.py
 │   ├── 8_Portfolio.py
 │   ├── 9_Risk_Explorer.py
-│   └── 10_Data_Quality.py
-├── config.py                        # Single source of truth: all paths, dates, hyperparameters
-├── db.py                           # Cached data access layer (Streamlit @st.cache_data wrappers)
-├── utils.py                        # Shared utilities: get_db, classify_sector, winsorized_zscore, get_logger
-├── create_universe.py
-├── create_databases.py
-├── update_constituents.py          # Incremental EDGAR 10-Q/10-K fetcher (logs to pull_log table)
-├── create_returns.py
-├── create_factors.py               # factors.db + snapshot_dates table
-├── create_models.py
-├── create_risk.py                  # Ledoit-Wolf covariance → risk.db
-├── create_barra.py                 # Barra factor risk model → risk.db (same file)
-├── create_strategy_params.py       # Reset strategy_params.xlsx template
-├── optimize_portfolio.py           # CVXPY optimizer (3 objectives, 9 strategies)
-├── exploratory/                    # Not committed — ad-hoc scripts
-│   ├── degiro_orders.py
-│   ├── explore_insider.py
-│   ├── explore_short_interest.py
-│   └── validate_constituents.py
+│   ├── 10_Data_Quality.py
+│   └── 11_Macro.py
+├── scripts/                        # Report/command backends (single-name, theme, validate, db-check)
+├── tests/
 ├── data/
 │   ├── universe.db
-│   ├── constituents.db             # includes pull_log table
+│   ├── constituents.db             # includes pull_log table + standard_concept_id column
 │   ├── returns.db
 │   ├── factors.db                  # includes snapshot_dates table
 │   ├── models.db
 │   ├── risk.db                     # Ledoit-Wolf + Barra tables
+│   ├── macro.db                    # FRED macro signals
 │   ├── strategy_params.xlsx        # Strategy / constraint / alpha-weight config
 │   ├── portfolio_output/           # {sid}_latest.csv + {sid}_latest_summary.json
 │   ├── factors_reference.csv       # includes barra_factor_type + barra_factor_order columns
 │   ├── models_reference.csv
 │   ├── constituents_reference.csv
+│   ├── standard_concepts_reference.csv
 │   ├── edgar_concept_map.xlsx
 │   └── universe_index/             # iShares Russell 1000 holdings CSVs
 └── logs/                           # Rotating log files: <script_name>.log (5 MB, 3 backups)
 ```
+
+## Tests
+
+`pytest` suite covering the parts where correctness is subtle — financial-statement parsing, factor math, the optimiser, and the daily orchestrator.
+
+```bash
+pytest tests/ -q                              # full suite
+pytest tests/ -q --ignore=tests/test_edgar_parsing.py   # fast (skips network-shaped fixtures)
+```
+
+| Area | What it pins down |
+|------|-------------------|
+| `test_factor_math.py` | Q4 derivation, YTD decomposition, LTM completeness guard, winsorised z-scores |
+| `test_edgar_parsing.py` | XBRL concept extraction, accounting-identity corrections, fiscal-period labelling |
+| `test_optimizer.py` | Each objective (alpha / Sharpe / min-variance) respects its constraint set and returns a valid simplex |
+| `test_daily_update.py` | Step dependency graph, dry-run planning, snapshot-date alignment across stages |
+| `test_utils.py` | Shared primitives (`get_db`, `classify_sector`, `winsorized_zscore`) |
 
 ## Logging
 
@@ -342,7 +354,7 @@ All pipeline scripts use `get_logger(name)` from `utils.py` — no `print()` sta
 - **Log files**: `logs/<script_name>.log` — rotating at 5 MB, 3 backups retained.
 - **Stdout**: every log line also mirrors to stdout with timestamp and level.
 - **Format**: `YYYY-MM-DD HH:MM:SS  LEVEL     message`
-- **Debug mode**: `LOG_LEVEL=DEBUG python create_factors.py --date 2026-04-01`
+- **Debug mode**: `LOG_LEVEL=DEBUG python -m pipeline.create_factors --date 2026-04-01`
 
 ## Dependencies
 

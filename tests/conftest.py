@@ -1,7 +1,9 @@
 """Pytest configuration for the Quant test suite.
 
-Adds the project root to sys.path so tests can `from create_factors import ...`
-without needing a pyproject.toml or installed package.
+Adds the project root to sys.path so tests can import top-level modules
+(config, utils, optimize_portfolio) and pipeline-package modules
+(pipeline.create_factors, pipeline.update_constituents) without a
+pyproject.toml or installed package.
 """
 
 import sys

@@ -1219,10 +1219,25 @@ def run_optimization(strategy: dict) -> tuple[pd.DataFrame, dict]:
     Sigma, L = _covariance_submatrix(risk_cov, risk_isin_idx, investable)
 
     use_barra  = strategy.get("use_barra_risk", True)
-    barra_date = _latest_barra_date()
     used_barra_date: str | None = None
-    if use_barra and barra_date:
-        L_barra = load_barra_L(barra_date, investable)
+    if use_barra:
+        # Align Barra with the strategy's configured risk_date so the factor and
+        # Ledoit-Wolf risk models reference the same snapshot. Only fall back to the
+        # latest Barra snapshot when that exact date is missing — and log loudly,
+        # because a date mismatch silently mixes risk models from different days.
+        risk_date  = strategy["risk_date"]
+        L_barra    = load_barra_L(risk_date, investable)
+        barra_date = risk_date
+        if L_barra is None:
+            fallback = _latest_barra_date()
+            if fallback and fallback != risk_date:
+                log.warning(
+                    "Barra has no snapshot for risk_date %s — falling back to latest %s. "
+                    "Risk-model date now differs from alpha/Ledoit-Wolf (%s).",
+                    risk_date, fallback, risk_date,
+                )
+                L_barra    = load_barra_L(fallback, investable)
+                barra_date = fallback
         if L_barra is not None:
             L     = L_barra
             Sigma = None   # not needed — _variance() uses ||L.T @ w||² instead

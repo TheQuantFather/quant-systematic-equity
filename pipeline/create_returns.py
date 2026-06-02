@@ -28,6 +28,7 @@ from pathlib import Path
 
 import pandas as pd
 
+
 from config import DATA_DIR, RETURNS_DB, UNIVERSE_DB
 from utils import get_db, get_logger
 
