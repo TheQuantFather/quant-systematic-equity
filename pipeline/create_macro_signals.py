@@ -23,6 +23,7 @@ import pandas as pd
 import requests
 import yfinance as yf
 
+
 from config import MACRO_DB, MACRO_BACKFILL_START
 from macro_db import load_signals_reference
 from utils import get_db, get_logger

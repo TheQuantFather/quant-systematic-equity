@@ -62,6 +62,7 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).parent))
+
 from config import (
     RETURNS_DB, FACTORS_DB, UNIVERSE_DB, RISK_DB, FACTORS_REF,
     HL_FACTOR_VAR, HL_FACTOR_CORR, HL_IDIO, NW_LAGS, VRA_WINDOW,

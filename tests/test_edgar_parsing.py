@@ -10,7 +10,7 @@ from datetime import date
 
 import pytest
 
-from update_constituents import (
+from pipeline.update_constituents import (
     _derive_working_capital_change,
     _latest_expected_sk,
     _quarter_from_period,

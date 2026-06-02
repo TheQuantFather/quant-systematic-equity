@@ -34,6 +34,7 @@ import sqlite3
 from pathlib import Path
 from datetime import datetime
 
+
 from config import (
     DATA_DIR, SIMFIN_DIR, UNIVERSE_DB as DB_PATH, FACTORS_DB,
     SCHEDULE_MONTHLY_START, SCHEDULE_WEEKLY_CUTOVER,

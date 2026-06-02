@@ -74,10 +74,10 @@ def test_execute_step_runs_when_deps_satisfied():
     assert errors == []
     assert len(calls) == 1
     cmd, timeout, dry_run = calls[0]
-    # cmd is built from [PYTHON, "-u", *script_args]
+    # cmd is built from [PYTHON, "-u", "-m", "pipeline.<script>", *args]
     assert cmd[0] == du.PYTHON
     assert cmd[1] == "-u"
-    assert cmd[2:] == ["create_factors.py", "--date", "2026-05-25"]
+    assert cmd[2:] == ["-m", "pipeline.create_factors", "--date", "2026-05-25"]
     # Timeout comes from TIMEOUTS dict (or default 1800 if missing).
     assert timeout == du.TIMEOUTS.get("my_step", 1800)
 
@@ -230,12 +230,12 @@ def test_dry_run_weekly_lists_expected_steps():
 
     text = proc.stdout + proc.stderr
     expected_steps = [
-        "create_returns.py --update",
-        "update_constituents.py",
-        "create_factors.py --date",
-        "create_models.py --date",
-        "create_risk.py --date",
-        "create_barra.py",
+        "pipeline.create_returns --update",
+        "pipeline.update_constituents",
+        "pipeline.create_factors --date",
+        "pipeline.create_models --date",
+        "pipeline.create_risk --date",
+        "pipeline.create_barra",
     ]
     for expected in expected_steps:
         assert re.search(rf"START\s+{re.escape(expected)}", text), \
@@ -255,8 +255,8 @@ def test_dry_run_default_skips_weekly_on_non_friday():
     assert proc.returncode == 0
     text = proc.stdout + proc.stderr
     # Daily steps always appear:
-    assert "create_returns.py --update" in text
-    assert "update_constituents.py" in text
+    assert "pipeline.create_returns --update" in text
+    assert "pipeline.update_constituents" in text
 
 
 def test_dry_run_skip_returns_marks_downstream_runnable():
@@ -271,6 +271,6 @@ def test_dry_run_skip_returns_marks_downstream_runnable():
     text = proc.stdout + proc.stderr
     assert "SKIP    returns" in text
     # Downstream factor/risk/barra steps should still be planned (not skipped):
-    assert "START   create_factors.py" in text
-    assert "START   create_risk.py" in text
-    assert "START   create_barra.py" in text
+    assert "START   pipeline.create_factors" in text
+    assert "START   pipeline.create_risk" in text
+    assert "START   pipeline.create_barra" in text

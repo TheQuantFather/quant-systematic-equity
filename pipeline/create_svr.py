@@ -29,6 +29,7 @@ import numpy as np
 import pandas as pd
 import requests
 
+
 from config import RETURNS_DB, UNIVERSE_DB
 from utils import get_db, get_logger
 

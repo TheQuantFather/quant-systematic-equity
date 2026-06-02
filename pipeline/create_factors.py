@@ -30,6 +30,7 @@ import pandas as pd
 from dateutil.relativedelta import relativedelta
 from typing import Optional
 
+
 from config import (
     UNIVERSE_DB, CONSTITUENTS_DB, RETURNS_DB, FACTORS_DB,
     FACTORS_REF, CONSTITUENTS_REF,

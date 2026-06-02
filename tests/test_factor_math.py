@@ -14,7 +14,7 @@ from datetime import date
 import pandas as pd
 import pytest
 
-from create_factors import (
+from pipeline.create_factors import (
     _ebitda,
     _enterprise_value,
     _fix_ytd_quarters,

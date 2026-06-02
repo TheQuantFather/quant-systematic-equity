@@ -73,7 +73,7 @@ def run(cmd: list[str], timeout: int, dry_run: bool = False) -> bool:
     spawn error.  Stderr is merged into stdout so the log shows one
     chronological stream.
     """
-    label = " ".join(cmd[2:])    # skip [PYTHON, "-u"] prefix for readability
+    label = " ".join(a for a in cmd[2:] if a != "-m")  # drop [PYTHON, -u, -m] noise
     log.info("START   %s   (timeout=%ds)", label, timeout)
     if dry_run:
         log.info("  [dry-run] %s", " ".join(cmd))
@@ -171,7 +171,11 @@ def _execute_step(
         errors.append(f"{name} (skipped — upstream {unmet} not satisfied)")
         return False
 
-    cmd     = [PYTHON, "-u", *script_args]
+    # All pipeline steps live in the pipeline package; run as modules so imports
+    # resolve against the repo root (cwd) without any sys.path bootstrap.
+    script_name, *rest = script_args
+    module = "pipeline." + script_name.removesuffix(".py")
+    cmd     = [PYTHON, "-u", "-m", module, *rest]
     timeout = TIMEOUTS.get(name, 1800)
     ok      = run_fn(cmd, timeout=timeout, dry_run=dry_run)
     results[name] = ok
@@ -258,7 +262,7 @@ def main() -> None:
              depends_on=("factors",))
         step("risk",    "create_risk.py",    "--date", snap_date,
              depends_on=("returns",))
-        step("barra",   "create_barra.py",
+        step("barra",   "create_barra.py",   "--date", snap_date,
              depends_on=("factors", "returns", "universe"))
 
         # Portfolio optimiser is on-demand only — run manually when needed.
