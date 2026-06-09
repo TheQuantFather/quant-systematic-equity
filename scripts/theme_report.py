@@ -252,7 +252,8 @@ def aggregate_barra(members: list[dict], weights: dict[str, float]) -> tuple[pd.
                      .reset_index(name="exposure"))
     fref = load_factor_reference()
     name_map = dict(zip(fref["factor_id"], fref["factor_name"]))
-    name_map.update({"beta_60d": "Beta (60d)"})
+    name_map.update(MODEL_NAMES)  # SIZ001 → "Size", PROF001 → "Profitability", etc.
+    name_map.update({"beta_60d": "Beta (60d)", "market": "Market"})
     weighted["name"] = weighted["factor_id"].map(name_map).fillna(weighted["factor_id"])
     weighted = weighted[~weighted["factor_id"].str.startswith("sec_")]
 
@@ -637,8 +638,8 @@ def main() -> None:
     ap.add_argument("--slug", required=True, help="URL-safe basket slug, e.g. ai_industrials")
     ap.add_argument("--name", required=True, help="Display name, e.g. 'AI Industrials'")
     ap.add_argument("--tickers", required=True, help="Comma-separated tickers")
-    ap.add_argument("--weight", choices=["cap", "equal"], default="cap",
-                    help="Weighting scheme (default: cap)")
+    ap.add_argument("--weight", choices=["cap", "equal"], default="equal",
+                    help="Weighting scheme (default: equal)")
     args = ap.parse_args()
 
     tickers = [t.strip().upper() for t in args.tickers.split(",") if t.strip()]

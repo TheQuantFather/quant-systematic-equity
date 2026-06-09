@@ -19,12 +19,11 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
-from utils import get_db, inject_css
+from utils import get_db, inject_css, get_barra_layout
 from config import (
     RISK_DB as _RISK_DB_PATH,
     UNIVERSE_DB as _UNIV_DB_PATH, MODELS_DB as _MODELS_DB_PATH,
     FACTORS_REF, MODELS_REF,
-    BARRA_SECTORS,
 )
 
 st.set_page_config(page_title="Risk Explorer", layout="wide")
@@ -37,44 +36,27 @@ BARRA_DB  = str(_RISK_DB_PATH)   # Barra tables now live in risk.db
 UNIV_DB   = str(_UNIV_DB_PATH)
 MODELS_DB = str(_MODELS_DB_PATH)
 
-# Load Barra factor IDs from reference CSV (single source of truth)
-_ref_csv = pd.read_csv(str(FACTORS_REF))
-_STYLE_IDS = set(
-    _ref_csv[_ref_csv["barra_factor_type"] == "style"]["factor_id"].tolist()
-)
-_FUND_IDS = set(
-    _ref_csv[_ref_csv["barra_factor_type"] == "fundamental"]["factor_id"].tolist()
-)
-_N_MARKET = 1
-_N_SECTOR = len(BARRA_SECTORS)
-_N_STYLE  = len(_STYLE_IDS)
-_N_BETA   = 1
-_N_FUND   = len(_FUND_IDS)
-
-# Factor group slices into the K-length Barra factor vector.
-# Layout: [market | sectors | styles | beta | fundamentals]  (K = 30).
-_MARKET_COL  = 0
-_SECTOR_COLS = slice(_N_MARKET, _N_MARKET + _N_SECTOR)
-_STYLE_COLS  = slice(_N_MARKET + _N_SECTOR,
-                     _N_MARKET + _N_SECTOR + _N_STYLE)
-_BETA_COL    = _N_MARKET + _N_SECTOR + _N_STYLE
-_FUND_COLS   = slice(_N_MARKET + _N_SECTOR + _N_STYLE + _N_BETA,
-                     _N_MARKET + _N_SECTOR + _N_STYLE + _N_BETA + _N_FUND)
-
-_GROUP_LABELS = {
-    "Market":      _MARKET_COL,
-    "Sector":      _SECTOR_COLS,
-    "Style":       _STYLE_COLS,
-    "Beta":        _BETA_COL,
-    "Fundamental": _FUND_COLS,
-}
+# Barra factor layout — single source of truth in models_reference.csv via
+# utils.get_barra_layout(). Layout: [market | sectors | beta | models].
+_LAYOUT       = get_barra_layout()
+_GROUP_LABELS = _LAYOUT["groups"]            # {label: int | slice} into the K-vector
+_FACTOR_GROUP = _LAYOUT["factor_group"]      # factor_id -> group label
+_PRETTY       = _LAYOUT["pretty"]            # factor_id -> display name
 
 def _factor_group(fid: str) -> str:
-    if fid == "market":          return "Market"
-    if fid.startswith("sec_"):   return "Sector"
-    if fid == "beta_60d":        return "Beta"
-    if fid in _STYLE_IDS:        return "Style"
-    return "Fundamental"
+    return _FACTOR_GROUP.get(fid, "Model")
+
+# Group → colour map, derived from the layout's groups (+ Idiosyncratic) so it
+# tracks the factor set automatically — no hardcoded group names/counts.
+_GROUP_PALETTE = ["#54A24B", "#4C78A8", "#E45756", "#F58518", "#72B7B2", "#B279A2"]
+GROUP_COLORS = {
+    g: _GROUP_PALETTE[i % len(_GROUP_PALETTE)]
+    for i, g in enumerate(list(_GROUP_LABELS.keys()) + ["Idiosyncratic"])
+}
+
+def _group_labels_for(names: list[str]) -> list[str]:
+    """Per-position group label for an ordered factor-id list."""
+    return [_factor_group(n) for n in names]
 
 
 @st.cache_data
@@ -107,17 +89,15 @@ def _load_model_name_map() -> dict[str, str]:
     return dict(zip(ref["ModelID"], ref["Model"]))
 
 
-def _pretty_factor(name: str, _cache: dict = {}) -> str:
-    """Convert a Barra factor_id to a human-readable display name."""
-    if not _cache:
-        _cache.update(_load_factor_name_map())
-    if name == "market":
-        return "Market"
-    if name.startswith("sec_"):
-        return name.replace("sec_", "").replace("_", " ").title()
-    if name == "beta_60d":
-        return "Beta (60d)"
-    return _cache.get(name, name)
+def _pretty_factor(name: str) -> str:
+    """Convert a Barra factor_id to a human-readable display name.
+
+    The layout's pretty map covers market / sectors / beta / model factors; fall
+    back to the raw factor-name map for any legacy id, else the id itself.
+    """
+    if name in _PRETTY:
+        return _PRETTY[name]
+    return _load_factor_name_map().get(name, name)
 
 
 # ---------------------------------------------------------------------------
@@ -565,21 +545,16 @@ with tab_stock:
             st.subheader("Factor Exposures")
             exp_s = X_df.loc[sel_isin]
             pretty = [_pretty_factor(n) for n in factor_names]
-            group_colors = (
-                ["Sector"] * 11 + ["Style"] * 5 + ["Beta"] + ["Fundamental"] * 12
-            )
             exp_df = pd.DataFrame({
                 "factor":    pretty,
                 "exposure":  exp_s.values,
-                "group":     group_colors,
+                "group":     _group_labels_for(factor_names),
             })
 
             fig_exp = px.bar(
                 exp_df, x="exposure", y="factor", color="group",
                 orientation="h",
-                color_discrete_map={"Market": "#54A24B", "Sector": "#4C78A8",
-                                    "Style": "#F58518", "Beta": "#E45756",
-                                    "Fundamental": "#72B7B2"},
+                color_discrete_map=GROUP_COLORS,
                 labels={"exposure": "Factor exposure (z-score / dummy)", "factor": ""},
                 title=f"{sel_ticker} — Factor Exposures",
             )
@@ -725,7 +700,7 @@ if tab_barra is not None:
     with tab_barra:
         K = len(factor_names)
         pretty_names = [_pretty_factor(n) for n in factor_names]
-        group_labels = ["Sector"] * 11 + ["Style"] * 5 + ["Beta"] + ["Fundamental"] * 12
+        group_labels = _group_labels_for(factor_names)
 
         # ── Factor volatilities ──────────────────────────────────────────────
         st.subheader("Factor Annual Volatilities")
@@ -739,8 +714,7 @@ if tab_barra is not None:
         fig_fv = px.bar(
             fvol_df, x="vol_pct", y="factor", color="group",
             orientation="h",
-            color_discrete_map={"Sector": "#4C78A8", "Style": "#F58518",
-                                 "Beta": "#E45756", "Fundamental": "#72B7B2"},
+            color_discrete_map=GROUP_COLORS,
             labels={"vol_pct": "Annualised factor vol (%)", "factor": ""},
             title=f"Factor Annual Volatilities — {sel_date}",
         )
@@ -847,13 +821,6 @@ if tab_barra is not None:
         if fr.empty:
             st.info("No factor return data in risk.db.")
         else:
-            GROUP_COLORS = {
-                "Sector":      "#4C78A8",
-                "Style":       "#F58518",
-                "Beta":        "#E45756",
-                "Fundamental": "#72B7B2",
-            }
-
             # Sector returns absorb the daily market component (no intercept in WLS).
             # Demean sector returns cross-sectionally each day so they show
             # relative sector performance (vs equal-weight sector average).
@@ -871,8 +838,9 @@ if tab_barra is not None:
             )
             fr = fr.drop(columns="sec_mean")
 
+            _fr_groups = [g for g in _GROUP_LABELS if g in set(fr["group"])]
             fr_grp = st.segmented_control(
-                "Show groups", ["All", "Sector", "Style", "Beta", "Fundamental"],
+                "Show groups", ["All"] + _fr_groups,
                 default="All", key="fr_grp",
             )
             fr_filt = fr if fr_grp == "All" else fr[fr["group"] == fr_grp]
@@ -899,7 +867,7 @@ if tab_barra is not None:
                 y_title   = "Rolling 1Y annualised return (%)"
 
             for fid in plot_data.columns:
-                grp   = id_to_group.get(fid, "Fundamental")
+                grp   = id_to_group.get(fid, _factor_group(fid))
                 color = GROUP_COLORS.get(grp, "#94A3B8")
                 fig_fr.add_trace(go.Scatter(
                     x=plot_data.index, y=plot_data[fid],
@@ -917,7 +885,7 @@ if tab_barra is not None:
             st.plotly_chart(fig_fr, use_container_width=True)
             st.caption(
                 "Sector returns are demeaned daily vs the equal-weight sector average "
-                "to show relative sector spread. Style, Beta, and Fundamental are raw WLS returns."
+                "to show relative sector spread. All other factors are raw WLS returns."
             )
 
             # Summary stats table

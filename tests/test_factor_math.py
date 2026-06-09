@@ -15,12 +15,17 @@ import pandas as pd
 import pytest
 
 from pipeline.create_factors import (
+    _apply_security_data_starts,
     _ebitda,
+    _dedup_constituent_rows,
     _enterprise_value,
     _fix_ytd_quarters,
+    _q4_inputs_available_before_annual,
     compute_growth_factors,
     compute_quality_factors,
+    compute_reit_factors,
     compute_value_factors,
+    select_growth_series,
     select_ltm_data,
 )
 
@@ -112,6 +117,67 @@ def test_fix_ytd_q3_left_alone_when_below_threshold():
     assert fixed == 1
     assert data["ISIN-TEST"][(2025, "Q2")]["Revenue"] == 110
     assert data["ISIN-TEST"][(2025, "Q3")]["Revenue"] == 150  # unchanged
+
+
+def test_dedup_constituent_rows_prefers_native_isin_over_mapped_legacy():
+    df = pd.DataFrame([
+        {
+            "security_id": "US-ISIN",
+            "constituent_id": "REV",
+            "fiscal_year": 2025,
+            "fiscal_period": "Q1",
+            "publish_date": pd.Timestamp("2025-05-28"),
+            "source_priority": 0,
+            "constituent_value": 44_062.0,
+        },
+        {
+            "security_id": "US-ISIN",
+            "constituent_id": "REV",
+            "fiscal_year": 2025,
+            "fiscal_period": "Q1",
+            "publish_date": pd.Timestamp("2024-05-29"),
+            "source_priority": 1,
+            "constituent_value": 26_044.0,
+        },
+    ])
+
+    out = _dedup_constituent_rows(df)
+    assert len(out) == 1
+    assert out.iloc[0]["constituent_value"] == 26_044.0
+    assert out.iloc[0]["publish_date"] == pd.Timestamp("2024-05-29")
+
+
+def test_q4_temporal_guard_uses_constituent_publish_dates_not_bucket_max():
+    annual_pub = pd.Timestamp("2025-02-26")
+    q1 = {
+        "Revenue": 26_044.0,
+        "Some Other Flow": 1.0,
+        "_publish_date": pd.Timestamp("2025-05-28"),
+        "_publish_by_name": {
+            "Revenue": pd.Timestamp("2024-05-29"),
+            "Some Other Flow": pd.Timestamp("2025-05-28"),
+        },
+    }
+    q2 = {"Revenue": 30_040.0, "_publish_by_name": {"Revenue": pd.Timestamp("2024-08-28")}}
+    q3 = {"Revenue": 35_082.0, "_publish_by_name": {"Revenue": pd.Timestamp("2024-11-20")}}
+
+    assert _q4_inputs_available_before_annual(q1, q2, q3, "Revenue", annual_pub)
+    assert not _q4_inputs_available_before_annual(q1, q2, q3, "Some Other Flow", annual_pub)
+
+
+def test_apply_security_data_starts_filters_old_issuer_rows():
+    df = pd.DataFrame([
+        {"security_id": "US-LINE", "report_date": "2018-12-31", "constituent_value": 1.0},
+        {"security_id": "US-LINE", "report_date": "2024-12-31", "constituent_value": 2.0},
+        {"security_id": "US-OTHER", "report_date": "2018-12-31", "constituent_value": 3.0},
+    ])
+
+    out = _apply_security_data_starts(
+        df,
+        {"US-LINE": pd.Timestamp("2024-01-01")},
+    )
+
+    assert out["constituent_value"].tolist() == [2.0, 3.0]
 
 
 # ── compute_quality_factors ─────────────────────────────────────────────────
@@ -286,62 +352,84 @@ def test_value_factors_dividend_yield_only_for_payers():
     assert "Dividend Yield" not in f
 
 
-# ── compute_growth_factors ──────────────────────────────────────────────────
+# ── compute_growth_factors (multi-year trend) ───────────────────────────────
 
-def test_growth_factors_basic_yoy():
-    cur   = {"Revenue": 1100.0, "Net Income": 120.0,
-             "Net Cash from Operating Activities": 130.0,
-             "Total Assets": 3300.0, "Total Equity": 1650.0,
-             "Operating Income (Loss)": 220.0}
-    prior = {"Revenue": 1000.0, "Net Income": 100.0,
-             "Net Cash from Operating Activities": 100.0,
-             "Total Assets": 3000.0, "Total Equity": 1500.0,
-             "Operating Income (Loss)": 200.0}
-    f = compute_growth_factors(cur, prior)
-    assert f["Revenue Growth"]  == pytest.approx(0.10)
-    assert f["Earnings Growth"] == pytest.approx(0.20)
-    assert f["Cash Flow Growth"] == pytest.approx(0.30)
-    assert f["Asset Growth"]    == pytest.approx(0.10)
-    assert f["Equity Growth"]   == pytest.approx(0.10)
-    assert f["Operating Income Growth"] == pytest.approx(0.10)
-
-
-def test_growth_factors_negative_base_skipped_when_required():
-    # Earnings/CF/OpInc growth all require positive base.  Asset/Equity/Revenue
-    # do not — their growth is computed against |prior|.
-    cur   = {"Revenue": 800.0, "Net Income": 50.0,
-             "Net Cash from Operating Activities": 60.0,
-             "Total Assets": 3000.0, "Total Equity": 1500.0,
-             "Operating Income (Loss)": 200.0}
-    prior = {"Revenue": 1000.0, "Net Income": -100.0,    # loss
-             "Net Cash from Operating Activities": -50.0,
-             "Total Assets": 2800.0, "Total Equity": 1400.0,
-             "Operating Income (Loss)": -10.0}
-    f = compute_growth_factors(cur, prior)
-    assert "Earnings Growth" not in f
-    assert "Cash Flow Growth" not in f
-    assert "Operating Income Growth" not in f
-    # Revenue contraction still computed (no require_positive_base):
-    assert f["Revenue Growth"] == pytest.approx(-0.20)
-    # Asset / Equity growth still computed:
-    assert f["Asset Growth"]  == pytest.approx((3000 - 2800) / 2800)
-    assert f["Equity Growth"] == pytest.approx((1500 - 1400) / 1400)
+def test_growth_trend_basic_slope_over_mean():
+    # Trend growth = OLS slope of the annual series ÷ mean(|level|).
+    # Net Income [100,110,120]: slope=10, mean=110 → 0.0909
+    series = {
+        "Revenue":                            [1000.0, 1100.0, 1200.0],
+        "Net Income":                         [100.0, 110.0, 120.0],
+        "Net Cash from Operating Activities": [200.0, 230.0, 260.0],
+        "Operating Income (Loss)":            [180.0, 190.0, 200.0],
+        "EBITDA":                             [300.0, 330.0, 360.0],
+    }
+    f = compute_growth_factors(series)
+    assert f["Revenue Growth"]          == pytest.approx(100 / 1100)
+    assert f["Earnings Growth"]         == pytest.approx(10 / 110)
+    assert f["Cash Flow Growth"]        == pytest.approx(30 / 230)
+    assert f["Operating Income Growth"] == pytest.approx(10 / 190)
+    assert f["EBITDA Growth"]           == pytest.approx(30 / 330)
+    # Asset / equity growth are no longer growth factors (asset-growth anomaly):
+    assert "Asset Growth" not in f
+    assert "Equity Growth" not in f
 
 
-def test_growth_factors_zero_base_skipped():
-    cur   = {"Revenue": 100.0}
-    prior = {"Revenue": 0.0}
-    assert "Revenue Growth" not in compute_growth_factors(cur, prior)
+def test_growth_trend_requires_three_points():
+    # Two points is below the minimum window — no trend emitted.
+    assert compute_growth_factors({"Revenue": [1000.0, 1100.0]}) == {}
+    # Three points emit.
+    assert "Revenue Growth" in compute_growth_factors({"Revenue": [1000.0, 1050.0, 1100.0]})
 
 
-def test_growth_factors_ebitda_growth_uses_abs_da():
-    cur   = {"Operating Income (Loss)": 220.0,
-             "Depreciation & Amortization": -30.0}    # negative D&A
-    prior = {"Operating Income (Loss)": 200.0,
-             "Depreciation & Amortization":  30.0}
-    f = compute_growth_factors(cur, prior)
-    # current EBITDA = 250, prior = 230
-    assert f["EBITDA Growth"] == pytest.approx((250 - 230) / 230)
+def test_growth_trend_no_explosion_on_depressed_base():
+    # KEY-like net income: volatile, dips negative, recovers. The 1-yr ratio
+    # exploded (+76x); the trend must stay bounded and read flat-to-negative.
+    series = {"Net Income": [2625.0, 1917.0, 967.0, -161.0, 1829.0]}
+    g = compute_growth_factors(series)["Earnings Growth"]
+    assert abs(g) < 1.0          # not an explosive multiple
+    assert g < 0.2               # a down-then-recover series is not strong growth
+
+
+def test_growth_trend_degenerate_zero_series_skipped():
+    # All-zero series → mean level 0 → undefined, skipped rather than div-by-zero.
+    assert "Revenue Growth" not in compute_growth_factors({"Revenue": [0.0, 0.0, 0.0]})
+
+
+def test_growth_series_ebitda_uses_abs_da():
+    # select_growth_series derives the per-year EBITDA series with abs(D&A).
+    # Annual-only filer: one FY (Q4) period per year, three years.
+    def yr(fy, pub, op, da):
+        return _quarter(fy, "Q4", pub,
+                        **{"Operating Income (Loss)": op,
+                           "Depreciation & Amortization": da,
+                           "Net Income": op})
+    sid_data = {
+        0: yr(2021, "2022-02-01", 200.0,  30.0),
+        1: yr(2022, "2023-02-01", 210.0, -30.0),   # negative D&A sign
+        2: yr(2023, "2024-02-01", 220.0,  30.0),
+    }
+    kind_map = {"Operating Income (Loss)": "Flow",
+                "Depreciation & Amortization": "Flow",
+                "Net Income": "Flow"}
+    series = select_growth_series(sid_data, kind_map, date(2024, 6, 1))
+    assert series["EBITDA"] == pytest.approx([230.0, 240.0, 250.0])  # op + |da|, oldest→newest
+    # FFO series = Net Income + |D&A| (NI set equal to op in this fixture):
+    assert series["FFO"] == pytest.approx([230.0, 240.0, 250.0])
+
+
+def test_reit_ffo_growth_is_trend_not_yoy():
+    # FFO Growth now uses the multi-year trend (slope/mean), bounded even on a
+    # volatile base — no 1yr-ratio explosion.
+    series = {"FFO": [500.0, 520.0, 30.0, 560.0]}   # one trough year
+    f = compute_reit_factors(cdata={"Net Income": 100.0, "Depreciation & Amortization": 400.0},
+                             growth_series=series, isin="X", prices={})
+    assert "FFO Growth" in f
+    assert abs(f["FFO Growth"]) < 1.0               # trend stays bounded
+    # No FFO series → no FFO Growth (but other FFO factors absent too without price)
+    assert "FFO Growth" not in compute_reit_factors(
+        cdata={"Net Income": 100.0, "Depreciation & Amortization": 400.0},
+        growth_series={}, isin="X", prices={})
 
 
 # ── select_ltm_data ─────────────────────────────────────────────────────────
@@ -378,7 +466,7 @@ def test_select_ltm_respects_publish_date_cutoff():
         (2024, "Q4"): _quarter(2024, "Q4", "2025-05-01", Revenue=280),  # after snap
     }
     ltm, _ = select_ltm_data(sid_data, {"Revenue": "Flow"}, snapshot=date(2025, 4, 1))
-    assert ltm["Revenue"] == 250 + 260 + 270            # Q4 excluded
+    assert ltm["Revenue"] is None                       # Q4 excluded; no full LTM
 
 
 def test_select_ltm_annual_only_uses_single_period():
@@ -417,7 +505,18 @@ def test_select_ltm_excludes_bs_only_buckets():
     ltm, _ = select_ltm_data(sid_data, kind_map, snapshot=date(2025, 4, 1))
     # Latest *Flow*-bearing bucket is Q3; its BS value wins, not the orphan Q4.
     assert ltm["Total Assets"] == 9950
-    assert ltm["Revenue"]      == 250 + 260 + 270
+    assert ltm["Revenue"] is None
+
+
+def test_select_ltm_requires_four_flow_quarters_for_non_annual_filers():
+    sid_data = {
+        (2025, "Q2"): _quarter(2025, "Q2", "2025-08-01", Revenue=260),
+        (2025, "Q3"): _quarter(2025, "Q3", "2025-11-01", Revenue=270),
+        (2026, "Q1"): _quarter(2026, "Q1", "2026-05-01", Revenue=290),
+    }
+
+    ltm, _ = select_ltm_data(sid_data, {"Revenue": "Flow"}, snapshot=date(2026, 5, 29))
+    assert ltm["Revenue"] is None
 
 
 def test_select_ltm_derives_gross_profit_per_quarter():

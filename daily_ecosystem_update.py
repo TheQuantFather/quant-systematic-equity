@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-daily_update.py — Automated pipeline update.
+daily_ecosystem_update.py - Automated ecosystem pipeline update.
 
 Schedule:
   Daily   — update prices (create_returns.py --update)
@@ -18,9 +18,9 @@ Behaviour:
     against the existing DB.
 
 Usage:
-    python daily_update.py                   # normal run (Friday triggers full rebuild)
-    python daily_update.py --force-weekly    # force full weekly rebuild today
-    python daily_update.py --dry-run         # print steps without running
+    python daily_ecosystem_update.py                   # normal run
+    python daily_ecosystem_update.py --force-weekly    # force weekly rebuild today
+    python daily_ecosystem_update.py --dry-run         # print steps without running
 """
 
 import argparse
@@ -59,12 +59,31 @@ TIMEOUTS: dict[str, int] = {
 # Logging
 # ---------------------------------------------------------------------------
 
-log = get_logger("daily_update")
+log = get_logger("daily_ecosystem_update")
 
 
 # ---------------------------------------------------------------------------
 # Runner — streams child output and enforces a hard timeout.
 # ---------------------------------------------------------------------------
+
+def _stop_process(proc: subprocess.Popen) -> None:
+    """Terminate a child process, escalating to kill if it does not exit."""
+    if proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
 
 def run(cmd: list[str], timeout: int, dry_run: bool = False) -> bool:
     """Run a subprocess, streaming its stdout/stderr line-by-line to the log.
@@ -73,6 +92,9 @@ def run(cmd: list[str], timeout: int, dry_run: bool = False) -> bool:
     spawn error.  Stderr is merged into stdout so the log shows one
     chronological stream.
     """
+    if timeout <= 0:
+        log.error("FAILED  invalid timeout for command %s: %s", cmd, timeout)
+        return False
     label = " ".join(a for a in cmd[2:] if a != "-m")  # drop [PYTHON, -u, -m] noise
     log.info("START   %s   (timeout=%ds)", label, timeout)
     if dry_run:
@@ -91,17 +113,17 @@ def run(cmd: list[str], timeout: int, dry_run: bool = False) -> bool:
     except Exception as exc:
         log.error("FAILED  %s — could not spawn: %s", label, exc)
         return False
+    if proc.stdout is None:
+        _stop_process(proc)
+        log.error("FAILED  %s — child stdout pipe was not created", label)
+        return False
 
     deadline = t0 + timeout
     try:
         while True:
             remaining = deadline - time.time()
             if remaining <= 0:
-                proc.kill()
-                try:
-                    proc.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    pass
+                _stop_process(proc)
                 log.error("TIMEOUT %s after %.0fs (limit %ds)",
                           label, time.time() - t0, timeout)
                 return False
@@ -118,10 +140,7 @@ def run(cmd: list[str], timeout: int, dry_run: bool = False) -> bool:
                 break                    # child exited and no buffered output
     except Exception as exc:
         log.error("FAILED  %s — output read error: %s", label, exc)
-        try:
-            proc.kill()
-        except Exception:
-            pass
+        _stop_process(proc)
         return False
 
     # Drain any final bytes left in the pipe after the child closed it.
@@ -185,7 +204,7 @@ def _execute_step(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Automated pipeline update")
+    parser = argparse.ArgumentParser(description="Automated ecosystem update")
     parser.add_argument("--dry-run",        action="store_true",
                         help="Print steps without executing")
     parser.add_argument("--force-weekly",   action="store_true",
@@ -207,7 +226,7 @@ def main() -> None:
     snap_date   = today.isoformat()
 
     log.info("=" * 60)
-    log.info("Pipeline update starting — %s", datetime.now().isoformat())
+    log.info("Ecosystem update starting — %s", datetime.now().isoformat())
     log.info("Python: %s", PYTHON)
     log.info("Weekly rebuild: %s", f"YES ({snap_date})" if run_weekly else "no (not Friday)")
     log.info("=" * 60)
@@ -281,4 +300,13 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        log.error("Interrupted by user")
+        sys.exit(130)
+    except SystemExit:
+        raise
+    except Exception:
+        log.exception("Unhandled daily_ecosystem_update failure")
+        sys.exit(1)

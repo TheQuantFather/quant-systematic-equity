@@ -1,5 +1,5 @@
 """
-8_Portfolio.py — Portfolio optimisation results dashboard.
+8_Portfolio_Optimiser.py — Portfolio optimisation results dashboard.
 
 Run optimize_portfolio.py to generate results, then view here.
 """
@@ -19,27 +19,20 @@ import streamlit as st
 from config import (
     OUTPUT_DIR, PARAMS_FILE, MODELS_DB, RISK_DB,
     UNIVERSE_DB as UNIV_DB, BENCHMARK_DIR,
-    FACTORS_REF, MODELS_REF,
-    BARRA_SECTORS as _BARRA_SECTORS,
+    MODELS_REF,
 )
-from utils import get_db, inject_css
+from utils import get_db, inject_css, get_barra_layout
 
-# Build BARRA_GROUPS dynamically from factors_reference.csv.
-# Layout: [market | sectors | styles | beta | fundamentals]  (K = 30).
-_ref_csv  = pd.read_csv(str(FACTORS_REF))
-_N_MARKET = 1
-_N_SECTOR = len(_BARRA_SECTORS)
-_N_STYLE  = len(_ref_csv[_ref_csv["barra_factor_type"] == "style"])
-_N_BETA   = 1
-_N_FUND   = len(_ref_csv[_ref_csv["barra_factor_type"] == "fundamental"])
-_BARRA_GROUPS = {
-    "Market":      0,
-    "Sector":      slice(_N_MARKET, _N_MARKET + _N_SECTOR),
-    "Style":       slice(_N_MARKET + _N_SECTOR,
-                         _N_MARKET + _N_SECTOR + _N_STYLE),
-    "Beta":        _N_MARKET + _N_SECTOR + _N_STYLE,
-    "Fundamental": slice(_N_MARKET + _N_SECTOR + _N_STYLE + _N_BETA,
-                         _N_MARKET + _N_SECTOR + _N_STYLE + _N_BETA + _N_FUND),
+# Barra factor-group slices — single source of truth in models_reference.csv via
+# utils.get_barra_layout(). Layout: [market | sectors | beta | models].
+_BARRA_GROUPS = get_barra_layout()["groups"]
+
+# Group → colour map, derived from the groups (+ Idiosyncratic) so it tracks the
+# factor set automatically — no hardcoded group names.
+_GROUP_PALETTE = ["#54A24B", "#4C78A8", "#E45756", "#F58518", "#72B7B2", "#B279A2"]
+_GROUP_COLORS = {
+    g: _GROUP_PALETTE[i % len(_GROUP_PALETTE)]
+    for i, g in enumerate(list(_BARRA_GROUPS.keys()) + ["Idiosyncratic"])
 }
 
 # Base model IDs and display names — read from models_reference.csv, not hardcoded.
@@ -50,7 +43,7 @@ BASE_MODELS = dict(zip(
     _mref.loc[_mref["IsComposite"] == 0, "Model"],
 ))
 
-st.set_page_config(page_title="Portfolio", layout="wide")
+st.set_page_config(page_title="Portfolio Optimiser", layout="wide")
 inject_css()
 st.title("Portfolio Optimiser")
 
@@ -454,21 +447,39 @@ st.caption(
     f"Objective: {objective}"
 )
 
-c1, c2, c3, c4, c5 = st.columns(5)
+def _pct_metric(value) -> str:
+    return f"{value:.2%}" if value is not None else "—"
+
+
+def _num_metric(value, fmt: str = ".2f") -> str:
+    return format(value, fmt) if value is not None else "—"
+
+
+c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
 if is_min_var:
     c1.metric("Expected Alpha", "—")
     c2.metric("Portfolio Vol",  f"{summary.get('portfolio_vol', 0):.2%}")
     c3.metric("Sharpe Ratio",   "—")
+    c4.metric("Beta",           "—")
+    c5.metric("Positions",      summary.get("n_positions", "—"))
+    c6.metric("Benchmark Stocks", "—")
+    c7.metric("Active Risk",    "—")
 elif is_sharpe:
     c1.metric("Exp Return (α)", f"{summary.get('expected_alpha', 0):+.4f}")
     c2.metric("Portfolio Vol",  f"{summary.get('portfolio_vol', 0):.2%}")
     c3.metric("Sharpe Ratio",   f"{summary.get('sharpe_ratio', 0):.2f}")
+    c4.metric("Beta",           _num_metric(summary.get("beta")))
+    c5.metric("Positions",      summary.get("n_positions", "—"))
+    c6.metric("Benchmark Stocks", "—")
+    c7.metric("Active Risk",    f"{summary.get('active_risk', 0):.2%}")
 else:
     c1.metric("Expected Alpha", f"{summary.get('expected_alpha', 0):+.4f}")
     c2.metric("Active Risk",    f"{summary.get('active_risk', 0):.2%}")
-    c3.metric("Info Ratio",     f"{summary.get('info_ratio', 0):.2f}")
-c4.metric("Positions",        summary.get("n_positions", "—"))
-c5.metric("Benchmark Stocks", summary.get("n_benchmark", "—") if is_alpha else "—")
+    c3.metric("Portfolio Vol",  _pct_metric(summary.get("portfolio_vol")))
+    c4.metric("Beta",           _num_metric(summary.get("beta")))
+    c5.metric("Info Ratio",     f"{summary.get('info_ratio', 0):.2f}")
+    c6.metric("Positions",      summary.get("n_positions", "—"))
+    c7.metric("Benchmark Stocks", summary.get("n_benchmark", "—"))
 
 st.markdown("---")
 
@@ -908,11 +919,7 @@ with tab4:
                         fig_pie = px.pie(
                             grp_df, values="TE Contribution (%)", names="Group",
                             title="TE Decomposition by Factor Group",
-                            color_discrete_map={
-                                "Sector": "#4C78A8", "Style": "#F58518",
-                                "Beta": "#E45756", "Fundamental": "#72B7B2",
-                                "Idiosyncratic": "#B279A2",
-                            },
+                            color_discrete_map=_GROUP_COLORS,
                         )
                         fig_pie.update_layout(height=320)
                         st.plotly_chart(fig_pie, use_container_width=True)

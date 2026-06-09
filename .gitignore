@@ -101,3 +101,6 @@ reports/
 
 # ── License files (MOSEK kept at ~/mosek/mosek.lic, not in source control) ──
 *.lic
+
+# ── Scratch / working notes (private — never publish) ──
+.scratch/
