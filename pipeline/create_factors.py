@@ -43,6 +43,7 @@ from utils import (
 log = get_logger("create_factors")
 
 _PERIOD_ORDER = {'Q1': 1, 'Q2': 2, 'Q3': 3, 'Q4': 4}
+FACTOR_UNIVERSE_INDEXES = ("russell_1000", "sp500")
 
 
 # ---------------------------------------------------------------------------
@@ -78,28 +79,47 @@ def load_ticker_map() -> dict:
 
 def load_snapshot_isins(snapshot: date) -> set | None:
     """
-    Returns the set of ISINs in the Russell 1000 at the closest available
-    universe_snapshots date to `snapshot`.  Returns None if the table is empty
-    (fallback: use all companies in the companies table).
+    Returns the union of ISINs in the factor coverage indexes at the latest
+    universe_snapshots date on or before `snapshot`. Returns None if the table
+    is empty (fallback: use all companies in the companies table).
     """
     date_str = snapshot.strftime('%Y-%m-%d')
+    out: set[str] = set()
+    sources: dict[str, str] = {}
     with get_db(UNIVERSE_DB) as conn:
-        matched = conn.execute(
-            "SELECT snapshot_date FROM universe_snapshots WHERE index_name = 'russell_1000' "
-            "ORDER BY ABS(julianday(snapshot_date) - julianday(?)) LIMIT 1",
-            (date_str,)
-        ).fetchone()
-        if not matched:
+        for index_name in FACTOR_UNIVERSE_INDEXES:
+            matched = conn.execute(
+                """
+                SELECT snapshot_date
+                FROM universe_snapshots
+                WHERE index_name = ? AND snapshot_date <= ?
+                ORDER BY snapshot_date DESC
+                LIMIT 1
+                """,
+                (index_name, date_str),
+            ).fetchone()
+            if not matched:
+                continue
+            matched_date = matched[0]
+            sources[index_name] = matched_date
+            rows = conn.execute(
+                """
+                SELECT isin
+                FROM universe_snapshots
+                WHERE snapshot_date = ? AND index_name = ?
+                """,
+                (matched_date, index_name),
+            ).fetchall()
+            out.update(r[0] for r in rows)
+
+        if not out:
             return None
-        matched_date = matched[0]
-        rows = conn.execute(
-            "SELECT isin FROM universe_snapshots WHERE snapshot_date = ? AND index_name = 'russell_1000'",
-            (matched_date,)
-        ).fetchall()
-    if matched_date != date_str:
-        log.info("No universe_snapshots for %s — using closest (%s, %s companies)",
-                 date_str, matched_date, f"{len(rows):,}")
-    return {r[0] for r in rows}
+
+    if any(src != date_str for src in sources.values()):
+        src_txt = ", ".join(f"{idx}={src}" for idx, src in sorted(sources.items()))
+        log.info("No exact factor-universe snapshot for %s — using %s (%s companies)",
+                 date_str, src_txt, f"{len(out):,}")
+    return out
 
 
 def _fix_ytd_quarters(data: dict, name_to_kind: dict[str, str]) -> int:
@@ -146,11 +166,69 @@ def _fix_ytd_quarters(data: dict, name_to_kind: dict[str, str]) -> int:
     return fixed
 
 
+def _dedup_constituent_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Keep one row per mapped PIT constituent key.
+
+    Native ISIN rows are preferred over legacy rows mapped from SimFin IDs; within
+    the same source priority, the latest publish_date wins.
+    """
+    return (df.sort_values(['source_priority', 'publish_date'])
+              .groupby(['security_id', 'constituent_id', 'fiscal_year', 'fiscal_period'],
+                       as_index=False)
+              .last())
+
+
+def _q4_inputs_available_before_annual(
+    q1: dict,
+    q2: dict,
+    q3: dict,
+    name: str,
+    annual_publish_date: pd.Timestamp,
+) -> bool:
+    """Return True when this constituent's Q1-Q3 values predate the annual."""
+    q1_pub = q1.get('_publish_by_name', {}).get(name, pd.Timestamp.max)
+    q2_pub = q2.get('_publish_by_name', {}).get(name, pd.Timestamp.max)
+    q3_pub = q3.get('_publish_by_name', {}).get(name, pd.Timestamp.max)
+    return q1_pub <= annual_publish_date and q2_pub <= annual_publish_date and q3_pub <= annual_publish_date
+
+
+def _load_security_data_starts(conn_u: sqlite3.Connection) -> dict[str, pd.Timestamp]:
+    rows = conn_u.execute(
+        """
+        SELECT name FROM sqlite_master
+        WHERE type='table' AND name='security_data_start'
+        """
+    ).fetchone()
+    if not rows:
+        return {}
+    starts = conn_u.execute("SELECT isin, min_report_date FROM security_data_start").fetchall()
+    out: dict[str, pd.Timestamp] = {}
+    for isin, min_report_date in starts:
+        ts = pd.to_datetime(min_report_date, errors="coerce")
+        if pd.notna(ts):
+            out[str(isin)] = ts
+    return out
+
+
+def _apply_security_data_starts(
+    df: pd.DataFrame,
+    data_starts: dict[str, pd.Timestamp],
+) -> pd.DataFrame:
+    """Drop rows before a security's current-issuer data start date."""
+    if not data_starts or df.empty:
+        return df
+    report_dates = pd.to_datetime(df['report_date'], errors='coerce')
+    min_dates = df['security_id'].map(data_starts)
+    keep = min_dates.isna() | (report_dates >= min_dates)
+    return df[keep].copy()
+
+
 def load_constituent_data() -> dict:
     """
     Returns {security_id: {(fiscal_year, fiscal_period): quarter_dict}} where
     quarter_dict = {constituent_name: value, '_publish_date': pd.Timestamp,
-                    '_sort_key': int}.
+                    '_sort_key': int, '_publish_by_name': dict}.
 
     sort_key = fiscal_year * 10 + period_num (Q1=1 … Q4=4) — used for ordering.
     For restated data, the row with the latest publish_date wins per
@@ -190,6 +268,7 @@ def load_constituent_data() -> dict:
         all_isins = set(
             r[0] for r in conn_u.execute("SELECT isin FROM companies WHERE isin IS NOT NULL").fetchall()
         )
+        data_starts = _load_security_data_starts(conn_u)
     simfin_to_isin = dict(zip(id_map['simfin_id'], id_map['isin']))
 
     def _map_sid(sid: str) -> Optional[str]:
@@ -197,20 +276,27 @@ def load_constituent_data() -> dict:
 
     def _load_and_clean(query: str, conn) -> pd.DataFrame:
         df = pd.read_sql_query(query, conn)
+        df['original_security_id'] = df['security_id'].astype(str)
+        # Native ISIN rows are EDGAR/current-source rows. Legacy SimFin rows are
+        # mapped from simfin_id to ISIN below and can use different fiscal-year
+        # labels for Jan/Feb FYE companies. When both sources collide on the same
+        # mapped key, prefer native ISIN data; within a source, latest publish wins.
+        df['source_priority'] = df['original_security_id'].isin(all_isins).astype(int)
         df['constituent_name'] = df['constituent_id'].map(id_to_name)
         df['data_kind']        = df['constituent_id'].map(id_to_kind)
         df = df.dropna(subset=['constituent_name'])
-        df['security_id'] = df['security_id'].astype(str).apply(_map_sid)
+        df['security_id'] = df['original_security_id'].apply(_map_sid)
         df = df.dropna(subset=['security_id'])
         df['fiscal_year']  = df['fiscal_year'].astype(int)
         df['publish_date'] = pd.to_datetime(df['publish_date'])
+        df = _apply_security_data_starts(df, data_starts)
         return df
 
     with get_db(CONSTITUENTS_DB) as conn:
         # Primary: quarterly rows (Q1–Q4) — covers SimFin + EDGAR 10-Q
         df_q = _load_and_clean(
             "SELECT security_id, constituent_id, constituent_value, "
-            "       fiscal_year, fiscal_period, publish_date "
+            "       fiscal_year, fiscal_period, publish_date, report_date "
             "FROM constituents "
             "WHERE fiscal_period IN ('Q1','Q2','Q3','Q4') "
             "  AND publish_date IS NOT NULL",
@@ -220,7 +306,7 @@ def load_constituent_data() -> dict:
         # Balance sheet rows from 10-K are already stored as Q4 — not needed here.
         df_fy = _load_and_clean(
             "SELECT security_id, constituent_id, constituent_value, "
-            "       fiscal_year, fiscal_period, publish_date "
+            "       fiscal_year, fiscal_period, publish_date, report_date "
             "FROM constituents "
             "WHERE fiscal_period = 'FY' "
             "  AND statement_type IN ('Income Statement', 'Cash Flow Statement') "
@@ -228,16 +314,8 @@ def load_constituent_data() -> dict:
             conn,
         )
 
-    # For restated data, keep the latest-published value per
-    # (security_id, constituent_id, fiscal_year, fiscal_period)
-    def _dedup(df: pd.DataFrame) -> pd.DataFrame:
-        return (df.sort_values('publish_date')
-                  .groupby(['security_id', 'constituent_id', 'fiscal_year', 'fiscal_period'],
-                           as_index=False)
-                  .last())
-
-    df_q  = _dedup(df_q)
-    df_fy = _dedup(df_fy)
+    df_q  = _dedup_constituent_rows(df_q)
+    df_fy = _dedup_constituent_rows(df_fy)
 
     df_q['sort_key'] = df_q['fiscal_year'] * 10 + df_q['fiscal_period'].map(_PERIOD_ORDER)
 
@@ -248,10 +326,12 @@ def load_constituent_data() -> dict:
         bucket = data.setdefault(sid, {}).setdefault(key, {
             '_publish_date': row.publish_date,
             '_sort_key':     row.sort_key,
+            '_publish_by_name': {},
         })
         if row.publish_date > bucket['_publish_date']:
             bucket['_publish_date'] = row.publish_date
         bucket[row.constituent_name] = row.constituent_value
+        bucket['_publish_by_name'][row.constituent_name] = row.publish_date
 
     # Fix YTD-cumulative quarterly values before Q4 derivation (order matters).
     ytd_fixed = _fix_ytd_quarters(data, name_to_kind)
@@ -279,30 +359,36 @@ def load_constituent_data() -> dict:
         q3 = sid_data.get((fy, 'Q3'), {})
         if not (q1 and q2 and q3):
             continue  # can't derive Q4 without all three prior quarters
-        # Temporal guard: Q1/Q2/Q3 must be published before the annual filing.
-        # If any were published after the annual, they belong to the next fiscal year
-        # (common for January/February fiscal-year-end companies like NVDA, WMT, HD
-        # where EDGAR labels the next FY's quarters under the same fiscal_year as the
-        # annual — e.g. NVDA FY2025 annual pub=Feb-2025 vs FY2026 Q1 pub=May-2025).
-        fy_pub = row.publish_date
-        if (q1.get('_publish_date', pd.Timestamp.max) > fy_pub or
-                q2.get('_publish_date', pd.Timestamp.max) > fy_pub or
-                q3.get('_publish_date', pd.Timestamp.max) > fy_pub):
-            continue
         v1 = q1.get(name)
         v2 = q2.get(name)
         v3 = q3.get(name)
         if v1 is None or v2 is None or v3 is None:
             continue  # constituent missing in at least one prior quarter
+
+        # Temporal guard: this constituent's Q1/Q2/Q3 values must be published
+        # before the annual filing.
+        # If any were published after the annual, they belong to the next fiscal year
+        # (common for January/February fiscal-year-end companies like NVDA, WMT, HD
+        # where EDGAR labels the next FY's quarters under the same fiscal_year as the
+        # annual — e.g. NVDA FY2025 annual pub=Feb-2025 vs FY2026 Q1 pub=May-2025).
+        # Use per-constituent publish dates rather than the bucket-level max: mixed
+        # SimFin/EDGAR buckets can contain unrelated later-published items, and those
+        # must not block Q4 derivation for values that were actually available.
+        fy_pub = row.publish_date
+        if not _q4_inputs_available_before_annual(q1, q2, q3, name, fy_pub):
+            continue
+
         q4_val = row.constituent_value - v1 - v2 - v3
         q4_sort = fy * 10 + _PERIOD_ORDER['Q4']
         bucket = sid_data.setdefault(q4_key, {
             '_publish_date': row.publish_date,
             '_sort_key':     q4_sort,
+            '_publish_by_name': {},
         })
         if row.publish_date > bucket['_publish_date']:
             bucket['_publish_date'] = row.publish_date
         bucket[name] = q4_val
+        bucket['_publish_by_name'][name] = row.publish_date
         derived_q4 += 1
 
     if derived_q4:
@@ -341,6 +427,7 @@ def load_constituent_data() -> dict:
             continue  # no balance-sheet anchor year — skip
         bucket = sid_data[q4_key]
         bucket[name] = row.constituent_value
+        bucket.setdefault('_publish_by_name', {})[name] = row.publish_date
         if row.publish_date > bucket['_publish_date']:
             bucket['_publish_date'] = row.publish_date
         annual_direct += 1
@@ -348,12 +435,14 @@ def load_constituent_data() -> dict:
     if annual_direct:
         log.info("[annual-only] assigned %s FY Flow values to Q4 for annual-only filers", f"{annual_direct:,}")
 
-    _fix_shares_units(data)
+    # Pass split history so legitimate split step-changes in EDGAR point-in-time
+    # shares are not mistaken for unit errors (e.g. CMG's 50:1 split).
+    _fix_shares_units(data, load_splits())
     log.info("Loaded quarterly constituent data for %s companies", f"{len(data):,}")
     return data
 
 
-def _fix_shares_units(data: dict) -> None:
+def _fix_shares_units(data: dict, splits: dict | None = None) -> None:
     """
     Correct unit errors in 'Shares (Basic)' in place using log-median correction.
 
@@ -364,25 +453,41 @@ def _fix_shares_units(data: dict) -> None:
     from the per-company log-median by ≥1.5 orders of magnitude; the power of
     10 needed to bring it back to the median is rounded to the nearest integer.
     Companies with fewer than 3 quarterly observations are skipped.
+
+    Split-awareness: EDGAR shares are point-in-time, so a real stock split is a
+    legitimate step-change in the series (e.g. CMG 27M → 1,372M across its 50:1
+    split).  The median/threshold test runs on shares first normalised to the
+    current split basis (× the product of split ratios dated after each quarter's
+    publish date), so a large split no longer looks like a unit error.  Detection
+    happens on the normalised series; the correction is applied to the raw stored
+    value (the unit error lives there).  Without `splits` the normalisation is a
+    no-op and behaviour is unchanged.
     """
     shares_key = 'Shares (Basic)'
+    splits = splits or {}
     fixed = 0
     for sid, quarters in data.items():
-        entries = [
-            (qdict['_sort_key'], qkey, qdict[shares_key])
-            for qkey, qdict in quarters.items()
-            if shares_key in qdict and qdict[shares_key] > 0
-        ]
+        sid_splits = splits.get(sid, ())
+        entries = []
+        for qkey, qdict in quarters.items():
+            val = qdict.get(shares_key)
+            if not (val and val > 0):
+                continue
+            asof = qdict.get('_publish_date')
+            factor = 1.0
+            for split_date, ratio in sid_splits:
+                if asof is not None and split_date > asof:
+                    factor *= ratio
+            entries.append((qkey, val, val * factor))   # (key, raw, split-normalised)
         if len(entries) < 3:
             continue
-        entries.sort()
-        values = np.array([e[2] for e in entries])
-        median_log = float(np.median(np.log10(values)))
-        for sk, qkey, val in entries:
-            diff = np.log10(val) - median_log
+        norm_values = np.array([e[2] for e in entries])
+        median_log = float(np.median(np.log10(norm_values)))
+        for qkey, raw, norm in entries:
+            diff = np.log10(norm) - median_log
             if abs(diff) >= 1.5:
                 power = -round(float(diff))
-                data[sid][qkey][shares_key] = val * (10 ** power)
+                data[sid][qkey][shares_key] = raw * (10 ** power)
                 fixed += 1
     if fixed:
         log.info("[shares fix] corrected %d unit-mismatched Shares (Basic) values", fixed)
@@ -453,6 +558,62 @@ def load_price_data() -> dict:
     return prices
 
 
+def load_splits() -> dict:
+    """
+    Returns {isin: [(split_date_ts, ratio), ...]} from returns.db `splits`, sorted by date.
+
+    returns.db prices are split-adjusted to the current basis, but constituents.db
+    shares are actual point-in-time counts.  These ratios let the market-cap path
+    convert a historical share count to the current basis so price × shares is
+    consistent across splits.  Empty dict when the table is absent (pre-backfill) —
+    callers then leave shares unadjusted, preserving prior behaviour.
+    """
+    if not RETURNS_DB.exists():
+        return {}
+    with get_db(RETURNS_DB) as conn:
+        has_tbl = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='splits'"
+        ).fetchone()
+        if not has_tbl:
+            return {}
+        df = pd.read_sql_query(
+            "SELECT isin, date, ratio FROM splits WHERE ratio > 0 ORDER BY isin, date",
+            conn,
+        )
+    splits: dict = {}
+    for isin, grp in df.groupby("isin", sort=False):
+        splits[isin] = [
+            (pd.Timestamp(d), float(r)) for d, r in zip(grp["date"], grp["ratio"])
+        ]
+    if splits:
+        log.info("Loaded split history for %s ISINs", f"{len(splits):,}")
+    return splits
+
+
+def _apply_split_adjustment(cdata: dict, isin: str, splits: dict) -> None:
+    """
+    Express the LTM share count in the current split-adjusted basis, in place.
+
+    returns.db `close` is split-adjusted to today's basis; the share count is as of
+    its source quarter (`_shares_asof`).  Multiplying by the product of every split
+    ratio dated after that quarter restates shares onto the same basis as the price,
+    so market cap is continuous through splits.  No-op when shares, the as-of date, or
+    split history are missing.
+    """
+    shares = cdata.get('Shares (Basic)')
+    asof   = cdata.get('_shares_asof')
+    sid_splits = splits.get(isin)
+    if shares is None or asof is None or not sid_splits:
+        return
+    asof_ts = pd.Timestamp(asof)
+    factor = 1.0
+    for split_date, ratio in sid_splits:
+        if split_date > asof_ts:
+            factor *= ratio
+    if factor != 1.0:
+        cdata['Shares (Basic)'] = shares * factor
+
+
 def load_factor_name_to_id() -> dict:
     """Returns {factor_name: factor_id} from factors_reference.csv."""
     df = pd.read_csv(FACTORS_REF)
@@ -496,6 +657,86 @@ _ALLOWED_FACTOR_SECTORS: dict[str, set] = {
 # Point-in-time selection
 # ---------------------------------------------------------------------------
 
+def _build_ltm(quarters: list, kind_map: dict, min_flow_quarters: int) -> dict:
+    """Sum Flow items / take latest Stock item across a window of quarters.
+
+    Flow items require a complete window (>= min_flow_quarters) — partial public
+    histories otherwise produce understated LTM that looks precise but is not
+    economically comparable. Annual-only filers pass min_flow_quarters=1.
+    """
+    ltm: dict = {}
+    flow_counts: dict = {}
+    for q in quarters:
+        # Derive Gross Profit per-quarter when absent but Revenue and Cost of
+        # Revenue are both available. Sign convention is normalised (both
+        # positive) so GP = Revenue - CoR holds for SimFin and EDGAR alike.
+        if (q.get('Gross Profit') is None
+                and q.get('Revenue') is not None
+                and q.get('Cost of Revenue') is not None):
+            q = {**q, 'Gross Profit': q['Revenue'] - q['Cost of Revenue']}
+
+        # Derive Operating Income when absent.
+        # Identity: Operating Income = Pretax Income - Non-Operating Income.
+        # Some XBRL filers (e.g. LLY, banks) omit the OperatingIncomeLoss tag
+        # but always report Pretax. When Non-Operating Income is also absent we
+        # treat it as zero — a minor approximation but avoids NaN propagation.
+        if (q.get('Operating Income (Loss)') is None
+                and q.get('Pretax Income (Loss)') is not None):
+            non_op = q.get('Non-Operating Income (Loss)') or 0.0
+            q = {**q, 'Operating Income (Loss)': q['Pretax Income (Loss)'] - non_op}
+
+        for name, val in q.items():
+            if name.startswith('_') or val is None:
+                continue
+            kind = kind_map.get(name, 'Flow')
+            if kind == 'Stock':
+                ltm[name] = val          # later quarter overwrites — sorted asc, so last = most recent
+                if name == 'Shares (Basic)':
+                    # Record the publish date of the quarter supplying the share
+                    # count so the market-cap path can split-adjust it to the
+                    # current basis (matching split-adjusted returns.db prices).
+                    ltm['_shares_asof'] = q.get('_publish_date')
+            else:
+                ltm[name] = ltm.get(name, 0.0) + val
+                flow_counts[name] = flow_counts.get(name, 0) + 1
+
+    # Null out Flow items that lacked a complete window.
+    for name, cnt in flow_counts.items():
+        if cnt < min_flow_quarters:
+            ltm[name] = None
+    return ltm
+
+
+def _available_quarters(
+    sid_data: dict, kind_map: dict, snapshot: date,
+) -> tuple[list, bool]:
+    """Sorted (ascending) PIT quarters that contain a Flow item, plus the
+    annual-only flag. Shared by select_ltm_data and select_growth_series so the
+    LTM windowing rules stay identical."""
+    snap_ts = pd.Timestamp(snapshot)
+
+    def _has_flow(bucket: dict) -> bool:
+        return any(
+            not k.startswith('_') and v is not None and kind_map.get(k, 'Flow') == 'Flow'
+            for k, v in bucket.items()
+        )
+
+    available = [
+        q for q in sid_data.values()
+        if q['_publish_date'] <= snap_ts and _has_flow(q)
+    ]
+    available.sort(key=lambda q: q['_sort_key'])
+
+    is_annual_only = (
+        len(available) >= 2 and
+        all(
+            available[i + 1]['_sort_key'] - available[i]['_sort_key'] >= 10
+            for i in range(len(available) - 1)
+        )
+    )
+    return available, is_annual_only
+
+
 def select_ltm_data(
     sid_data: dict,
     kind_map: dict,
@@ -514,10 +755,9 @@ def select_ltm_data(
 
     Returns ({}, {}) when fewer than 1 quarter is available.
 
-    Consecutive-quarter validation: warns to stdout when the 4 quarters are not
-    strictly adjacent (e.g. a missing filing leaves a gap). Non-consecutive quarters
-    still produce a result, but Flow totals will be understated — the warning flags
-    cases worth investigating in validate_constituents.py.
+    Flow items require a full four-quarter window unless the filer is annual-only.
+    Short-history companies still get Stock and price-based factors, but accounting
+    ratios that depend on LTM flows stay null rather than using partial-year data.
 
     Known limitation: if a filer reports only YTD cumulative income statement facts
     in XBRL (no standalone 3-month tag), the stored quarterly values will be YTD
@@ -525,117 +765,91 @@ def select_ltm_data(
     The fix is to derive standalone quarters algebraically in update_constituents.py
     before storing.
     """
-    snap_ts = pd.Timestamp(snapshot)
-
-    def _has_flow(bucket: dict) -> bool:
-        """True if the bucket contains at least one Flow item (not BS-only)."""
-        return any(
-            not k.startswith('_') and v is not None and kind_map.get(k, 'Flow') == 'Flow'
-            for k, v in bucket.items()
-        )
-
-    # Keep only quarters published on or before snapshot that have at least one
-    # Flow item.  BS-only buckets (e.g. orphaned EDGAR annual balance-sheet rows
-    # whose Q4 derivation was skipped) are excluded so they cannot overwrite
-    # balance-sheet values from a complete prior-year quarter in build_ltm.
-    available = [
-        q for q in sid_data.values()
-        if q['_publish_date'] <= snap_ts and _has_flow(q)
-    ]
+    available, is_annual_only = _available_quarters(sid_data, kind_map, snapshot)
     if not available:
         return {}, {}
-
-    # Sort ascending by sort_key so tail(4) = most recent
-    available.sort(key=lambda q: q['_sort_key'])
 
     # Annual-only filers (e.g. SimFin annual coverage): all consecutive periods
     # are spaced ≥10 sort-key units apart (one Q4 per fiscal year, gap = 10).
     # Normal quarterly gaps are 1 (within year) or 7 (Q4→Q1 cross-year).
     # For these, the single most-recent period already represents a full LTM;
     # summing multiple annual Q4 periods would overstate by N×.
-    is_annual_only = (
-        len(available) >= 2 and
-        all(
-            available[i + 1]['_sort_key'] - available[i]['_sort_key'] >= 10
-            for i in range(len(available) - 1)
-        )
-    )
-
     if is_annual_only:
         recent_4 = available[-1:]
         prior_4  = available[-2:-1] if len(available) >= 2 else []
+        min_flow = 1
     else:
         recent_4 = available[-4:]
         prior_4  = available[-8:-4] if len(available) >= 8 else []
+        min_flow = 4
 
-    def _check_consecutive(quarters: list, label: str) -> None:
-        """Warn if the 4 quarters are not consecutive.
+    return (_build_ltm(recent_4, kind_map, min_flow),
+            _build_ltm(prior_4,  kind_map, min_flow))
 
-        sort_key = fiscal_year * 10 + period_num (Q1=1 … Q4=4).
-        Consecutive steps: +1 within year, or +7 for Q4→Q1 cross-year (e.g. 20244→20251).
-        A gap means a missing filing ended up in the LTM window, which silently
-        understates annualised Flow totals.
-        """
-        if len(quarters) < 2:
-            return
-        keys = [q['_sort_key'] for q in quarters]
-        for i in range(len(keys) - 1):
-            gap = keys[i + 1] - keys[i]
-            if gap not in (1, 7):
-                log.warning(
-                    "[%s] non-consecutive quarters in LTM (sort_keys %s) — gap %d at position %d; snapshot=%s",
-                    label, keys, gap, i, snapshot,
-                )
-                return
 
-    _check_consecutive(recent_4, "LTM")
-    _check_consecutive(prior_4,  "prior-LTM")
+# Flow metrics whose multi-year trend feeds the growth factors. EBITDA is
+# derived per-window from Operating Income + |D&A|.
+_GROWTH_TREND_FIELDS = (
+    'Revenue', 'Net Income', 'Net Cash from Operating Activities',
+    'Operating Income (Loss)',
+)
 
-    def build_ltm(quarters: list, min_flow_quarters: int) -> dict:
-        ltm: dict = {}
-        flow_counts: dict = {}
-        for q in quarters:
-            # Derive Gross Profit per-quarter when absent but Revenue and Cost of Revenue
-            # are both available. Sign convention is normalised (both positive) so
-            # GP = Revenue - CoR holds for SimFin and EDGAR data alike.
-            if (q.get('Gross Profit') is None
-                    and q.get('Revenue') is not None
-                    and q.get('Cost of Revenue') is not None):
-                q = {**q, 'Gross Profit': q['Revenue'] - q['Cost of Revenue']}
 
-            # Derive Operating Income when absent.
-            # Identity: Operating Income = Pretax Income − Non-Operating Income.
-            # Some XBRL filers (e.g. LLY, banks) omit the OperatingIncomeLoss tag
-            # but always report Pretax.  When Non-Operating Income is also absent we
-            # treat it as zero — a minor approximation but avoids NaN propagation.
-            if (q.get('Operating Income (Loss)') is None
-                    and q.get('Pretax Income (Loss)') is not None):
-                non_op = q.get('Non-Operating Income (Loss)') or 0.0
-                q = {**q, 'Operating Income (Loss)': q['Pretax Income (Loss)'] - non_op}
+def select_growth_series(
+    sid_data: dict,
+    kind_map: dict,
+    snapshot: date,
+    n_years: int = 5,
+) -> dict:
+    """Annual LTM series (oldest → newest) per growth metric for trend factors.
 
-            for name, val in q.items():
-                if name.startswith('_') or val is None:
-                    continue
-                kind = kind_map.get(name, 'Flow')
-                if kind == 'Stock':
-                    ltm[name] = val          # later quarter overwrites — sorted asc, so last = most recent
-                else:
-                    ltm[name] = ltm.get(name, 0.0) + val
-                    flow_counts[name] = flow_counts.get(name, 0) + 1
+    Builds up to n_years complete trailing-12-month windows stepping back one
+    fiscal year at a time (4 quarters per step; annual-only filers use one FY
+    period per step). Each window is built with the same completeness rules as
+    select_ltm_data, so a partial year is dropped rather than understated.
 
-        # Require a minimum number of quarters for Flow items.  A window built
-        # from only 1 quarter produces a badly understated LTM that inflates YoY
-        # growth factors (LNT case: prior-LTM = 1 quarter → Revenue Growth +292%).
-        # Threshold = 2: blocks degenerate 1-quarter windows while allowing
-        # 3-quarter windows (Q4 not yet filed at snapshot — very common PIT lag).
-        # Annual-only filers require 1 (a single FY period already covers 12 months).
-        for name, cnt in flow_counts.items():
-            if cnt < min_flow_quarters:
-                ltm[name] = None
-        return ltm
+    Returns {metric_name: [v_oldest, …, v_newest]} including a derived
+    'EBITDA' series. Series shorter than 2 points are omitted; the trend
+    computation downstream requires ≥3.
+    """
+    available, is_annual_only = _available_quarters(sid_data, kind_map, snapshot)
+    if not available:
+        return {}
 
-    min_flow = 1 if is_annual_only else 2
-    return build_ltm(recent_4, min_flow), build_ltm(prior_4, min_flow)
+    step, min_flow = (1, 1) if is_annual_only else (4, 4)
+
+    # Carve consecutive non-overlapping windows from the most recent backwards.
+    windows: list[dict] = []
+    end = len(available)
+    while end - step >= 0 and len(windows) < n_years:
+        windows.append(_build_ltm(available[end - step:end], kind_map, min_flow))
+        end -= step
+    windows.reverse()  # oldest → newest
+
+    series: dict[str, list] = {}
+    for field in _GROWTH_TREND_FIELDS:
+        vals = [w.get(field) for w in windows]
+        if all(v is not None for v in vals) and len(vals) >= 2:
+            series[field] = vals
+
+    ebitda = [
+        _ebitda(w.get('Operating Income (Loss)'), w.get('Depreciation & Amortization'))
+        for w in windows
+    ]
+    if all(v is not None for v in ebitda) and len(ebitda) >= 2:
+        series['EBITDA'] = ebitda
+
+    # FFO = Net Income + |D&A| per window (REIT growth, sector_type='reit').
+    ffo = [
+        (w['Net Income'] + abs(w['Depreciation & Amortization']))
+        if w.get('Net Income') is not None and w.get('Depreciation & Amortization') is not None
+        else None
+        for w in windows
+    ]
+    if all(v is not None for v in ffo) and len(ffo) >= 2:
+        series['FFO'] = ffo
+
+    return series
 
 
 # ---------------------------------------------------------------------------
@@ -839,51 +1053,72 @@ def compute_value_factors(
     return f
 
 
-def compute_growth_factors(cdata: dict, cdata_prior: dict) -> dict:
-    """7 YoY growth factors. Earnings/CF growth skipped when prior year is negative."""
+_GROWTH_MIN_YEARS = 3   # least-squares trend needs ≥3 annual points
+
+# Map each growth factor to the series key produced by select_growth_series.
+_GROWTH_FACTOR_FIELDS = (
+    ('Revenue Growth',          'Revenue'),
+    ('Earnings Growth',         'Net Income'),
+    ('Cash Flow Growth',        'Net Cash from Operating Activities'),
+    ('Operating Income Growth', 'Operating Income (Loss)'),
+    ('EBITDA Growth',           'EBITDA'),
+)
+
+
+def _trend_growth(series: list) -> float | None:
+    """MSCI-style growth: least-squares slope of the annual series divided by
+    the mean absolute level. Robust to a single depressed/negative base year —
+    a trough recovery no longer explodes the ratio (the KEY/asset-growth fix).
+
+    Requires ≥3 points. Returns None for a missing series or a degenerate
+    (~flat-zero) series whose mean level is not meaningfully positive.
+    """
+    if not series:
+        return None
+    n = len(series)
+    if n < _GROWTH_MIN_YEARS:
+        return None
+    y = np.asarray(series, dtype=float)
+    scale = float(np.mean(np.abs(y)))
+    if scale <= 0:
+        return None
+    x = np.arange(n, dtype=float)
+    # Closed-form OLS slope; var(x) > 0 for n ≥ 2.
+    slope = float(np.sum((x - x.mean()) * (y - y.mean())) / np.sum((x - x.mean()) ** 2))
+    return slope / scale
+
+
+def compute_growth_factors(growth_series: dict) -> dict:
+    """5 trend growth factors: annual-series slope ÷ mean(|level|) over the
+    trailing 3–5 fiscal years (whatever history is available, min 3).
+
+    Replaces the old 1-year YoY ratio, which was distorted by small/volatile
+    base years (e.g. a bank recovering from a one-off loss showed +7,000% EPS
+    growth). The trend measures *sustained* growth and sees through base effects.
+    """
     f = {}
-
-    def yoy(name: str, require_positive_base: bool = False):
-        cur = cdata.get(name)
-        pri = cdata_prior.get(name)
-        if cur is None or pri is None or pri == 0:
-            return None
-        if require_positive_base and pri < 0:
-            return None
-        return (cur - pri) / abs(pri)
-
-    for name, kw in [
-        ('Revenue Growth',            {'name': 'Revenue'}),
-        ('Earnings Growth',           {'name': 'Net Income', 'require_positive_base': True}),
-        ('Cash Flow Growth',          {'name': 'Net Cash from Operating Activities', 'require_positive_base': True}),
-        ('Asset Growth',              {'name': 'Total Assets'}),
-        ('Equity Growth',             {'name': 'Total Equity'}),
-        ('Operating Income Growth',   {'name': 'Operating Income (Loss)', 'require_positive_base': True}),
-    ]:
-        v = yoy(**kw)
+    for factor_name, field in _GROWTH_FACTOR_FIELDS:
+        series = growth_series.get(field)
+        if not series:
+            continue
+        v = _trend_growth(series)
         if v is not None:
-            f[name] = v
-
-    # EBITDA Growth: derive EBITDA = op_income + abs(D&A) for current and prior period
-    cur_ebitda = _ebitda(cdata.get('Operating Income (Loss)'), cdata.get('Depreciation & Amortization'))
-    pri_ebitda = _ebitda(cdata_prior.get('Operating Income (Loss)'), cdata_prior.get('Depreciation & Amortization'))
-    if cur_ebitda is not None and pri_ebitda is not None and pri_ebitda > 0:
-        f['EBITDA Growth'] = (cur_ebitda - pri_ebitda) / abs(pri_ebitda)
-
+            f[factor_name] = v
     return f
 
 
 def compute_momentum_factors(
     isin: str, prices: dict, ref_date: date = None
 ) -> dict:
-    """Risk-adjusted momentum and long-term reversal factors.
+    """Risk-adjusted momentum and reversal factors.
 
-    All three factors share the same computation: compounded total return over
-    the window divided by annualised realised volatility (std of log returns × √252).
+    All factors share the same computation: compounded total return over the
+    window divided by annualised realised volatility (std of log returns × √252).
 
-      6M Momentum   : T−6m  → T−1m   (skip-month)
-      12M Momentum  : T−12m → T−1m   (skip-month)
-      LT Reversal   : T−36m → T−13m  (window before momentum; direction=−1)
+      ST Reversal   : T−1m  → T       (the skipped recent month; direction=−1)
+      6M Momentum   : T−6m  → T−1m    (skip-month)
+      12M Momentum  : T−12m → T−1m    (skip-month)
+      LT Reversal   : T−36m → T−13m   (window before momentum; direction=−1)
     """
     f = {}
     entry = prices.get(isin)
@@ -901,10 +1136,11 @@ def compute_momentum_factors(
     if ref_idx < 1:
         return f
 
-    for start_months, end_months, name in [
-        (6,  1,  "6M Momentum"),
-        (12, 1,  "12M Momentum"),
-        (36, 13, "LT Reversal"),
+    for start_months, end_months, name, min_obs in [
+        (1,  0,  "ST Reversal",  15),
+        (6,  1,  "6M Momentum",  20),
+        (12, 1,  "12M Momentum", 20),
+        (36, 13, "LT Reversal",  20),
     ]:
         end_dt    = ref_dt - relativedelta(months=end_months)
         end_np    = np.datetime64(end_dt, "D").astype("datetime64[ns]")
@@ -918,7 +1154,7 @@ def compute_momentum_factors(
             continue
         window   = total_rets[start_idx : end_idx + 1]
         valid    = window[np.isfinite(window)]
-        if len(valid) < 20:
+        if len(valid) < min_obs:
             continue
         ret      = float(np.prod(1.0 + valid) - 1.0)
         log_rets = np.log(1.0 + valid)
@@ -1068,12 +1304,15 @@ def compute_svr_factors(
 
 
 def compute_reit_factors(
-    cdata: dict, cdata_prior: dict, isin: str, prices: dict, ref_date: date = None
+    cdata: dict, growth_series: dict, isin: str, prices: dict, ref_date: date = None
 ) -> dict:
     """
     REIT-specific factors based on Funds From Operations (FFO).
     FFO = Net Income + Depreciation & Amortization (D&A from CF statement).
     Only called for companies with sector_type == 'reit'.
+
+    FFO Growth uses the same multi-year trend method as the other growth factors
+    (slope of the annual FFO series ÷ mean(|FFO|)) — see _trend_growth.
     """
     f = {}
     net_income = cdata.get('Net Income')
@@ -1096,13 +1335,10 @@ def compute_reit_factors(
         if abs(ratio) <= 10:  # cap at 1000%; higher means SimFin revenue data is unreliable
             f['FFO Margin'] = ratio
 
-    # FFO Growth — skip if prior FFO was zero or negative
-    net_income_prior = cdata_prior.get('Net Income')
-    da_prior         = cdata_prior.get('Depreciation & Amortization')
-    if net_income_prior is not None and da_prior is not None:
-        ffo_prior = net_income_prior + abs(da_prior)
-        if ffo_prior > 0:
-            f['FFO Growth'] = (ffo - ffo_prior) / ffo_prior
+    # FFO Growth — multi-year trend of the annual FFO series.
+    ffo_growth = _trend_growth(growth_series.get('FFO'))
+    if ffo_growth is not None:
+        f['FFO Growth'] = ffo_growth
 
     return f
 
@@ -1157,6 +1393,7 @@ def run_for_date(
     constituent_data: dict,
     kind_map: dict,
     prices: dict,
+    splits: dict,
     svr_data: dict,
     factor_name_to_id: dict,
     factor_sector_types: dict,
@@ -1184,23 +1421,29 @@ def run_for_date(
         if not sid_data:
             continue
 
-        cdata, cdata_prior = select_ltm_data(sid_data, kind_map, snapshot)
+        # Growth factors use the multi-year trend series, not the prior-year LTM.
+        cdata, _ = select_ltm_data(sid_data, kind_map, snapshot)
         if not cdata:
             continue
+        growth_series = select_growth_series(sid_data, kind_map, snapshot)
+
+        # Restate point-in-time shares onto the current split-adjusted basis so
+        # market cap (split-adjusted price × shares) is continuous through splits.
+        _apply_split_adjustment(cdata, isin, splits)
 
         sector_type = meta.get('sector_type', 'general')
 
         factors: dict = {}
         factors.update(compute_quality_factors(cdata))
         factors.update(compute_value_factors(cdata, isin, prices, ref_date=snapshot))
-        factors.update(compute_growth_factors(cdata, cdata_prior))
+        factors.update(compute_growth_factors(growth_series))
         factors.update(compute_momentum_factors(isin, prices, ref_date=snapshot))
         factors.update(compute_size_factor(cdata, isin, prices, ref_date=snapshot))
         factors.update(compute_low_vol_factors(isin, prices, ref_date=snapshot))
         factors.update(compute_liquidity_factors(isin, prices, ref_date=snapshot))
         factors.update(compute_svr_factors(isin, svr_data, ref_date=snapshot))
         if sector_type == 'reit':
-            factors.update(compute_reit_factors(cdata, cdata_prior, isin, prices, ref_date=snapshot))
+            factors.update(compute_reit_factors(cdata, growth_series, isin, prices, ref_date=snapshot))
 
         allowed = _ALLOWED_FACTOR_SECTORS.get(sector_type, {'all', 'general'})
 
@@ -1219,6 +1462,10 @@ def run_for_date(
     if unknown_names:
         log.warning("factor names not in factors_reference.csv (skipped): %s", sorted(unknown_names))
 
+    # A snapshot rebuild is authoritative for that date. Delete existing rows
+    # first so factors that no longer pass data-quality gates do not linger from
+    # an older, more permissive run.
+    conn.execute("DELETE FROM factors WHERE data_date = ?", (date_str,))
     conn.executemany(
         "INSERT OR REPLACE INTO factors "
         "(data_date, factor_id, security_id, factor_value, update_date, computation_date) "
@@ -1305,6 +1552,7 @@ def main():
     constituent_data = load_constituent_data()
 
     prices   = load_price_data()
+    splits   = load_splits()
     svr_data = load_svr_data()
 
     with get_db(FACTORS_DB) as conn:
@@ -1315,7 +1563,7 @@ def main():
         for snapshot in dates_to_run:
             total_rows += run_for_date(
                 snapshot, universe, ticker_map,
-                constituent_data, kind_map, prices, svr_data,
+                constituent_data, kind_map, prices, splits, svr_data,
                 factor_name_to_id, factor_sector_types, log_transform_ids, conn,
             )
             conn.execute(

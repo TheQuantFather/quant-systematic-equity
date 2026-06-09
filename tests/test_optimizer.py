@@ -167,12 +167,12 @@ def test_minimize_variance_binding_max_position():
 # ── maximize_sharpe ─────────────────────────────────────────────────────────
 
 def test_maximize_sharpe_returns_valid_portfolio():
-    investable, alpha, _b, Sigma, L = _make_universe()
+    investable, alpha, b, Sigma, L = _make_universe()
     sectors, industries, B_sector, B_ind, cap_buckets, B_cap = _single_sector_industry()
     strat = _basic_strategy("maximize_sharpe")
 
     weights, info = _optimize_sharpe(
-        strat, investable, alpha, Sigma, L,
+        strat, investable, alpha, b, Sigma, L,
         sectors, industries, B_sector, B_ind, cap_buckets, B_cap,
     )
     _assert_valid_simplex(weights, max_position=0.5)
@@ -183,12 +183,12 @@ def test_maximize_sharpe_returns_valid_portfolio():
 def test_maximize_sharpe_orders_by_alpha_with_equal_vols():
     # Diagonal Σ and equal variances: the unconstrained Sharpe portfolio is
     # proportional to Σ⁻¹α — weights should rank-order the alphas.
-    investable, alpha, _b, Sigma, L = _make_universe()
+    investable, alpha, b, Sigma, L = _make_universe()
     sectors, industries, B_sector, B_ind, cap_buckets, B_cap = _single_sector_industry()
     strat = _basic_strategy("maximize_sharpe", max_position=0.5)   # loose cap
 
     weights, _ = _optimize_sharpe(
-        strat, investable, alpha, Sigma, L,
+        strat, investable, alpha, b, Sigma, L,
         sectors, industries, B_sector, B_ind, cap_buckets, B_cap,
     )
     # Strictly monotonic in alpha (stock i+1 has higher alpha → higher weight)
@@ -198,16 +198,50 @@ def test_maximize_sharpe_orders_by_alpha_with_equal_vols():
 def test_maximize_sharpe_max_position_binds_when_tight():
     # Tighten the cap below the unconstrained allocation (~33% on top name)
     # — now the cap should bind.
-    investable, alpha, _b, Sigma, L = _make_universe()
+    investable, alpha, b, Sigma, L = _make_universe()
     sectors, industries, B_sector, B_ind, cap_buckets, B_cap = _single_sector_industry()
     strat = _basic_strategy("maximize_sharpe", max_position=0.25)
 
     weights, _ = _optimize_sharpe(
-        strat, investable, alpha, Sigma, L,
+        strat, investable, alpha, b, Sigma, L,
         sectors, industries, B_sector, B_ind, cap_buckets, B_cap,
     )
     assert weights[-1] == pytest.approx(0.25, abs=1e-3)   # cap binds on highest-alpha
     assert np.all(weights <= 0.25 + 1e-5)
+
+
+def test_maximize_sharpe_respects_benchmark_relative_sector_band():
+    # Alpha wants to concentrate in Tech, but the benchmark-relative sector band
+    # should keep Tech within benchmark weight + tolerance.
+    investable = [f"ISIN-{i}" for i in range(4)]
+    Sigma = np.eye(4) * 0.04
+    L = np.linalg.cholesky(Sigma)
+    alpha = np.array([10.0, 9.0, 1.0, 1.0])
+    b = np.full(4, 0.25)
+
+    sectors = ["Tech", "Health Care"]
+    industries = ["X"]
+    B_sector = np.array([
+        [1, 1, 0, 0],
+        [0, 0, 1, 1],
+    ], dtype=float)
+    B_ind = np.ones((1, 4))
+    cap_buckets = ["all"]
+    B_cap = np.ones((1, 4))
+
+    strat = _basic_strategy(
+        "maximize_sharpe",
+        max_position=1.0,
+        max_sector_active_weight=0.05,
+    )
+
+    weights, _ = _optimize_sharpe(
+        strat, investable, alpha, b, Sigma, L,
+        sectors, industries, B_sector, B_ind, cap_buckets, B_cap,
+    )
+    tech_weight = float(B_sector[0] @ weights)
+    assert tech_weight <= 0.55 + 1e-5
+    assert tech_weight == pytest.approx(0.55, abs=1e-3)
 
 
 # ── Sector constraints ──────────────────────────────────────────────────────

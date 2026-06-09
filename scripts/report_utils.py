@@ -79,7 +79,7 @@ NARRATIVE_PLACEHOLDERS = ["EXEC_SUMMARY", "BULL_CASE", "BEAR_CASE",
                           "VERDICT_TAG", "VERDICT_BODY", "SOURCES"]
 
 # Share-outstanding constituent IDs to try (EDGAR universal first, SimFin legacy second).
-SHARES_CIDS = ("B3C4D5E6", "IIG88888")
+SHARES_CIDS = ("B3C4D5E6",)  # IIG88888 excluded: collides with InterestAndDividendIncome in EDGAR concept map
 
 
 # ---------------------------------------------------------------------------

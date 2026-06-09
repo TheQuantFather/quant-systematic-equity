@@ -1,4 +1,4 @@
-"""Tests for daily_update.py — orchestration, dependency skipping, and the
+"""Tests for daily_ecosystem_update.py - orchestration, dependency skipping, and the
 subprocess runner (live streaming + timeout enforcement).
 
 Strategy
@@ -9,7 +9,7 @@ Strategy
    when upstream failed, and when the runner returns False.
 3. `run` — exercised with tiny `python -c "..."` snippets to verify the
    success / non-zero-exit / timeout / spawn-error / streaming paths.
-4. End-to-end — invoke daily_update.py --dry-run --force-weekly via subprocess
+4. End-to-end - invoke daily_ecosystem_update.py --dry-run --force-weekly via subprocess
    to confirm the full orchestration produces the expected step sequence.
 """
 
@@ -21,8 +21,8 @@ from pathlib import Path
 
 import pytest
 
-import daily_update as du
-from daily_update import _execute_step, _unmet_deps, run
+import daily_ecosystem_update as du
+from daily_ecosystem_update import _execute_step, _unmet_deps, run
 
 
 REPO_DIR = Path(du.__file__).parent.resolve()
@@ -168,6 +168,11 @@ def test_run_dry_run_does_not_execute():
     assert run(cmd, timeout=10, dry_run=True) is True
 
 
+def test_run_returns_false_for_invalid_timeout():
+    cmd = [sys.executable, "-u", "-c", "print('should not run')"]
+    assert run(cmd, timeout=0) is False
+
+
 def test_run_kills_child_on_timeout():
     """A child sleeping past the deadline must be killed and run() returns False
     within a small margin of the timeout."""
@@ -193,11 +198,11 @@ def test_run_streams_output_line_by_line(caplog):
     )
     cmd = [sys.executable, "-u", "-c", child_code]
 
-    # daily_update's logger has propagate=False, so caplog (which hooks the
+    # daily_ecosystem_update's logger has propagate=False, so caplog (which hooks the
     # root logger) won't see records by default.  Temporarily enable it.
     du.log.propagate = True
     try:
-        with caplog.at_level("INFO", logger="daily_update"):
+        with caplog.at_level("INFO", logger="daily_ecosystem_update"):
             ok = run(cmd, timeout=10)
     finally:
         du.log.propagate = False
@@ -222,7 +227,7 @@ def test_dry_run_weekly_lists_expected_steps():
       - The final summary reports success (exit 0)
     """
     proc = subprocess.run(
-        [sys.executable, str(REPO_DIR / "daily_update.py"),
+        [sys.executable, str(REPO_DIR / "daily_ecosystem_update.py"),
          "--dry-run", "--force-weekly"],
         capture_output=True, text=True, timeout=60,
     )
@@ -232,6 +237,7 @@ def test_dry_run_weekly_lists_expected_steps():
     expected_steps = [
         "pipeline.create_returns --update",
         "pipeline.update_constituents",
+        "pipeline.create_macro_signals --date",
         "pipeline.create_factors --date",
         "pipeline.create_models --date",
         "pipeline.create_risk --date",
@@ -249,7 +255,7 @@ def test_dry_run_default_skips_weekly_on_non_friday():
     """Without --force-weekly, the rebuild only runs on Fridays.  We verify
     behaviour matches today's day-of-week — either weekly is present or it isn't."""
     proc = subprocess.run(
-        [sys.executable, str(REPO_DIR / "daily_update.py"), "--dry-run"],
+        [sys.executable, str(REPO_DIR / "daily_ecosystem_update.py"), "--dry-run"],
         capture_output=True, text=True, timeout=30,
     )
     assert proc.returncode == 0
@@ -257,13 +263,14 @@ def test_dry_run_default_skips_weekly_on_non_friday():
     # Daily steps always appear:
     assert "pipeline.create_returns --update" in text
     assert "pipeline.update_constituents" in text
+    assert "pipeline.create_macro_signals --date" in text
 
 
 def test_dry_run_skip_returns_marks_downstream_runnable():
     """--skip-returns must not break the dependency chain — downstream
     (factors, risk, barra) should still appear in the dry-run plan."""
     proc = subprocess.run(
-        [sys.executable, str(REPO_DIR / "daily_update.py"),
+        [sys.executable, str(REPO_DIR / "daily_ecosystem_update.py"),
          "--dry-run", "--force-weekly", "--skip-returns"],
         capture_output=True, text=True, timeout=60,
     )

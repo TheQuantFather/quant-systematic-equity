@@ -1,42 +1,54 @@
 """
 create_universe.py
 
-Builds universe.db with two tables:
+Maintains universe.db. The production universe membership source is EDGAR
+N-PORT-P filings for registered ETF proxies such as IVV (S&P 500) and IWB
+(Russell 1000). Local iShares holdings CSVs and SimFin metadata are retained
+only as explicit legacy/bootstrap paths.
 
-  companies          — one row per security (ISIN primary key), enriched with
-                       metadata from iShares (GICS sector, exchange, country)
-                       and SimFin (CIK, fiscal year end, employees, business
-                       summary, SimFin sector/industry).
+Core tables:
 
-  universe_snapshots — index membership per snapshot date, one row per
-                       (snapshot_date, isin, index_name).  Populated from
-                       iShares holdings CSVs dropped into data/universe_index/.
+  companies                — security master keyed by ISIN. Still contains some
+                             legacy SimFin fields while the EDGAR-first security
+                             master is being completed.
 
-Run:
-  python create_universe.py
+  universe_snapshots       — raw point-in-time index membership, one row per
+                             (snapshot_date, isin, index_name), normally rebuilt
+                             from N-PORT accessions.
 
-Add a new index snapshot:
-  1. Download the iShares holdings CSV for that index and date.
-  2. Drop it into data/universe_index/ with a filename convention:
-         <index_name>_<YYYY_MM_DD>.csv   e.g. russell_1000_2025_04_01.csv
-  3. Re-run this script — it merges all files, deduplicating by ISIN.
+  clean_universe_snapshots — optimizer-facing cleaned membership with identity
+                             mapping/tradability audit fields.
+
+Common production commands:
+  python pipeline/create_universe.py --ensure-snapshot YYYY-MM-DD
+  python pipeline/create_universe.py --rebuild-snapshots
+  python pipeline/create_universe.py --materialize-clean-snapshots --clean-mode live --clean-latest-only
+
+Legacy/bootstrap only:
+  python pipeline/create_universe.py --legacy-rebuild-companies
+  python pipeline/create_universe.py --rebuild-snapshots --include-legacy-csv
 """
 
 import json
+import re
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+import sys
 
 import pandas as pd
 import sqlite3
 from pathlib import Path
 from datetime import datetime
 
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from config import (
-    DATA_DIR, SIMFIN_DIR, UNIVERSE_DB as DB_PATH, FACTORS_DB,
+    DATA_DIR, SIMFIN_DIR, UNIVERSE_DB as DB_PATH, FACTORS_DB, CONSTITUENTS_DB,
     SCHEDULE_MONTHLY_START, SCHEDULE_WEEKLY_CUTOVER,
 )
 from utils import get_db, get_logger
@@ -110,6 +122,36 @@ def load_ticker_alias() -> dict[str, str]:
     return {r[0]: r[1] for r in rows}
 
 
+def seed_simfin_exclude_table(conn: "sqlite3.Connection") -> None:
+    """Create simfin_exclude table if it doesn't exist yet."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS simfin_exclude (
+            ticker TEXT PRIMARY KEY,
+            note   TEXT
+        )
+    """)
+    conn.commit()
+
+
+def load_simfin_exclude() -> set[str]:
+    """Return iShares tickers that must not be enriched from SimFin by ticker."""
+    with get_db(DB_PATH) as conn:
+        rows = conn.execute("SELECT ticker FROM simfin_exclude").fetchall()
+    return {str(r[0]).upper().strip() for r in rows}
+
+
+def seed_security_data_start_table(conn: "sqlite3.Connection") -> None:
+    """Create security_data_start table if it doesn't exist yet."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS security_data_start (
+            isin            TEXT PRIMARY KEY,
+            min_report_date TEXT NOT NULL,
+            note            TEXT
+        )
+    """)
+    conn.commit()
+
+
 def seed_registry_tables(conn: "sqlite3.Connection") -> None:
     """Create index_registry and nport_accessions tables if they don't exist yet."""
     conn.execute("""
@@ -131,6 +173,100 @@ def seed_registry_tables(conn: "sqlite3.Connection") -> None:
             PRIMARY KEY (index_name, snapshot_date),
             FOREIGN KEY (index_name) REFERENCES index_registry(index_name)
         )
+    """)
+    conn.commit()
+
+
+def seed_nport_security_metadata_table(conn: "sqlite3.Connection") -> None:
+    """Create N-PORT security metadata staging table if it does not exist."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS nport_security_metadata (
+            accession          TEXT NOT NULL,
+            filing_cik         TEXT NOT NULL,
+            isin               TEXT NOT NULL,
+            security_name      TEXT,
+            security_title     TEXT,
+            cusip              TEXT,
+            lei                TEXT,
+            balance            REAL,
+            units              TEXT,
+            currency           TEXT,
+            market_value       REAL,
+            weight             REAL,
+            payoff_profile     TEXT,
+            asset_category     TEXT,
+            issuer_category    TEXT,
+            investment_country TEXT,
+            is_restricted      TEXT,
+            fair_value_level   TEXT,
+            fetched_at         TEXT NOT NULL,
+            PRIMARY KEY (accession, isin)
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_nport_security_metadata_isin
+        ON nport_security_metadata(isin)
+    """)
+    conn.commit()
+
+
+def seed_nport_company_candidates_table(conn: "sqlite3.Connection") -> None:
+    """Create derived N-PORT company candidate staging table if it does not exist."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS nport_company_candidates (
+            isin                       TEXT PRIMARY KEY,
+            security_name              TEXT,
+            security_title             TEXT,
+            cusip                      TEXT,
+            lei                        TEXT,
+            currency                   TEXT,
+            investment_country         TEXT,
+            first_snapshot_date        TEXT,
+            last_snapshot_date         TEXT,
+            max_weight                 REAL,
+            seen_indexes               TEXT,
+            accessions                 TEXT,
+            company_status             TEXT NOT NULL,
+            existing_ticker            TEXT,
+            existing_company_name      TEXT,
+            existing_gics_sector       TEXT,
+            existing_gics_industry     TEXT,
+            resolved_ticker            TEXT,
+            resolved_cik               TEXT,
+            resolved_company_name      TEXT,
+            resolved_exchange          TEXT,
+            resolution_status          TEXT,
+            resolution_confidence      REAL,
+            resolver_sources           TEXT,
+            resolution_evidence        TEXT,
+            resolved_at                TEXT,
+            candidate_source           TEXT NOT NULL,
+            staged_at                  TEXT NOT NULL
+        )
+    """)
+    existing_cols = {
+        row[1] for row in conn.execute("PRAGMA table_info(nport_company_candidates)").fetchall()
+    }
+    for col_name, col_type in {
+        "resolved_ticker": "TEXT",
+        "resolved_cik": "TEXT",
+        "resolved_company_name": "TEXT",
+        "resolved_exchange": "TEXT",
+        "resolution_status": "TEXT",
+        "resolution_confidence": "REAL",
+        "resolver_sources": "TEXT",
+        "resolution_evidence": "TEXT",
+        "resolved_at": "TEXT",
+    }.items():
+        if col_name not in existing_cols:
+            conn.execute(f"ALTER TABLE nport_company_candidates ADD COLUMN {col_name} {col_type}")
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_nport_company_candidates_status
+        ON nport_company_candidates(company_status)
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_nport_company_candidates_last_snapshot
+        ON nport_company_candidates(last_snapshot_date)
     """)
     conn.commit()
 
@@ -159,7 +295,7 @@ def rebuild_snapshot_schedule(
     Rule:
       - 'monthly' : month-end of every month from monthly_start up to weekly_cutover.
       - 'weekly'  : existing computed snapshot dates on/after weekly_cutover (the
-                    weekly cadence added by daily_update.py — left as-is, not generated).
+                    weekly cadence added by daily_ecosystem_update.py — left as-is, not generated).
       - 'legacy'  : existing computed snapshot dates before weekly_cutover that are not
                     month-ends (the old 15th-quarterly / April-1-annual grid) — kept,
                     tagged, never recomputed.
@@ -230,7 +366,11 @@ def seed_all_reference_tables(conn: "sqlite3.Connection") -> None:
     """Ensure all persistent reference tables exist (schema only, no data insertion)."""
     seed_isin_patch_table(conn)
     seed_ticker_alias_table(conn)
+    seed_simfin_exclude_table(conn)
+    seed_security_data_start_table(conn)
     seed_registry_tables(conn)
+    seed_nport_security_metadata_table(conn)
+    seed_nport_company_candidates_table(conn)
     seed_snapshot_schedule_table(conn)
 
 
@@ -368,6 +508,7 @@ def build_companies(
     simfin: pd.DataFrame,
     patch: dict[str, str] | None = None,
     alias: dict[str, str] | None = None,
+    simfin_exclude: set[str] | None = None,
 ) -> pd.DataFrame:
     """
     Build the companies table from all iShares snapshots merged with SimFin.
@@ -375,9 +516,12 @@ def build_companies(
 
     patch: ISIN overrides (ticker → ISIN). If None, load_isin_patch() is used.
     alias: SimFin ticker aliases (iShares ticker → SimFin ticker). If None, load_ticker_alias() is used.
+    simfin_exclude: iShares tickers to keep off SimFin ticker matching. Use for
+                    ticker reuse where SimFin still describes an old issuer.
     """
     _patch = patch if patch is not None else load_isin_patch()
     _alias = alias if alias is not None else load_ticker_alias()
+    _simfin_exclude = simfin_exclude if simfin_exclude is not None else load_simfin_exclude()
     today = datetime.now().date().isoformat()
 
     # SimFin lookup by ticker
@@ -395,10 +539,14 @@ def build_companies(
             if not ticker or ticker in ("NAN", "-"):
                 continue
 
-            # Match to SimFin: direct ticker, then alias from DB
-            sf = sf_by_ticker.get(ticker)
-            if sf is None:
-                sf = sf_by_ticker.get(_alias.get(ticker, ""))
+            # Match to SimFin: direct ticker, then alias from DB. Some tickers
+            # are reused by unrelated issuers; those are excluded by reference
+            # table so iShares/EDGAR metadata remains authoritative.
+            sf = None
+            if ticker not in _simfin_exclude:
+                sf = sf_by_ticker.get(ticker)
+                if sf is None:
+                    sf = sf_by_ticker.get(_alias.get(ticker, ""))
 
             # Resolve ISIN: patch always wins over SimFin (SimFin has wrong ISINs for ~39 companies)
             isin: str | None = _patch.get(ticker)
@@ -509,6 +657,64 @@ def build_snapshots(
 # Historical universe snapshots from EDGAR N-PORT-P
 # ---------------------------------------------------------------------------
 
+def _nport_text(inv: ET.Element, ns: dict[str, str], tag: str) -> str | None:
+    el = inv.find(f"n:{tag}", ns)
+    if el is None or el.text is None:
+        return None
+    text = el.text.strip()
+    return text or None
+
+
+def _nport_float(inv: ET.Element, ns: dict[str, str], tag: str) -> float | None:
+    text = _nport_text(inv, ns, tag)
+    if text is None:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _parse_nport_ec_holdings(xml_data: bytes) -> list[dict]:
+    root = ET.fromstring(xml_data)
+    ns = {"n": "http://www.sec.gov/edgar/nport"}
+    holdings = []
+    for inv in root.findall(".//n:invstOrSec", ns):
+        asset_category = _nport_text(inv, ns, "assetCat")
+        if asset_category != "EC":
+            continue
+        isin_el = inv.find("n:identifiers/n:isin", ns)
+        isin = isin_el.get("value", "").strip() if isin_el is not None else ""
+        if not isin or isin == "N/A":
+            continue
+        holdings.append({
+            "isin": isin,
+            "security_name": _nport_text(inv, ns, "name"),
+            "security_title": _nport_text(inv, ns, "title"),
+            "cusip": _nport_text(inv, ns, "cusip"),
+            "lei": _nport_text(inv, ns, "lei"),
+            "balance": _nport_float(inv, ns, "balance"),
+            "units": _nport_text(inv, ns, "units"),
+            "currency": _nport_text(inv, ns, "curCd"),
+            "market_value": _nport_float(inv, ns, "valUSD"),
+            "weight": _nport_float(inv, ns, "pctVal"),
+            "payoff_profile": _nport_text(inv, ns, "payoffProfile"),
+            "asset_category": asset_category,
+            "issuer_category": _nport_text(inv, ns, "issuerCat"),
+            "investment_country": _nport_text(inv, ns, "invCountry"),
+            "is_restricted": _nport_text(inv, ns, "isRestrictedSec"),
+            "fair_value_level": _nport_text(inv, ns, "fairValLevel"),
+        })
+    return holdings
+
+
+def _fetch_nport_holdings(acc: str, cik: str) -> list[dict]:
+    acc_clean = acc.replace("-", "")
+    url = f"https://www.sec.gov/Archives/edgar/data/{cik}/{acc_clean}/primary_doc.xml"
+    xml_data = _edgar_fetch_bytes(url, timeout=60)
+    return _parse_nport_ec_holdings(xml_data)
+
+
 def _fetch_nport_isins(acc: str, cik: str, known_isins: set[str] | None = None) -> list[dict]:
     """
     Fetch one N-PORT-P filing and return ALL equity holdings as dicts.
@@ -523,28 +729,14 @@ def _fetch_nport_isins(acc: str, cik: str, known_isins: set[str] | None = None) 
     *scrape-time* universe state into the historical record and produced the
     under-counted snapshots (~749 vs ~1000) seen in pre-2024 dates.
     """
-    acc_clean = acc.replace("-", "")
-    url = f"https://www.sec.gov/Archives/edgar/data/{cik}/{acc_clean}/primary_doc.xml"
-    xml_data = _edgar_fetch_bytes(url, timeout=60)
-    root = ET.fromstring(xml_data)
-    ns   = {"n": "http://www.sec.gov/edgar/nport"}
-    holdings = []
-    for inv in root.findall(".//n:invstOrSec", ns):
-        isin_el = inv.find("n:identifiers/n:isin", ns)
-        val_el  = inv.find("n:valUSD", ns)
-        pct_el  = inv.find("n:pctVal", ns)
-        cat_el  = inv.find("n:assetCat", ns)
-        isin = isin_el.get("value", "") if isin_el is not None else ""
-        if not isin or isin == "N/A":
-            continue
-        if (cat_el.text if cat_el is not None else "") != "EC":
-            continue
-        holdings.append({
-            "isin":         isin,
-            "weight":       float(pct_el.text) if pct_el is not None else None,
-            "market_value": float(val_el.text) if val_el is not None else None,
-        })
-    return holdings
+    return [
+        {
+            "isin": h["isin"],
+            "weight": h["weight"],
+            "market_value": h["market_value"],
+        }
+        for h in _fetch_nport_holdings(acc, cik)
+    ]
 
 
 def build_historical_snapshots(
@@ -559,7 +751,8 @@ def build_historical_snapshots(
               If None, load_index_registry() is called automatically.
     Deduplicates fetches: if multiple snapshot dates share the same accession for
     an index, the XML is fetched once and applied to all matching dates.
-    Only companies whose ISIN is in the companies table are included.
+    All EC holdings reported in the N-PORT filing are included. Downstream
+    consumers decide how to handle missing metadata/returns coverage.
     """
     _registry = registry if registry is not None else load_index_registry()
     rows = []
@@ -687,21 +880,815 @@ def enrich_edgar_metadata(companies: pd.DataFrame) -> pd.DataFrame:
 
 def _fetch_nport_all_ec_isins(acc: str, cik: str) -> set[str]:
     """Fetch one N-PORT-P filing and return the set of ISINs for all EC holdings."""
-    acc_clean = acc.replace("-", "")
-    url = f"https://www.sec.gov/Archives/edgar/data/{cik}/{acc_clean}/primary_doc.xml"
-    xml_data = _edgar_fetch_bytes(url, timeout=60)
-    root = ET.fromstring(xml_data)
-    ns = {"n": "http://www.sec.gov/edgar/nport"}
-    isins: set[str] = set()
-    for inv in root.findall(".//n:invstOrSec", ns):
-        cat_el = inv.find("n:assetCat", ns)
-        if (cat_el.text if cat_el is not None else "") != "EC":
+    return {h["isin"] for h in _fetch_nport_holdings(acc, cik)}
+
+
+def _selected_nport_accessions(
+    *,
+    indexes: list[str] | None = None,
+    only_latest: bool = False,
+) -> list[tuple[str, str, str, str | None, str]]:
+    """Return unique (index_name, accession, cik, period_ending, snapshot_date) rows."""
+    registry = load_index_registry()
+    rows: list[tuple[str, str, str, str | None, str]] = []
+    selected = set(indexes or [])
+    for index_name, idx in registry.items():
+        if selected and index_name not in selected:
             continue
-        isin_el = inv.find("n:identifiers/n:isin", ns)
-        isin = isin_el.get("value", "") if isin_el is not None else ""
-        if isin and isin != "N/A":
-            isins.add(isin)
-    return isins
+        cik = idx.get("cik")
+        if not cik or not idx["filings"]:
+            continue
+        filings = idx["filings"]
+        dates = [max(filings)] if only_latest else sorted(filings)
+        for snapshot_date in dates:
+            accession, period_ending = filings[snapshot_date]
+            rows.append((index_name, accession, cik, period_ending, snapshot_date))
+
+    # Same accession can back multiple snapshot dates. Fetch/store once.
+    dedup: dict[tuple[str, str], tuple[str, str, str, str | None, str]] = {}
+    for row in rows:
+        _, accession, cik, _, _ = row
+        dedup.setdefault((accession, cik), row)
+    return sorted(dedup.values(), key=lambda r: (r[0], r[4], r[1]))
+
+
+def refresh_nport_security_metadata(
+    *,
+    indexes: list[str] | None = None,
+    only_latest: bool = False,
+    force: bool = False,
+) -> None:
+    """Fetch N-PORT EC holding metadata and stage it in nport_security_metadata."""
+    accessions = _selected_nport_accessions(indexes=indexes, only_latest=only_latest)
+    if not accessions:
+        raise RuntimeError("No N-PORT accessions selected. Check index_registry/nport_accessions.")
+
+    now = datetime.now().isoformat(timespec="seconds")
+    insert_sql = """
+        INSERT OR REPLACE INTO nport_security_metadata (
+            accession, filing_cik, isin, security_name, security_title, cusip,
+            lei, balance, units, currency, market_value, weight, payoff_profile,
+            asset_category, issuer_category, investment_country, is_restricted,
+            fair_value_level, fetched_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """
+    with get_db(DB_PATH) as conn:
+        seed_nport_security_metadata_table(conn)
+        existing = {
+            r[0] for r in conn.execute(
+                "SELECT DISTINCT accession FROM nport_security_metadata"
+            ).fetchall()
+        }
+
+    written = skipped = failures = 0
+    log.info(
+        "Refreshing N-PORT security metadata: accessions=%d indexes=%s latest_only=%s force=%s",
+        len(accessions), ",".join(indexes or ["all"]), only_latest, force,
+    )
+    for index_name, accession, cik, period_ending, snapshot_date in accessions:
+        if accession in existing and not force:
+            skipped += 1
+            continue
+        try:
+            holdings = _fetch_nport_holdings(accession, cik)
+        except Exception as exc:
+            failures += 1
+            log.warning("[%s %s %s] N-PORT metadata fetch failed: %s",
+                        index_name, snapshot_date, accession, exc)
+            continue
+        rows = [
+            (
+                accession, cik, h["isin"], h["security_name"], h["security_title"],
+                h["cusip"], h["lei"], h["balance"], h["units"], h["currency"],
+                h["market_value"], h["weight"], h["payoff_profile"],
+                h["asset_category"], h["issuer_category"], h["investment_country"],
+                h["is_restricted"], h["fair_value_level"], now,
+            )
+            for h in holdings
+        ]
+        with get_db(DB_PATH) as conn:
+            seed_nport_security_metadata_table(conn)
+            conn.executemany(insert_sql, rows)
+            conn.commit()
+        written += len(rows)
+        log.info("[%s %s] %s: staged %d EC holdings", index_name, snapshot_date, accession, len(rows))
+        time.sleep(0.3)
+
+    log.info(
+        "N-PORT security metadata refresh done: rows_written=%s skipped_accessions=%d failures=%d",
+        f"{written:,}", skipped, failures,
+    )
+
+
+def _first_clean(values: pd.Series) -> str | None:
+    for value in values:
+        if pd.isna(value):
+            continue
+        cleaned = str(value).strip()
+        if cleaned and cleaned.upper() != "N/A":
+            return cleaned
+    return None
+
+
+def stage_nport_company_candidates(
+    *,
+    indexes: list[str] | None = None,
+    only_latest: bool = False,
+) -> None:
+    """Derive reviewable security-master candidates from staged N-PORT metadata.
+
+    This deliberately does not mutate companies. It gives us a durable audit
+    layer for missing or weak security-master coverage before we resolve
+    tickers/CIKs or apply any production backfill.
+    """
+    idx_filter = ""
+    params: list[object] = []
+    if indexes:
+        idx_filter = f"AND us.index_name IN ({','.join('?' * len(indexes))})"
+        params.extend(indexes)
+
+    latest_filter = ""
+    if only_latest:
+        latest_filter = """
+          AND us.snapshot_date = (
+              SELECT MAX(us2.snapshot_date)
+              FROM universe_snapshots us2
+              WHERE us2.index_name = us.index_name
+          )
+        """
+
+    sql = f"""
+        SELECT us.index_name, us.snapshot_date, us.isin, us.weight, us.market_value,
+               na.accession,
+               nm.security_name, nm.security_title, nm.cusip, nm.lei,
+               nm.currency, nm.investment_country,
+               c.ticker AS existing_ticker,
+               c.company_name AS existing_company_name,
+               c.gics_sector AS existing_gics_sector,
+               c.gics_industry AS existing_gics_industry
+        FROM universe_snapshots us
+        JOIN nport_accessions na
+          ON na.index_name = us.index_name
+         AND na.snapshot_date = us.snapshot_date
+        JOIN nport_security_metadata nm
+          ON nm.accession = na.accession
+         AND nm.isin = us.isin
+        LEFT JOIN companies c ON c.isin = us.isin
+        WHERE 1=1 {idx_filter} {latest_filter}
+    """
+
+    with get_db(DB_PATH) as conn:
+        seed_nport_security_metadata_table(conn)
+        seed_nport_company_candidates_table(conn)
+        existing_resolutions = pd.read_sql_query(
+            """
+            SELECT isin, resolved_ticker, resolved_cik, resolved_company_name,
+                   resolved_exchange, resolution_status, resolution_confidence,
+                   resolver_sources, resolution_evidence, resolved_at
+            FROM nport_company_candidates
+            """,
+            conn,
+        )
+        raw = pd.read_sql_query(sql, conn, params=tuple(params))
+
+    if raw.empty:
+        log.warning(
+            "No staged N-PORT company candidates found. Run --refresh-nport-metadata first."
+        )
+        return
+
+    raw["weight"] = pd.to_numeric(raw["weight"], errors="coerce").fillna(0.0)
+    raw = raw.sort_values(
+        ["isin", "snapshot_date", "weight"],
+        ascending=[True, False, False],
+    )
+
+    preferred = (
+        raw.groupby("isin", as_index=False)
+        .agg(
+            security_name=("security_name", _first_clean),
+            security_title=("security_title", _first_clean),
+            cusip=("cusip", _first_clean),
+            lei=("lei", _first_clean),
+            currency=("currency", _first_clean),
+            investment_country=("investment_country", _first_clean),
+            existing_ticker=("existing_ticker", _first_clean),
+            existing_company_name=("existing_company_name", _first_clean),
+            existing_gics_sector=("existing_gics_sector", _first_clean),
+            existing_gics_industry=("existing_gics_industry", _first_clean),
+        )
+    )
+    rollup = (
+        raw.groupby("isin", as_index=False)
+        .agg(
+            first_snapshot_date=("snapshot_date", "min"),
+            last_snapshot_date=("snapshot_date", "max"),
+            max_weight=("weight", "max"),
+            seen_indexes=("index_name", lambda s: "|".join(sorted({str(v) for v in s if pd.notna(v)}))),
+            accessions=("accession", lambda s: "|".join(sorted({str(v) for v in s if pd.notna(v)}))),
+        )
+    )
+    candidates = preferred.merge(rollup, on="isin", how="left")
+    candidates["company_status"] = candidates["existing_company_name"].notna().map(
+        {True: "exists_in_companies", False: "missing_from_companies"}
+    )
+    candidates["candidate_source"] = "nport_security_metadata"
+    candidates["staged_at"] = datetime.now().isoformat(timespec="seconds")
+    if not existing_resolutions.empty:
+        candidates = candidates.merge(existing_resolutions, on="isin", how="left")
+    else:
+        for col in [
+            "resolved_ticker", "resolved_cik", "resolved_company_name",
+            "resolved_exchange", "resolution_status", "resolution_confidence",
+            "resolver_sources", "resolution_evidence", "resolved_at",
+        ]:
+            candidates[col] = None
+    candidates = candidates[
+        [
+            "isin", "security_name", "security_title", "cusip", "lei",
+            "currency", "investment_country", "first_snapshot_date",
+            "last_snapshot_date", "max_weight", "seen_indexes", "accessions",
+            "company_status", "existing_ticker", "existing_company_name",
+            "existing_gics_sector", "existing_gics_industry",
+            "resolved_ticker", "resolved_cik", "resolved_company_name",
+            "resolved_exchange", "resolution_status", "resolution_confidence",
+            "resolver_sources", "resolution_evidence", "resolved_at",
+            "candidate_source", "staged_at",
+        ]
+    ]
+
+    with get_db(DB_PATH) as conn:
+        seed_nport_company_candidates_table(conn)
+        conn.execute("DELETE FROM nport_company_candidates")
+        candidates.to_sql("nport_company_candidates", conn, if_exists="append", index=False)
+        conn.commit()
+
+    missing = int(candidates["company_status"].eq("missing_from_companies").sum())
+    log.info(
+        "Staged N-PORT company candidates: rows=%s missing_from_companies=%d latest_only=%s indexes=%s",
+        f"{len(candidates):,}",
+        missing,
+        only_latest,
+        ",".join(indexes or ["all"]),
+    )
+
+
+def _resolution_name_tokens(value: object) -> set[str]:
+    raw = str(value or "").upper()
+    replacements = {
+        "&": " AND ",
+        ".": " ",
+        ",": " ",
+        "'": " ",
+        "\"": " ",
+        "/": " ",
+        "-": " ",
+        "(": " ",
+        ")": " ",
+    }
+    for old, new in replacements.items():
+        raw = raw.replace(old, new)
+    stop = {
+        "THE", "INC", "INCORPORATED", "CORP", "CORPORATION", "CO", "COMPANY",
+        "PLC", "LTD", "LIMITED", "NV", "N", "V", "SA", "AG", "LP", "LLC",
+        "CLASS", "COM", "COMMON", "STOCK", "NEW", "GROUP", "HOLDINGS",
+    }
+    return {t for t in raw.split() if t and t not in stop and len(t) > 1}
+
+
+def _resolution_name_similarity(left: object, right: object) -> float:
+    l_tokens = _resolution_name_tokens(left)
+    r_tokens = _resolution_name_tokens(right)
+    if not l_tokens or not r_tokens:
+        return 0.0
+    return len(l_tokens & r_tokens) / len(l_tokens | r_tokens)
+
+
+def _load_sec_company_tickers() -> dict[str, dict[str, str]]:
+    """Load SEC ticker->CIK/title reference from company_tickers.json."""
+    data = _edgar_fetch("https://www.sec.gov/files/company_tickers.json", timeout=20)
+    out: dict[str, dict[str, str]] = {}
+    for entry in data.values():
+        ticker = str(entry.get("ticker", "")).upper().strip()
+        if not ticker:
+            continue
+        cik_raw = entry.get("cik_str")
+        cik = str(cik_raw).zfill(10) if cik_raw is not None else ""
+        out[ticker] = {
+            "cik": cik,
+            "title": str(entry.get("title", "")).strip(),
+        }
+    return out
+
+
+def _sec_ticker_variants(ticker: str | None) -> list[str]:
+    if not ticker:
+        return []
+    raw = str(ticker).upper().strip()
+    variants = [raw]
+    compact = "".join(ch for ch in raw if ch.isalnum())
+    if compact and compact not in variants:
+        variants.append(compact)
+    trimmed = raw.rstrip("/")
+    if trimmed and trimmed not in variants:
+        variants.append(trimmed)
+    no_trailing_digits = compact.rstrip("0123456789")
+    if no_trailing_digits and no_trailing_digits not in variants:
+        variants.append(no_trailing_digits)
+    return variants
+
+
+def _match_sec_ticker(
+    *,
+    openfigi_ticker: str | None,
+    security_name: object,
+    security_title: object,
+    sec_by_ticker: dict[str, dict[str, str]],
+) -> tuple[str | None, dict[str, str], float, str]:
+    names = [security_name, security_title]
+    for variant in _sec_ticker_variants(openfigi_ticker):
+        sec = sec_by_ticker.get(variant)
+        if sec:
+            score = max(_resolution_name_similarity(name, sec.get("title")) for name in names)
+            return variant, sec, score, "sec_ticker_variant"
+
+    best_ticker = None
+    best_sec: dict[str, str] = {}
+    best_score = 0.0
+    for ticker, sec in sec_by_ticker.items():
+        score = max(_resolution_name_similarity(name, sec.get("title")) for name in names)
+        if score > best_score:
+            best_ticker = ticker
+            best_sec = sec
+            best_score = score
+
+    if best_ticker and best_score >= 0.75:
+        return best_ticker, best_sec, best_score, "sec_name_match"
+    return None, {}, 0.0, "no_sec_match"
+
+
+def _fetch_sec_submission_summary(cik: str) -> dict[str, object]:
+    if not cik:
+        return {}
+    try:
+        sub = _edgar_fetch(f"https://data.sec.gov/submissions/CIK{cik}.json", timeout=15)
+    except Exception:
+        return {}
+    return {
+        "name": sub.get("name") or "",
+        "tickers": sub.get("tickers") or [],
+        "exchanges": sub.get("exchanges") or [],
+    }
+
+
+def resolve_nport_company_candidates(limit: int | None = None) -> None:
+    """Resolve missing N-PORT company candidates to ticker/CIK for review.
+
+    Updates only resolution columns on nport_company_candidates. It does not
+    insert into companies and does not create manual mappings.
+    """
+    figi_key = _load_openfigi_api_key()
+    with get_db(DB_PATH) as conn:
+        seed_nport_company_candidates_table(conn)
+        sql = """
+            SELECT isin, security_name, security_title, cusip, lei
+            FROM nport_company_candidates
+            WHERE company_status = 'missing_from_companies'
+            ORDER BY max_weight DESC, isin
+        """
+        if limit is not None:
+            sql += " LIMIT ?"
+            candidates = pd.read_sql_query(sql, conn, params=(limit,))
+        else:
+            candidates = pd.read_sql_query(sql, conn)
+
+    if candidates.empty:
+        log.info("No missing N-PORT company candidates to resolve.")
+        return
+
+    isins = candidates["isin"].astype(str).tolist()
+    log.info("Resolving %d N-PORT candidate ISINs via OpenFIGI ...", len(isins))
+    isin_to_ticker = _openfigi_map_isins(isins, figi_key=figi_key)
+    log.info("  OpenFIGI resolved %d / %d tickers", len(isin_to_ticker), len(isins))
+
+    try:
+        sec_by_ticker = _load_sec_company_tickers()
+    except Exception as exc:
+        log.warning("SEC company_tickers.json fetch failed: %s", exc)
+        sec_by_ticker = {}
+
+    rows: list[tuple] = []
+    now = datetime.now().isoformat(timespec="seconds")
+    for candidate in candidates.to_dict("records"):
+        isin = str(candidate["isin"])
+        openfigi_ticker = isin_to_ticker.get(isin)
+        sec_ticker, sec, sec_name_score, sec_match_rule = _match_sec_ticker(
+            openfigi_ticker=openfigi_ticker,
+            security_name=candidate.get("security_name"),
+            security_title=candidate.get("security_title"),
+            sec_by_ticker=sec_by_ticker,
+        )
+        ticker = sec_ticker or openfigi_ticker
+        cik = sec.get("cik", "")
+        sec_title = sec.get("title", "")
+        submission = _fetch_sec_submission_summary(cik) if cik else {}
+        submission_name = str(submission.get("name") or "")
+        exchanges = submission.get("exchanges") or []
+        exchange = str(exchanges[0]) if exchanges else ""
+        resolved_name = submission_name or sec_title
+        name_similarity = max(
+            _resolution_name_similarity(candidate.get("security_name"), resolved_name),
+            _resolution_name_similarity(candidate.get("security_title"), resolved_name),
+        )
+
+        sources: list[str] = []
+        evidence_parts = [
+            f"nport_name={candidate.get('security_name') or ''}",
+            f"nport_title={candidate.get('security_title') or ''}",
+            f"nport_cusip={candidate.get('cusip') or ''}",
+            f"nport_lei={candidate.get('lei') or ''}",
+        ]
+        if openfigi_ticker:
+            sources.append("openfigi_isin")
+            evidence_parts.append(f"openfigi_ticker={openfigi_ticker}")
+        if cik:
+            sources.append("sec_company_tickers")
+            evidence_parts.append(f"sec_match_rule={sec_match_rule}")
+            evidence_parts.append(f"sec_name_score={sec_name_score:.3f}")
+            evidence_parts.append(f"sec_ticker={sec_ticker or ''}")
+            evidence_parts.append(f"sec_cik={cik}")
+            evidence_parts.append(f"sec_title={sec_title}")
+        if submission:
+            sources.append("sec_submissions")
+            evidence_parts.append(f"sec_submission_name={submission_name}")
+            evidence_parts.append(f"sec_exchanges={'|'.join(str(x) for x in exchanges)}")
+        evidence_parts.append(f"name_similarity={name_similarity:.3f}")
+
+        if not ticker:
+            status = "unresolved_no_ticker"
+            confidence = 0.0
+        elif not cik:
+            status = "ticker_resolved_no_sec_cik"
+            confidence = 0.55
+        elif sec_match_rule == "sec_name_match" and name_similarity >= 0.75:
+            status = "resolved_sec_name_match"
+            confidence = 0.85
+        elif name_similarity >= 0.5:
+            status = "resolved"
+            confidence = 0.9
+        elif name_similarity > 0:
+            status = "needs_review_name_weak"
+            confidence = 0.7
+        else:
+            status = "needs_review_name_mismatch"
+            confidence = 0.45
+
+        rows.append((
+            ticker,
+            cik or None,
+            resolved_name or None,
+            exchange or None,
+            status,
+            confidence,
+            "|".join(sources) if sources else "none",
+            "; ".join(evidence_parts),
+            now,
+            isin,
+        ))
+
+    update_sql = """
+        UPDATE nport_company_candidates
+        SET resolved_ticker = ?,
+            resolved_cik = ?,
+            resolved_company_name = ?,
+            resolved_exchange = ?,
+            resolution_status = ?,
+            resolution_confidence = ?,
+            resolver_sources = ?,
+            resolution_evidence = ?,
+            resolved_at = ?
+        WHERE isin = ?
+    """
+    with get_db(DB_PATH) as conn:
+        seed_nport_company_candidates_table(conn)
+        conn.executemany(update_sql, rows)
+        conn.commit()
+
+    status_counts = pd.Series([r[4] for r in rows]).value_counts().to_dict()
+    log.info("N-PORT candidate resolution staged: %s", status_counts)
+
+
+def promote_nport_company_candidates(min_confidence: float = 0.85) -> None:
+    """Insert reviewed N-PORT candidate resolutions into companies.
+
+    Promotion is intentionally conservative:
+      - only missing candidates with a resolved ticker and CIK are eligible;
+      - the resolved ticker must already exist in companies, so sector/classification
+        metadata is copied from a known row instead of guessed;
+      - unresolved or ticker-only rows remain in nport_company_candidates.
+    """
+    eligible_statuses = ("resolved", "resolved_sec_name_match")
+    with get_db(DB_PATH) as conn:
+        seed_nport_company_candidates_table(conn)
+        candidates = pd.read_sql_query(
+            f"""
+            SELECT isin, security_name, security_title, cusip, currency,
+                   investment_country, last_snapshot_date, resolved_ticker,
+                   resolved_cik, resolved_company_name, resolved_exchange,
+                   resolution_status, resolution_confidence
+            FROM nport_company_candidates
+            WHERE company_status = 'missing_from_companies'
+              AND resolution_status IN ({','.join('?' * len(eligible_statuses))})
+              AND resolution_confidence >= ?
+              AND resolved_ticker IS NOT NULL AND resolved_ticker != ''
+              AND resolved_cik IS NOT NULL AND resolved_cik != ''
+            ORDER BY max_weight DESC, isin
+            """,
+            conn,
+            params=(*eligible_statuses, min_confidence),
+        )
+
+        if candidates.empty:
+            log.info("No reviewed N-PORT candidates eligible for promotion.")
+            return
+
+        tickers = candidates["resolved_ticker"].dropna().astype(str).unique().tolist()
+        ph = ",".join("?" * len(tickers))
+        existing = pd.read_sql_query(
+            f"""
+            SELECT *
+            FROM companies
+            WHERE ticker IN ({ph})
+            ORDER BY ticker, COALESCE(update_date, '') DESC, COALESCE(data_date, '') DESC
+            """,
+            conn,
+            params=tuple(tickers),
+        )
+
+    if existing.empty:
+        log.warning("No existing same-ticker companies rows found; nothing promoted.")
+        return
+
+    existing_by_ticker = (
+        existing.drop_duplicates(subset=["ticker"], keep="first")
+        .set_index("ticker")
+        .to_dict("index")
+    )
+    company_cols = [
+        "isin", "ticker", "company_name", "gics_sector", "gics_industry_group",
+        "gics_industry", "gics_sub_industry", "country", "exchange", "currency",
+        "fiscal_year_end", "num_employees", "business_summary", "cik", "cusip",
+        "simfin_id", "simfin_sector", "simfin_industry", "data_date", "update_date",
+        "delisted_date",
+    ]
+    today = datetime.now().strftime("%Y-%m-%d")
+    rows: list[tuple] = []
+    skipped: list[tuple[str, str, str]] = []
+    for candidate in candidates.to_dict("records"):
+        ticker = str(candidate["resolved_ticker"])
+        base = existing_by_ticker.get(ticker)
+        if not base:
+            skipped.append((candidate["isin"], ticker, "no_existing_ticker_metadata"))
+            continue
+        row = {col: base.get(col) for col in company_cols}
+        row["isin"] = candidate["isin"]
+        row["ticker"] = ticker
+        row["company_name"] = (
+            candidate.get("resolved_company_name")
+            or candidate.get("security_name")
+            or base.get("company_name")
+        )
+        row["cik"] = candidate.get("resolved_cik") or base.get("cik")
+        row["cusip"] = candidate.get("cusip") or base.get("cusip")
+        row["exchange"] = base.get("exchange") or candidate.get("resolved_exchange")
+        row["currency"] = base.get("currency") or candidate.get("currency")
+        row["data_date"] = candidate.get("last_snapshot_date") or today
+        row["update_date"] = today
+        row["delisted_date"] = None
+        rows.append(tuple(row.get(col) for col in company_cols))
+
+    if not rows:
+        log.warning("No N-PORT candidates promoted. Skipped=%s", skipped)
+        return
+
+    insert_sql = (
+        f"INSERT OR REPLACE INTO companies ({','.join(company_cols)}) "
+        f"VALUES ({','.join('?' * len(company_cols))})"
+    )
+    with get_db(DB_PATH) as conn:
+        conn.executemany(insert_sql, rows)
+        conn.commit()
+
+    log.info("Promoted %d N-PORT candidate(s) into companies.", len(rows))
+    for isin, ticker, reason in skipped:
+        log.warning("Skipped %s/%s: %s", isin, ticker, reason)
+
+
+def _normalise_company_name(value: object) -> str:
+    text = str(value or "").upper()
+    text = re.sub(r"[^A-Z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def repair_company_identifier_continuity() -> None:
+    """Carry known same-issuer metadata across current ISIN changes.
+
+    The rule is intentionally narrow: same ticker + same normalised company name,
+    one unambiguous source row with a legacy identifier bridge, and a current row
+    missing that bridge. This keeps redomiciles/share-class ISIN changes from
+    losing factor, risk, and market-cap coverage without guessing across issuers.
+    """
+    continuity_cols = [
+        "gics_sector", "gics_industry_group", "gics_industry", "gics_sub_industry",
+        "country", "exchange", "currency", "fiscal_year_end", "num_employees",
+        "business_summary", "cik", "simfin_id", "simfin_sector", "simfin_industry",
+    ]
+
+    with get_db(DB_PATH) as conn:
+        companies = pd.read_sql_query(
+            """
+            SELECT isin, ticker, company_name, delisted_date, update_date, data_date,
+                   gics_sector, gics_industry_group, gics_industry, gics_sub_industry,
+                   country, exchange, currency, fiscal_year_end, num_employees,
+                   business_summary, cik, simfin_id, simfin_sector, simfin_industry
+            FROM companies
+            WHERE ticker IS NOT NULL AND ticker != ''
+              AND company_name IS NOT NULL AND company_name != ''
+            """,
+            conn,
+        )
+
+        if companies.empty:
+            log.info("No companies available for identifier-continuity repair.")
+            return
+
+        companies["_name_key"] = companies["company_name"].map(_normalise_company_name)
+        updates: list[tuple] = []
+        repaired: list[tuple[str, str, str]] = []
+
+        for (_ticker, _name_key), group in companies.groupby(["ticker", "_name_key"], dropna=False):
+            source = group[group["simfin_id"].notna()].copy()
+            if source["simfin_id"].dropna().nunique() != 1:
+                continue
+            source = source.sort_values(
+                by=["update_date", "data_date", "isin"],
+                ascending=[False, False, True],
+                na_position="last",
+            ).iloc[0]
+
+            targets = group[
+                group["simfin_id"].isna()
+                & (group["delisted_date"].isna() | (group["delisted_date"].astype(str) == ""))
+            ]
+            for target in targets.to_dict("records"):
+                values = []
+                changed = False
+                for col in continuity_cols:
+                    current = target.get(col)
+                    replacement = source.get(col)
+                    is_missing = pd.isna(current) or current == ""
+                    if is_missing and not pd.isna(replacement) and replacement != "":
+                        values.append(replacement)
+                        changed = True
+                    else:
+                        values.append(current)
+                if changed:
+                    updates.append((*values, target["isin"]))
+                    repaired.append((target["ticker"], target["isin"], source["isin"]))
+
+        if not updates:
+            log.info("No identifier-continuity repairs needed.")
+            return
+
+        set_clause = ", ".join(f"{col}=?" for col in continuity_cols)
+        conn.executemany(
+            f"UPDATE companies SET {set_clause} WHERE isin=?",
+            updates,
+        )
+        conn.commit()
+
+    log.info("Repaired identifier continuity for %d company row(s).", len(repaired))
+    for ticker, target_isin, source_isin in repaired[:25]:
+        log.info("  %-8s %s <- %s", ticker, target_isin, source_isin)
+    if len(repaired) > 25:
+        log.info("  ... %d more", len(repaired) - 25)
+
+
+def consolidate_same_issuer_fundamentals() -> None:
+    """Migrate stranded fundamentals onto a same-issuer current ISIN.
+
+    Targets exactly the breakage where a redomicile / ISIN-change leaves the
+    current snapshot ISIN with no ISIN-keyed fundamentals while a legacy ISIN
+    for the *same issuer* still carries them (e.g. Amcor, Pinnacle Financial,
+    both promoted from N-PORT under a new ISIN). The constituents fundamentals
+    (incl. shares outstanding) are re-keyed onto the current ISIN so factors and
+    market cap resolve.
+
+    The rule is deliberately narrow to avoid perturbing working names:
+      * same ticker + same normalised company name,
+      * canonical = the single current-snapshot member of the group,
+      * canonical and legacy share one non-null simfin_id (same-issuer guard),
+      * canonical has ZERO ISIN-keyed constituents rows (so re-keying cannot
+        create a primary-key conflict and cannot overwrite good data),
+      * legacy ISIN(s) are not current-snapshot members and do carry rows.
+
+    True dual-class pairs (distinct tickers like BFA/BFB, or two ISINs both
+    present in the current snapshot like Clearway A/C) never match and are left
+    untouched.
+    """
+    with get_db(DB_PATH) as conn:
+        companies = pd.read_sql_query(
+            """
+            SELECT isin, ticker, company_name, cik, simfin_id, delisted_date
+            FROM companies
+            WHERE ticker IS NOT NULL AND ticker != ''
+              AND company_name IS NOT NULL AND company_name != ''
+            """,
+            conn,
+        )
+        snapshot_isins = {
+            r[0] for r in conn.execute(
+                """
+                SELECT us.isin FROM universe_snapshots us
+                JOIN (SELECT index_name, MAX(snapshot_date) AS d
+                      FROM universe_snapshots GROUP BY index_name) latest
+                  ON latest.index_name = us.index_name AND latest.d = us.snapshot_date
+                """
+            ).fetchall()
+        }
+
+    if companies.empty:
+        log.info("No companies available for fundamentals consolidation.")
+        return
+
+    companies["_name_key"] = companies["company_name"].map(_normalise_company_name)
+
+    def _isin_keyed_count(cur, isin: str) -> int:
+        return cur.execute(
+            "SELECT COUNT(*) FROM constituents WHERE security_id = ?", (isin,)
+        ).fetchone()[0]
+
+    migrations: list[tuple[str, str, str]] = []  # (ticker, legacy_isin, canon_isin)
+    simfin_clear: list[str] = []                 # legacy isins to null simfin_id on
+
+    with get_db(CONSTITUENTS_DB) as cconn:
+        cur = cconn.cursor()
+        for (ticker, _name_key), group in companies.groupby(["ticker", "_name_key"], dropna=False):
+            isins = list(group["isin"])
+            if len(isins) < 2:
+                continue
+            simfins = group["simfin_id"].dropna().unique()
+            if len(simfins) != 1:
+                continue  # need a single shared issuer id
+            canon = [i for i in isins if i in snapshot_isins]
+            if len(canon) != 1:
+                continue  # not a clean one-current-member group
+            canon_isin = canon[0]
+            if _isin_keyed_count(cur, canon_isin) != 0:
+                continue  # canonical already has fundamentals — leave it alone
+            # canonical must itself carry the shared simfin_id (same issuer)
+            canon_row = group[group["isin"] == canon_isin].iloc[0]
+            if pd.isna(canon_row["simfin_id"]):
+                continue
+            for legacy_isin in [i for i in isins if i != canon_isin and i not in snapshot_isins]:
+                legacy_row = group[group["isin"] == legacy_isin].iloc[0]
+                if legacy_row["simfin_id"] != canon_row["simfin_id"]:
+                    continue
+                if _isin_keyed_count(cur, legacy_isin) == 0:
+                    continue
+                cur.execute(
+                    "UPDATE OR IGNORE constituents SET security_id = ? WHERE security_id = ?",
+                    (canon_isin, legacy_isin),
+                )
+                migrations.append((ticker, legacy_isin, canon_isin))
+                simfin_clear.append(legacy_isin)
+        cconn.commit()
+
+    if not migrations:
+        log.info("No same-issuer fundamentals to consolidate.")
+        return
+
+    # Resolve the shared-simfin_id collision so create_factors maps the SimFin
+    # numeric id deterministically to the canonical ISIN.
+    with get_db(DB_PATH) as conn:
+        conn.executemany(
+            "UPDATE companies SET simfin_id = NULL WHERE isin = ?",
+            [(i,) for i in simfin_clear],
+        )
+        conn.commit()
+
+    log.info("Consolidated same-issuer fundamentals for %d ISIN(s):", len(migrations))
+    for ticker, legacy_isin, canon_isin in migrations:
+        log.info("  %-8s %s -> %s", ticker, legacy_isin, canon_isin)
+    log.warning(
+        "Fundamentals moved to the canonical ISIN. Restate the snapshot date(s) where "
+        "the canonical ISIN is a member (typically only the latest), e.g. "
+        "create_factors --date <D> -> create_models --date <D> -> create_risk --date <D> "
+        "-> create_barra --date <D>. Do NOT restate all historical dates: those snapshots "
+        "still reference the legacy ISIN, whose factors were already computed and would be "
+        "dropped. (If full historical consolidation is wanted, the legacy snapshot ISINs "
+        "must first be normalised to the canonical ISIN.)"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1045,11 +2032,16 @@ def write_db(companies: pd.DataFrame, snapshots: pd.DataFrame) -> None:
 
         n_alias = conn.execute("SELECT COUNT(*) FROM ticker_alias").fetchone()[0]
         n_patch = conn.execute("SELECT COUNT(*) FROM isin_patch").fetchone()[0]
+        n_excl  = conn.execute("SELECT COUNT(*) FROM simfin_exclude").fetchone()[0]
+        n_start = conn.execute("SELECT COUNT(*) FROM security_data_start").fetchone()[0]
         n_reg   = conn.execute("SELECT COUNT(*) FROM index_registry").fetchone()[0]
         n_acc   = conn.execute("SELECT COUNT(*) FROM nport_accessions").fetchone()[0]
-        log.info("DB written: ticker_alias=%d, isin_patch=%d, index_registry=%d, nport_accessions=%d, "
+        log.info("DB written: ticker_alias=%d, isin_patch=%d, simfin_exclude=%d, "
+                 "security_data_start=%d, "
+                 "index_registry=%d, nport_accessions=%d, "
                  "companies=%s, universe_snapshots=%s",
-                 n_alias, n_patch, n_reg, n_acc, f"{len(companies):,}", f"{len(snapshots):,}")
+                 n_alias, n_patch, n_excl, n_start, n_reg, n_acc,
+                 f"{len(companies):,}", f"{len(snapshots):,}")
 
 
 # ---------------------------------------------------------------------------
@@ -1194,7 +2186,7 @@ _NPORT_AUTO_INDEXES: list[dict] = [
 ]
 
 
-def ensure_snapshot(snap_date_iso: str) -> None:
+def ensure_snapshot(snap_date_iso: str, *, include_legacy_csv: bool = False) -> None:
     """
     Make `universe_snapshots` current for `snap_date_iso` across all
     auto-discovered indexes (russell_1000 + sp500).
@@ -1205,7 +2197,8 @@ def ensure_snapshot(snap_date_iso: str) -> None:
       period_of_report ≤ snap_date and insert it.
 
     Phase 2 (rebuild): call `rebuild_snapshots()` once to refresh
-    `universe_snapshots` from all accessions + CSVs.
+    `universe_snapshots` from N-PORT accessions. Legacy CSV snapshots are
+    included only when include_legacy_csv=True.
 
     Idempotent: if all accessions are already known, only Phase 2 runs.
     """
@@ -1241,7 +2234,111 @@ def ensure_snapshot(snap_date_iso: str) -> None:
             )
         conn.commit()
 
-    rebuild_snapshots()
+    rebuild_snapshots(include_legacy_csv=include_legacy_csv)
+
+
+def align_scheduled_universe_snapshots(indexes: list[str] | None = None) -> None:
+    """Fill scheduled universe dates from the latest N-PORT-backed as-of snapshot.
+
+    This makes the as-of rule explicit in universe_snapshots and nport_accessions
+    instead of relying on downstream "nearest available" logic. It does not fetch
+    EDGAR and does not overwrite existing universe rows.
+    """
+    with get_db(DB_PATH) as conn:
+        seed_all_reference_tables(conn)
+        if indexes:
+            selected_indexes = indexes
+        else:
+            selected_indexes = [
+                row[0] for row in conn.execute(
+                    """
+                    SELECT DISTINCT us.index_name
+                    FROM universe_snapshots us
+                    JOIN nport_accessions na
+                      ON na.index_name = us.index_name
+                     AND na.snapshot_date = us.snapshot_date
+                    ORDER BY us.index_name
+                    """
+                ).fetchall()
+            ]
+        schedule_dates = [
+            row[0] for row in conn.execute(
+                "SELECT data_date FROM snapshot_schedule ORDER BY data_date"
+            ).fetchall()
+        ]
+        if not selected_indexes:
+            raise RuntimeError("No N-PORT-backed universe indexes found to align.")
+        if not schedule_dates:
+            raise RuntimeError("snapshot_schedule is empty. Run --rebuild-schedule first.")
+
+        inserted_accessions = inserted_rows = skipped = 0
+        for index_name in selected_indexes:
+            for target_date in schedule_dates:
+                exists = conn.execute(
+                    """
+                    SELECT 1
+                    FROM universe_snapshots
+                    WHERE index_name = ? AND snapshot_date = ?
+                    LIMIT 1
+                    """,
+                    (index_name, target_date),
+                ).fetchone()
+                if exists:
+                    continue
+
+                source = conn.execute(
+                    """
+                    SELECT us.snapshot_date, na.accession, na.period_ending
+                    FROM universe_snapshots us
+                    JOIN nport_accessions na
+                      ON na.index_name = us.index_name
+                     AND na.snapshot_date = us.snapshot_date
+                    WHERE us.index_name = ?
+                      AND us.snapshot_date <= ?
+                    GROUP BY us.snapshot_date, na.accession, na.period_ending
+                    ORDER BY us.snapshot_date DESC
+                    LIMIT 1
+                    """,
+                    (index_name, target_date),
+                ).fetchone()
+                if not source:
+                    skipped += 1
+                    continue
+                source_date, accession, period_ending = source
+
+                before = conn.total_changes
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO nport_accessions
+                        (index_name, snapshot_date, accession, period_ending)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (index_name, target_date, accession, period_ending),
+                )
+                inserted_accessions += conn.total_changes - before
+
+                before = conn.total_changes
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO universe_snapshots
+                        (snapshot_date, isin, index_name, weight, market_value)
+                    SELECT ?, isin, index_name, weight, market_value
+                    FROM universe_snapshots
+                    WHERE index_name = ? AND snapshot_date = ?
+                    """,
+                    (target_date, index_name, source_date),
+                )
+                inserted_rows += conn.total_changes - before
+
+        conn.commit()
+
+    log.info(
+        "Aligned scheduled universe snapshots: indexes=%s inserted_rows=%s inserted_accessions=%d skipped=%d",
+        ",".join(selected_indexes),
+        f"{inserted_rows:,}",
+        inserted_accessions,
+        skipped,
+    )
 
 
 def _audit_pit_coverage() -> None:
@@ -1279,8 +2376,13 @@ def _audit_pit_coverage() -> None:
         log.warning("  orphan: %s", isin)
 
 
-def rebuild_snapshots() -> None:
-    """Rebuild universe_snapshots from CSVs + EDGAR N-PORT-P. Does not touch companies."""
+def rebuild_snapshots(*, include_legacy_csv: bool = False) -> None:
+    """Rebuild universe_snapshots from EDGAR N-PORT-P. Does not touch companies.
+
+    Local ETF holdings CSVs are legacy/bootstrap inputs and are excluded by
+    default. Pass include_legacy_csv=True to preserve old CSV-sourced snapshots
+    during a transitional rebuild.
+    """
     log.info("=== REBUILD UNIVERSE SNAPSHOTS ===")
 
     with get_db(DB_PATH) as conn:
@@ -1291,15 +2393,19 @@ def rebuild_snapshots() -> None:
 
     registry = load_index_registry()
 
-    index_files = sorted(INDEX_DIR.glob("russell_*.csv")) if INDEX_DIR.exists() else []
-    ishares_frames: list[tuple[pd.DataFrame, str, str]] = []
-    for path in index_files:
-        eq, snapshot_date, index_name = load_ishares(path)
-        log.info("  %-45s  %5d holdings  (%s @ %s)", path.name, len(eq), index_name, snapshot_date)
-        ishares_frames.append((eq, snapshot_date, index_name))
+    snapshots_csv = pd.DataFrame()
+    if include_legacy_csv:
+        index_files = sorted(INDEX_DIR.glob("*.csv")) if INDEX_DIR.exists() else []
+        ishares_frames: list[tuple[pd.DataFrame, str, str]] = []
+        for path in index_files:
+            eq, snapshot_date, index_name = load_ishares(path)
+            log.info("  %-45s  %5d holdings  (%s @ %s)", path.name, len(eq), index_name, snapshot_date)
+            ishares_frames.append((eq, snapshot_date, index_name))
 
-    snapshots_csv = build_snapshots(ishares_frames, companies) if ishares_frames else pd.DataFrame()
-    log.info("CSV snapshots: %s rows", f"{len(snapshots_csv):,}")
+        snapshots_csv = build_snapshots(ishares_frames, companies) if ishares_frames else pd.DataFrame()
+        log.warning("Legacy CSV snapshots included: %s rows", f"{len(snapshots_csv):,}")
+    else:
+        log.info("Legacy CSV snapshots excluded (N-PORT-only rebuild).")
 
     log.info("Fetching N-PORT-P snapshots from EDGAR ...")
     hist = build_historical_snapshots(known_isins, registry=registry)
@@ -1322,6 +2428,239 @@ def rebuild_snapshots() -> None:
 
     _audit_pit_coverage()
     log.info("Done.")
+
+
+# ---------------------------------------------------------------------------
+# Clean universe materialisation  (--materialize-clean-snapshots flag)
+# ---------------------------------------------------------------------------
+
+def _available_snapshot_indexes() -> list[str]:
+    with get_db(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT index_name FROM universe_snapshots ORDER BY index_name"
+        ).fetchall()
+    return [r[0] for r in rows]
+
+
+def _scheduled_dates(computed_only: bool = True) -> list[str]:
+    sql = "SELECT data_date FROM snapshot_schedule"
+    if computed_only:
+        sql += " WHERE factors_computed_at IS NOT NULL"
+    sql += " ORDER BY data_date"
+    with get_db(DB_PATH) as conn:
+        rows = conn.execute(sql).fetchall()
+    return [r[0] for r in rows]
+
+
+def _clean_snapshot_frame(
+    index_name: str,
+    snapshot_date: str,
+    *,
+    mode: str,
+) -> pd.DataFrame:
+    from universe_loader import load_clean_universe
+
+    require_latest_volume = mode == "live"
+    normalize_live_isin = mode == "live"
+    min_return_date = snapshot_date
+    result = load_clean_universe(
+        index_name,
+        snapshot_date,
+        benchmark_index=None,
+        mode=mode,
+        normalize_live_isin=normalize_live_isin,
+        min_return_date=min_return_date,
+        require_latest_volume=require_latest_volume,
+        tradable_only=False,
+    )
+    df = result.members.copy()
+    out = pd.DataFrame({
+        "mode": mode,
+        "requested_snapshot_date": result.requested_snapshot_date,
+        "source_snapshot_date": result.source_snapshot_date,
+        "index_name": index_name,
+        "isin": df["isin"],
+        "canonical_isin": df["canonical_isin"],
+        "original_isin": df["original_isin"],
+        "mapped_from_isin": df["mapped_from_isin"],
+        "mapped_to_isin": df["mapped_to_isin"],
+        "ticker": df["ticker"],
+        "company_name": df["company_name"],
+        "weight": df["weight"],
+        "raw_weight": df["raw_weight"],
+        "market_value": df["market_value"],
+        "gics_sector": df["gics_sector"],
+        "gics_industry_group": df["gics_industry_group"],
+        "gics_industry": df["gics_industry"],
+        "gics_sub_industry": df["gics_sub_industry"],
+        "simfin_sector": df["simfin_sector"],
+        "simfin_industry": df["simfin_industry"],
+        "country": df["country"],
+        "exchange": df["exchange"],
+        "currency": df["currency"],
+        "cik": df["cik"],
+        "cusip": df["cusip"],
+        "delisted_date": df["delisted_date"],
+        "last_return_date": df["last_return_date"],
+        "latest_close": df["latest_close"],
+        "latest_volume": df["latest_volume"],
+        "identity_status": df["identity_status"],
+        "identity_rule": df["identity_rule"],
+        "identity_confidence": df["identity_confidence"],
+        "identity_evidence": df["identity_evidence"],
+        "is_tradable": df["is_tradable"].astype(int),
+        "exclude_reason": df["exclude_reason"],
+        "materialized_at": datetime.now().isoformat(timespec="seconds"),
+    })
+    return out
+
+
+def materialize_clean_snapshots(
+    *,
+    indexes: list[str] | None = None,
+    mode: str = "point_in_time",
+    only_latest: bool = False,
+) -> None:
+    """
+    Build clean_universe_snapshots from raw universe_snapshots + security master.
+
+    Raw universe_snapshots remain untouched.  The clean table is the optimizer-facing
+    product with delisted/stale/security-identity flags applied.
+
+    Modes:
+      point_in_time — no future ISIN normalisation; suitable for backtests.
+      live          — map stale same-name ticker ISINs to the newest current ISIN.
+    """
+    if mode not in {"point_in_time", "live"}:
+        raise ValueError("mode must be 'point_in_time' or 'live'")
+
+    _indexes = indexes if indexes else _available_snapshot_indexes()
+    if not _indexes:
+        raise RuntimeError("No universe snapshot indexes found.")
+
+    if only_latest:
+        with get_db(DB_PATH) as conn:
+            rows = conn.execute(
+                "SELECT MAX(snapshot_date) FROM universe_snapshots"
+            ).fetchall()
+        dates = [rows[0][0]] if rows and rows[0][0] else []
+    else:
+        dates = _scheduled_dates(computed_only=True)
+
+    if not dates:
+        raise RuntimeError("No scheduled dates found for clean materialisation.")
+
+    frames: list[pd.DataFrame] = []
+    failures: list[tuple[str, str, str]] = []
+    log.info(
+        "Materialising clean_universe_snapshots: mode=%s indexes=%s dates=%d",
+        mode, ",".join(_indexes), len(dates),
+    )
+    for snapshot_date in dates:
+        for index_name in _indexes:
+            try:
+                frame = _clean_snapshot_frame(index_name, snapshot_date, mode=mode)
+            except Exception as exc:
+                failures.append((index_name, snapshot_date, str(exc)))
+                log.warning("[%s %s] clean materialisation skipped: %s", index_name, snapshot_date, exc)
+                continue
+            frames.append(frame)
+
+    if not frames:
+        raise RuntimeError("Clean materialisation produced no rows.")
+
+    clean = pd.concat(frames, ignore_index=True)
+    clean = clean.drop_duplicates(
+        subset=["mode", "requested_snapshot_date", "index_name", "isin"],
+        keep="last",
+    )
+
+    with get_db(DB_PATH) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS clean_universe_snapshots (
+                mode                    TEXT NOT NULL,
+                requested_snapshot_date TEXT NOT NULL,
+                source_snapshot_date    TEXT NOT NULL,
+                index_name              TEXT NOT NULL,
+                isin                    TEXT NOT NULL,
+                canonical_isin          TEXT,
+                original_isin           TEXT,
+                mapped_from_isin        TEXT,
+                mapped_to_isin          TEXT,
+                ticker                  TEXT,
+                company_name            TEXT,
+                weight                  REAL,
+                raw_weight              REAL,
+                market_value            REAL,
+                gics_sector             TEXT,
+                gics_industry_group     TEXT,
+                gics_industry           TEXT,
+                gics_sub_industry       TEXT,
+                simfin_sector           TEXT,
+                simfin_industry         TEXT,
+                country                 TEXT,
+                exchange                TEXT,
+                currency                TEXT,
+                cik                     TEXT,
+                cusip                   TEXT,
+                delisted_date           TEXT,
+                last_return_date        TEXT,
+                latest_close            REAL,
+                latest_volume           REAL,
+                identity_status         TEXT,
+                identity_rule           TEXT,
+                identity_confidence     REAL,
+                identity_evidence       TEXT,
+                is_tradable             INTEGER NOT NULL,
+                exclude_reason          TEXT,
+                materialized_at         TEXT,
+                PRIMARY KEY (mode, requested_snapshot_date, index_name, isin)
+            )
+        """)
+        existing_cols = {
+            row[1] for row in conn.execute("PRAGMA table_info(clean_universe_snapshots)").fetchall()
+        }
+        for col_name, col_type in {
+            "canonical_isin": "TEXT",
+            "mapped_from_isin": "TEXT",
+            "mapped_to_isin": "TEXT",
+            "identity_rule": "TEXT",
+            "identity_confidence": "REAL",
+            "identity_evidence": "TEXT",
+        }.items():
+            if col_name not in existing_cols:
+                conn.execute(f"ALTER TABLE clean_universe_snapshots ADD COLUMN {col_name} {col_type}")
+        ph_indexes = ",".join("?" * len(_indexes))
+        ph_dates = ",".join("?" * len(dates))
+        conn.execute(
+            f"""
+            DELETE FROM clean_universe_snapshots
+            WHERE mode = ?
+              AND index_name IN ({ph_indexes})
+              AND requested_snapshot_date IN ({ph_dates})
+            """,
+            [mode, *_indexes, *dates],
+        )
+        clean.to_sql("clean_universe_snapshots", conn, if_exists="append", index=False)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_clean_universe_lookup "
+            "ON clean_universe_snapshots(mode, requested_snapshot_date, index_name, is_tradable)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_clean_universe_isin "
+            "ON clean_universe_snapshots(isin)"
+        )
+        conn.commit()
+
+    tradable = int(clean["is_tradable"].sum())
+    log.info(
+        "Clean snapshots written: rows=%s tradable=%s blocked=%s failures=%d",
+        f"{len(clean):,}", f"{tradable:,}", f"{len(clean) - tradable:,}", len(failures),
+    )
+    for index_name, snapshot_date, detail in failures[:20]:
+        log.warning("  failure: %s %s — %s", index_name, snapshot_date, detail)
+    if len(failures) > 20:
+        log.warning("  ... %d more failures", len(failures) - 20)
 
 
 # ---------------------------------------------------------------------------
@@ -1639,19 +2978,48 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Build or update universe.db")
     parser.add_argument(
         "--rebuild-snapshots", action="store_true",
-        help="Rebuild universe_snapshots from CSVs + EDGAR only (leaves companies table intact)",
+        help="Rebuild universe_snapshots from N-PORT accessions only (leaves companies table intact)",
+    )
+    parser.add_argument(
+        "--include-legacy-csv", action="store_true",
+        help=(
+            "Include local data/universe_index CSV holdings in --rebuild-snapshots "
+            "or --ensure-snapshot. Transitional/legacy only."
+        ),
+    )
+    parser.add_argument(
+        "--legacy-rebuild-companies", action="store_true",
+        help=(
+            "Legacy full rebuild of companies from local ETF CSVs + SimFin, then "
+            "append N-PORT snapshots. This path is retained for rollback/bootstrap "
+            "only while the EDGAR-first security master is completed."
+        ),
     )
     parser.add_argument(
         "--ensure-snapshot", metavar="YYYY-MM-DD",
         help=(
-            "Discover the latest IWB N-PORT-P accession for the given snapshot date "
+            "Discover the latest IVV/IWB N-PORT-P accessions for the given snapshot date "
             "(if missing from nport_accessions), then rebuild universe_snapshots. "
-            "Used by daily_update.py weekly cadence."
+            "Used by daily_ecosystem_update.py weekly cadence."
+        ),
+    )
+    parser.add_argument(
+        "--align-scheduled-universe-snapshots", action="store_true",
+        help=(
+            "Fill missing snapshot_schedule dates in universe_snapshots using the "
+            "latest N-PORT-backed snapshot on or before each date. No EDGAR fetch."
+        ),
+    )
+    parser.add_argument(
+        "--align-index", action="append", default=[],
+        help=(
+            "Index for --align-scheduled-universe-snapshots. Repeatable. "
+            "Default: all N-PORT-backed universe indexes."
         ),
     )
     parser.add_argument(
         "--refresh-isins", action="store_true",
-        help="Fetch ISINs from FMP for all tickers in universe_index CSVs and write to isin_patch table",
+        help="Legacy: fetch ISINs from FMP for tickers in universe_index CSVs and write to isin_patch",
     )
     parser.add_argument(
         "--fix-isins", action="store_true",
@@ -1670,11 +3038,95 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--refresh-nport-metadata", action="store_true",
+        help=(
+            "Fetch N-PORT holding-level security metadata into "
+            "nport_security_metadata. EDGAR-first staging; does not mutate companies."
+        ),
+    )
+    parser.add_argument(
+        "--nport-index", action="append", default=[],
+        help="Index for --refresh-nport-metadata. Repeatable. Default: all indexes with accessions.",
+    )
+    parser.add_argument(
+        "--nport-latest-only", action="store_true",
+        help="Only refresh each selected index's latest N-PORT accession.",
+    )
+    parser.add_argument(
+        "--nport-force", action="store_true",
+        help="Re-fetch N-PORT metadata even when an accession is already staged.",
+    )
+    parser.add_argument(
+        "--stage-nport-company-candidates", action="store_true",
+        help=(
+            "Build nport_company_candidates from staged N-PORT metadata. "
+            "Read-only with respect to companies; use for review/audit before backfills."
+        ),
+    )
+    parser.add_argument(
+        "--candidate-index", action="append", default=[],
+        help=(
+            "Index for --stage-nport-company-candidates. Repeatable. "
+            "Default: all indexes with staged metadata."
+        ),
+    )
+    parser.add_argument(
+        "--candidate-latest-only", action="store_true",
+        help="Only stage candidates from each selected index's latest snapshot.",
+    )
+    parser.add_argument(
+        "--resolve-nport-company-candidates", action="store_true",
+        help=(
+            "Resolve missing nport_company_candidates to likely ticker/CIK in "
+            "candidate review columns. Does not mutate companies."
+        ),
+    )
+    parser.add_argument(
+        "--promote-nport-company-candidates", action="store_true",
+        help=(
+            "Insert high-confidence resolved N-PORT candidates into companies by "
+            "copying existing same-ticker metadata. Leaves ambiguous rows untouched."
+        ),
+    )
+    parser.add_argument(
+        "--repair-company-identifier-continuity", action="store_true",
+        help=(
+            "Carry known same-ticker/same-company identifier metadata across current "
+            "ISIN changes when the source bridge is unambiguous."
+        ),
+    )
+    parser.add_argument(
+        "--promote-min-confidence", type=float, default=0.85,
+        help="Minimum resolution_confidence for --promote-nport-company-candidates.",
+    )
+    parser.add_argument(
         "--rebuild-schedule", action="store_true",
         help=(
             "(Re)build the snapshot_schedule table — the single source of truth for "
             "snapshot dates (month-end monthly grid + weekly/legacy tags). Idempotent."
         ),
+    )
+    parser.add_argument(
+        "--materialize-clean-snapshots", action="store_true",
+        help=(
+            "Build clean_universe_snapshots from raw universe_snapshots without "
+            "modifying the raw PIT table."
+        ),
+    )
+    parser.add_argument(
+        "--clean-mode", choices=["point_in_time", "live"], default="point_in_time",
+        help=(
+            "Mode for --materialize-clean-snapshots. point_in_time keeps historical "
+            "ISINs; live maps stale same-name ticker ISINs to current rows."
+        ),
+    )
+    parser.add_argument(
+        "--clean-index", action="append", default=[],
+        help="Index to materialize. Repeat for multiple. Default: all universe indexes.",
+    )
+    parser.add_argument(
+        "--clean-latest-only", action="store_true",
+        help="Only materialize the latest raw universe snapshot date.",
     )
     parser.add_argument(
         "--limit", type=int, default=None,
@@ -1687,12 +3139,26 @@ def main() -> None:
         rebuild_snapshot_schedule()
         return
 
+    if args.materialize_clean_snapshots:
+        log.info("=== MATERIALIZE CLEAN UNIVERSE SNAPSHOTS ===")
+        materialize_clean_snapshots(
+            indexes=args.clean_index or None,
+            mode=args.clean_mode,
+            only_latest=args.clean_latest_only,
+        )
+        return
+
     if args.rebuild_snapshots:
-        rebuild_snapshots()
+        rebuild_snapshots(include_legacy_csv=args.include_legacy_csv)
         return
 
     if args.ensure_snapshot:
-        ensure_snapshot(args.ensure_snapshot)
+        ensure_snapshot(args.ensure_snapshot, include_legacy_csv=args.include_legacy_csv)
+        return
+
+    if args.align_scheduled_universe_snapshots:
+        log.info("=== ALIGN SCHEDULED UNIVERSE SNAPSHOTS ===")
+        align_scheduled_universe_snapshots(indexes=args.align_index or None)
         return
 
     if args.refresh_isins:
@@ -1711,7 +3177,49 @@ def main() -> None:
         recover_delisted_securities(limit=args.limit)
         return
 
-    log.info("=== CREATE UNIVERSE ===")
+    if args.refresh_nport_metadata:
+        log.info("=== REFRESH N-PORT SECURITY METADATA ===")
+        refresh_nport_security_metadata(
+            indexes=args.nport_index or None,
+            only_latest=args.nport_latest_only,
+            force=args.nport_force,
+        )
+        return
+
+    if args.stage_nport_company_candidates:
+        log.info("=== STAGE N-PORT COMPANY CANDIDATES ===")
+        stage_nport_company_candidates(
+            indexes=args.candidate_index or None,
+            only_latest=args.candidate_latest_only,
+        )
+        return
+
+    if args.resolve_nport_company_candidates:
+        log.info("=== RESOLVE N-PORT COMPANY CANDIDATES ===")
+        resolve_nport_company_candidates(limit=args.limit)
+        return
+
+    if args.repair_company_identifier_continuity:
+        log.info("=== REPAIR COMPANY IDENTIFIER CONTINUITY ===")
+        repair_company_identifier_continuity()
+        consolidate_same_issuer_fundamentals()
+        return
+
+    if args.promote_nport_company_candidates:
+        log.info("=== PROMOTE N-PORT COMPANY CANDIDATES ===")
+        promote_nport_company_candidates(min_confidence=args.promote_min_confidence)
+        return
+
+    if not args.legacy_rebuild_companies:
+        parser.print_help()
+        log.warning(
+            "No action selected. The old no-args SimFin/CSV company rebuild is now "
+            "behind --legacy-rebuild-companies. Use --rebuild-snapshots for the "
+            "N-PORT production path."
+        )
+        return
+
+    log.warning("=== LEGACY CREATE UNIVERSE: CSV + SIMFIN SECURITY MASTER ===")
 
     log.info("Loading SimFin data ...")
     simfin = load_simfin()
@@ -1735,12 +3243,19 @@ def main() -> None:
         seed_all_reference_tables(conn)
     patch    = load_isin_patch()
     alias    = load_ticker_alias()
+    simfin_exclude = load_simfin_exclude()
     registry = load_index_registry()
-    log.info("  isin_patch: %d overrides | ticker_alias: %d | indexes: %d",
-             len(patch), len(alias), len(registry))
+    log.info("  isin_patch: %d overrides | ticker_alias: %d | simfin_exclude: %d | indexes: %d",
+             len(patch), len(alias), len(simfin_exclude), len(registry))
 
     log.info("Building companies table ...")
-    companies = build_companies(ishares_frames, simfin, patch=patch, alias=alias)
+    companies = build_companies(
+        ishares_frames,
+        simfin,
+        patch=patch,
+        alias=alias,
+        simfin_exclude=simfin_exclude,
+    )
 
     log.info("Enriching metadata from EDGAR ...")
     companies = enrich_edgar_metadata(companies)

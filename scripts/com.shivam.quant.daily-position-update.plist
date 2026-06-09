@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.shivam.quant.daily-position-update</string>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/shivam/Desktop/Programming/Quant</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/shivam/opt/anaconda3/envs/quant/bin/python</string>
+        <string>/Users/shivam/Desktop/Programming/Quant/daily_position_update.py</string>
+    </array>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>21</integer>
+        <key>Minute</key>
+        <integer>10</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/shivam/Desktop/Programming/Quant/logs/daily_position_update.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/shivam/Desktop/Programming/Quant/logs/daily_position_update.err.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/shivam/opt/anaconda3/envs/quant/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+</dict>
+</plist>
