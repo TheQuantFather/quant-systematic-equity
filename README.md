@@ -100,14 +100,16 @@ This is what makes the **Backtester** trustworthy: each rebalance only ever sees
 |----------|-------|---------|
 | Quality | 15 | Gross Margin, ROE, ROA, Current Ratio, Leverage, Debt-to-Assets |
 | Value | 5 | Earnings Yield, Book-to-Price, Sales-to-Price, Cash Yield, EV-to-EBIT |
-| Growth | 5 | Revenue, Earnings, Cash Flow, Asset, Equity Growth |
+| Growth | 5 | Revenue, Earnings, Operating Income, EBITDA, Cash Flow Growth |
 | Momentum | 2 | 6M, 12M price momentum |
 | Size | 1 | Log Market Cap |
 | Low Volatility | 1 | Realized volatility (inverted) |
 | Liquidity | 1 | Amihud illiquidity (inverted) |
-| REIT-only | 3 | FFO Yield, FFO per Share, FFO Growth |
+| REIT-only | 3 | FFO Yield, FFO Margin, FFO Growth |
 
 Direction is applied only at model score time (`z × weight × direction`); `factor_value_z` is always stored unsigned.
+
+**Growth factors use a multi-year trend, not a 1-year change.** Each growth factor is the ordinary-least-squares slope of the annual LTM series over the trailing 3–5 fiscal years, scaled by the mean absolute level (`slope / mean(|level|)`, minimum 3 annual points). This MSCI Barra–style definition measures *sustained* growth and is robust to depressed or volatile base years — a single trough year (e.g. a bank recovering from a one-off loss) no longer produces a spurious multi-hundred-percent growth reading the way a naïve `(current − prior)/|prior|` ratio does. REIT FFO Growth uses the same trend on the annual FFO series.
 
 ### Models (11 total)
 
@@ -116,7 +118,7 @@ Direction is applied only at model score time (`z × weight × direction`); `fac
 | Profitability | PROF001 | Margins, ROE/ROA/ROIC, FCF, cash conversion, gross profit to assets |
 | Defensive Quality | DEF001 | Leverage, debt-to-assets, interest coverage, accruals, asset turnover, working capital |
 | Value | VAL001 | Earnings/book/sales/cash yields, EV-to-EBIT, EV/EBITDA, dividend yield |
-| Growth | GRO001 | Asset, earnings, revenue, equity, cash flow, operating income, EBITDA growth |
+| Growth | GRO001 | Revenue, earnings, operating income, cash flow, EBITDA growth (multi-year trend slope) |
 | Momentum | MOM001 | 12-month (60%) + 6-month (40%) risk-adjusted momentum |
 | Size | SIZ001 | Log Market Cap |
 | Low Volatility | LVOL001 | Realized volatility |
@@ -185,7 +187,7 @@ Set `use_barra_risk = FALSE` in the Strategies sheet of `strategy_params.xlsx` t
 
 ### Objectives
 
-- **maximize_alpha** — active-weight SOCP vs benchmark. Requires `benchmark_file`.
+- **maximize_alpha** — active-weight SOCP vs benchmark. Requires `benchmark_file`. An optional `risk_aversion` parameter (default 0) turns the pure linear-alpha objective into a mean-variance one: `max α·w − ½·risk_aversion·(w−b)′Σ(w−b)`. At 0 it loads the highest-conviction tilts to their caps; a positive value trades alpha off against active variance and de-concentrates the book.
 - **maximize_sharpe** — Charnes-Cooper transform: solve for `y = w/σ_p`, recover `w = y/∑y`.
 - **minimize_variance** — minimize `w'Σw`; ignores alpha signal.
 
@@ -197,7 +199,7 @@ Set `use_barra_risk = FALSE` in the Strategies sheet of `strategy_params.xlsx` t
 ### Configuration
 
 Edit `data/strategy_params.xlsx` (4 sheets):
-- **Strategies** — strategy_id, objective, benchmark_file, alpha_date, risk_date, solver, investable_universe, use_barra_risk
+- **Strategies** — strategy_id, objective, risk_aversion, benchmark_file, alpha_date, risk_date, solver, investable_universe, use_barra_risk
 - **Constraints** — per-strategy constraint rows; toggle `enabled` TRUE/FALSE
 - **Alpha_Weights** — model_id + weight rows; multiple rows per strategy for blending
 - **Reference** — read-only guide to available models, objectives, constraints
@@ -212,10 +214,11 @@ Re-run `optimize_portfolio.py` (or click **▶ Run Optimisation** in the app) to
 | Deep Dive | Single-stock factor & model attribution, fundamentals, peer comparison |
 | Backtester | Point-in-time strategy simulation — no look-ahead bias (see below) |
 | Database | Raw database explorer (all tables, read-only SQL) |
-| Portfolio | Strategy results: weights, sector/industry, factor tilts, risk attribution |
+| Portfolio Optimiser | Strategy results: weights, sector/industry, factor tilts, risk attribution |
 | Risk Explorer | Barra / Ledoit-Wolf deep-dive: correlations, factor vols, stock decomposition |
 | Data Quality | Pipeline health: factor coverage, constituent fill rates, sync status across all DBs |
 | Macro | US macro signals — yields, spreads, commodities, economic indicators |
+| Portfolio Analytics | Live position tracking and realised performance attribution |
 
 ## Databases
 
@@ -282,10 +285,13 @@ flowchart LR
 
 ```
 ├── app.py                          # Streamlit entry point
-├── daily_update.py                 # Pipeline orchestrator (runs pipeline.* as -m modules)
+├── daily_ecosystem_update.py       # Pipeline orchestrator (runs pipeline.* as -m modules)
+├── daily_position_update.py        # Live position / realised-performance refresh (scheduled)
 ├── config.py                       # Single source of truth: all paths, dates, hyperparameters
 ├── db.py                           # Cached data access layer (Streamlit @st.cache_data wrappers)
 ├── macro_db.py                     # Macro signal queries
+├── universe_loader.py              # Point-in-time / live universe loading and ISIN remapping
+├── portfolio_analytics.py          # Live-portfolio analytics backend (Portfolio Analytics page)
 ├── utils.py                        # Shared utilities: get_db, classify_sector, winsorized_zscore, get_logger
 ├── optimize_portfolio.py           # CVXPY optimizer (3 objectives, configurable strategies)
 ├── pipeline/                       # Build scripts — run as `python -m pipeline.<name>`
@@ -304,10 +310,11 @@ flowchart LR
 │   ├── 4_Deep_Dive.py
 │   ├── 6_Backtester.py
 │   ├── 7_Database.py
-│   ├── 8_Portfolio.py
+│   ├── 8_Portfolio_Optimiser.py
 │   ├── 9_Risk_Explorer.py
 │   ├── 10_Data_Quality.py
-│   └── 11_Macro.py
+│   ├── 11_Macro.py
+│   └── 12_Portfolio_Analytics.py
 ├── scripts/                        # Report/command backends (single-name, theme, validate, db-check)
 ├── tests/
 ├── data/
@@ -343,7 +350,7 @@ pytest tests/ -q --ignore=tests/test_edgar_parsing.py   # fast (skips network-sh
 | `test_factor_math.py` | Q4 derivation, YTD decomposition, LTM completeness guard, winsorised z-scores |
 | `test_edgar_parsing.py` | XBRL concept extraction, accounting-identity corrections, fiscal-period labelling |
 | `test_optimizer.py` | Each objective (alpha / Sharpe / min-variance) respects its constraint set and returns a valid simplex |
-| `test_daily_update.py` | Step dependency graph, dry-run planning, snapshot-date alignment across stages |
+| `test_daily_ecosystem_update.py` | Step dependency graph, dry-run planning, snapshot-date alignment across stages |
 | `test_utils.py` | Shared primitives (`get_db`, `classify_sector`, `winsorized_zscore`) |
 
 ## Logging
