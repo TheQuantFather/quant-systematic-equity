@@ -168,6 +168,92 @@ def mark_snapshot_computed(data_date: str) -> None:
         conn.commit()
 
 
+def get_barra_layout() -> dict:
+    """Single source of truth for the Barra factor layout.
+
+    Reads the Barra risk-factor tags from models_reference.csv
+    (``barra_risk_factor`` / ``barra_order`` / ``barra_ortho_against``) and combines
+    them with the structural blocks (market intercept, GICS sector dummies, beta) to
+    produce the ordered factor vector shared by create_barra.py and the risk pages.
+
+    Layout: ``[market | sectors | beta | models]``.
+
+    Returns a dict with:
+      sectors        list[str]                 GICS sector names (BARRA_SECTORS order)
+      model_factors  list[(id, name, ortho)]   risk-factor models, ordered by barra_order;
+                                                ortho = ModelID to residualise against, or None
+      factor_names   list[str]                 full ordered factor-id vector (length K)
+      groups         dict[str, int | slice]    display groups {"Market","Sector","Style"} ->
+                                                index/slice. Style folds beta + model factors
+                                                (a lone beta group adds no value).
+      anchors        dict[str, int]            structural column anchors for the pipeline:
+                                                market_idx / sector_start / sector_end /
+                                                beta_idx / model_start / model_end
+      factor_group   dict[str, str]            factor_id -> display group label
+      pretty         dict[str, str]            factor_id -> human-readable display name
+    """
+    from config import MODELS_REF, BARRA_SECTORS
+
+    df = pd.read_csv(MODELS_REF).drop_duplicates("ModelID")
+    df = df[df["barra_risk_factor"].astype(str).str.strip().str.lower() == "true"]
+    df = df.sort_values("barra_order")
+
+    def _ortho(v) -> str | None:
+        s = "" if pd.isna(v) else str(v).strip()
+        return s or None
+
+    model_factors = [(r.ModelID, r.Model, _ortho(r.barra_ortho_against))
+                     for r in df.itertuples(index=False)]
+
+    sectors    = list(BARRA_SECTORS)
+    sector_ids = [f"sec_{s.replace(' ', '_').lower()}" for s in sectors]
+    model_ids  = [mid for mid, _, _ in model_factors]
+
+    factor_names = ["market"] + sector_ids + ["beta_60d"] + model_ids
+
+    n_sec       = len(sector_ids)
+    beta_idx    = 1 + n_sec
+    model_start = beta_idx + 1
+    model_end   = model_start + len(model_ids)
+
+    # Structural anchors (fixed column positions) for the pipeline.
+    anchors = {
+        "market_idx":   0,
+        "sector_start": 1,
+        "sector_end":   1 + n_sec,
+        "beta_idx":     beta_idx,
+        "model_start":  model_start,
+        "model_end":    model_end,
+    }
+
+    # Display groups: Market | Sector | Style. Style folds beta + the model
+    # factors so there is no single-factor "Beta" group.
+    groups = {
+        "Market": 0,
+        "Sector": slice(1, 1 + n_sec),
+        "Style":  slice(beta_idx, model_end),
+    }
+
+    factor_group = {"market": "Market", "beta_60d": "Style"}
+    pretty       = {"market": "Market", "beta_60d": "Beta (60d)"}
+    for sid, sname in zip(sector_ids, sectors):
+        factor_group[sid] = "Sector"
+        pretty[sid]       = sname
+    for mid, mname, _ in model_factors:
+        factor_group[mid] = "Style"
+        pretty[mid]       = mname
+
+    return {
+        "sectors":       sectors,
+        "model_factors": model_factors,
+        "factor_names":  factor_names,
+        "groups":        groups,
+        "anchors":       anchors,
+        "factor_group":  factor_group,
+        "pretty":        pretty,
+    }
+
+
 def classify_sector(sector: str | None, industry: str | None) -> str:
     """Map SimFin sector/industry to one of: 'reit', 'financial', 'general'."""
     s = (sector   or "").lower()

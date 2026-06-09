@@ -79,12 +79,10 @@ FED_TARGET_PCT = 2.0  # Fed 2% inflation target
 # benchmark_returns. Adding a new index there will surface it automatically
 # once it appears in the right group below.
 EQUITY_GROUPS: dict[str, list[str]] = {
-    "Broad Market":    ["sp500", "russell_1000", "russell_2000"],
-    "Style":           ["russell_1000_growth", "russell_1000_value",
-                        "sp500_growth", "sp500_value"],
-    "Factor":          ["msci_usa_quality", "msci_usa_momentum",
-                        "msci_usa_min_vol", "msci_usa_value", "msci_usa_size"],
-    "Global":          ["msci_usa", "europe_equity", "japan_equity", "em_equity"],
+    "Broad Market": ["sp500", "russell_1000", "russell_2000"],
+    "Factors":      ["russell_1000_growth", "msci_usa_quality",
+                     "msci_usa_momentum", "russell_1000_value"],
+    "Global":       ["msci_usa", "europe_equity", "japan_equity", "em_equity"],
 }
 
 # Category display order and section titles
@@ -97,16 +95,18 @@ CATEGORY_TITLES = {
     "labor":     "Labor Market",
 }
 
-# Chart palette — consistent across sections
-PALETTE  = ["#4C9BE8", "#E88D4C", "#2ECC71", "#E74C3C", "#9B59B6", "#F39C12",
-            "#1ABC9C", "#E67E22", "#3498DB", "#E91E63"]
+# Chart palette — high-contrast, colour-blind-aware
+PALETTE  = ["#4C9BE8", "#F4C430", "#2ECC71", "#E74C3C",
+            "#B388FF", "#FF7043", "#26C6DA", "#EF5350"]
 DARK_BG  = "#0E1117"
+LINE_W   = 2.2          # consistent line weight across all charts
 CHART_LAYOUT = dict(
     plot_bgcolor=DARK_BG,
     paper_bgcolor=DARK_BG,
     font_color="white",
+    font_size=13,
     hovermode="x unified",
-    margin=dict(l=0, r=80, t=24, b=0),
+    margin=dict(l=0, r=100, t=24, b=0),
 )
 
 # Human-readable display names for index_name values in benchmark_returns
@@ -248,19 +248,17 @@ def _chart_vix(df: pd.DataFrame, col: str, signal_name: str) -> go.Figure:
     fig = go.Figure()
 
     if not s.empty:
-        # Regime band fills
-        x_range = [s.index[0], s.index[-1]]
-        bands = [(0, 15, "rgba(46,204,113,0.07)"),
-                 (15, 25, "rgba(241,196,15,0.07)"),
-                 (25, 35, "rgba(230,126,34,0.07)"),
-                 (35, 80, "rgba(231,76,60,0.07)")]
+        bands = [(0, 15, "rgba(46,204,113,0.10)"),
+                 (15, 25, "rgba(241,196,15,0.08)"),
+                 (25, 35, "rgba(230,126,34,0.10)"),
+                 (35, 80, "rgba(231,76,60,0.10)")]
         for lo, hi, fill in bands:
             fig.add_hrect(y0=lo, y1=hi, fillcolor=fill, line_width=0)
 
         fig.add_trace(go.Scatter(
             x=s.index, y=s.values,
             name=signal_name,
-            line=dict(color="#E88D4C", width=1.5),
+            line=dict(color="#F4C430", width=LINE_W),
         ))
 
         # Horizontal regime labels
@@ -280,9 +278,11 @@ def _chart_vix(df: pd.DataFrame, col: str, signal_name: str) -> go.Figure:
 def _chart_indexed(
     df: pd.DataFrame,
     groups: dict[str, list[str]],
-    height_per_row: int = 280,
+    height_per_row: int = 300,
 ) -> go.Figure:
-    """One subplot per equity group, each rebased to 100 at the lookback start."""
+    """One subplot per equity group, rebased to 100 at the lookback start.
+    End-of-line labels show current rebased value so you can read relative
+    performance without hovering."""
     group_names = [g for g in groups if any(i in df.columns for i in groups[g])]
     n = len(group_names)
     if n == 0:
@@ -291,7 +291,7 @@ def _chart_indexed(
     fig = make_subplots(
         rows=n, cols=1,
         shared_xaxes=True,
-        vertical_spacing=0.06,
+        vertical_spacing=0.08,
         subplot_titles=[g for g in group_names],
     )
     for row, group in enumerate(group_names, start=1):
@@ -301,21 +301,43 @@ def _chart_indexed(
             if idx not in rebased.columns:
                 continue
             s = rebased[idx].dropna()
+            color = PALETTE[i % len(PALETTE)]
+            label = INDEX_LABELS.get(idx, idx)
+            chg   = s.iloc[-1] - 100          # total return vs lookback start
+
             fig.add_trace(go.Scatter(
                 x=s.index, y=s.values,
-                name=INDEX_LABELS.get(idx, idx),
-                line=dict(color=PALETTE[i % len(PALETTE)], width=1.5),
+                name=label,
+                line=dict(color=color, width=LINE_W),
                 legendgroup=group,
                 legendgrouptitle_text=group if i == 0 else None,
             ), row=row, col=1)
+
+            # End-of-line annotation: label + Δ from base
+            fig.add_annotation(
+                x=s.index[-1], y=s.iloc[-1],
+                xref=f"x{row if row > 1 else ''}",
+                yref=f"y{row if row > 1 else ''}",
+                text=f"<b>{label}</b> {chg:+.1f}",
+                showarrow=False,
+                xanchor="left", xshift=6,
+                font=dict(color=color, size=11),
+            )
+
         fig.add_hline(y=100, line_dash="dot", line_color="white",
-                      line_width=0.5, opacity=0.3, row=row, col=1)
-        fig.update_yaxes(title_text="Rebased", row=row, col=1)
+                      line_width=0.8, opacity=0.35, row=row, col=1)
+        fig.update_yaxes(title_text="Rebased (100)", row=row, col=1,
+                         title_font_size=11)
+
+    # Larger subplot titles
+    for ann in fig.layout.annotations:
+        if ann.text in group_names:
+            ann.font = dict(size=14)
 
     fig.update_layout(
         height=height_per_row * n,
-        legend=dict(groupclick="toggleitem"),
-        **{**CHART_LAYOUT, "margin": dict(l=0, r=80, t=32, b=0)},
+        showlegend=False,          # end-of-line labels replace the legend
+        **{**CHART_LAYOUT, "margin": dict(l=0, r=160, t=36, b=0)},
     )
     return fig
 
@@ -335,7 +357,7 @@ def _chart_rates(df: pd.DataFrame, signals: list[tuple]) -> go.Figure:
         fig.add_trace(go.Scatter(
             x=s.index, y=s.values,
             name=meta["signal_name"],
-            line=dict(color=PALETTE[i], width=1.5),
+            line=dict(color=PALETTE[i], width=LINE_W),
         ), row=1, col=1)
 
     for _, sid, meta in spread_signals:
@@ -372,7 +394,7 @@ def _chart_credit(df: pd.DataFrame, signals: list[tuple]) -> go.Figure:
         fig.add_trace(go.Scatter(
             x=s.index, y=s.values,
             name=meta["signal_name"],
-            line=dict(color=color, width=1.5),
+            line=dict(color=color, width=LINE_W),
         ))
         fig.add_hline(
             y=avg, line_dash="dash", line_color=color, line_width=0.8, opacity=0.5,
@@ -435,7 +457,7 @@ def _chart_labor(df: pd.DataFrame, signals: list[tuple]) -> go.Figure:
             fig.add_trace(go.Scatter(
                 x=s.index, y=s.values,
                 name=meta["signal_name"],
-                line=dict(color=PALETTE[4 + i], width=1.5),
+                line=dict(color=PALETTE[4 + i], width=LINE_W),
             ), row=1, col=i)
 
     fig.update_layout(

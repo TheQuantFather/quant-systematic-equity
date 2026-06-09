@@ -79,7 +79,7 @@ RISK_SNAPSHOT_DATES = BACKFILL_DATES
 # --rebuild-schedule`, read everywhere via `utils.get_snapshot_schedule`).
 # These two parameters define the generation RULE: a month-end monthly grid from
 # SCHEDULE_MONTHLY_START up to SCHEDULE_WEEKLY_CUTOVER, beyond which the weekly
-# cadence (added by daily_update.py) takes over.  BACKFILL_DATES /
+# cadence (added by daily_ecosystem_update.py) takes over.  BACKFILL_DATES /
 # QUARTERLY_BACKFILL_DATES above are retained only as legacy cadence tags.
 # ---------------------------------------------------------------------------
 SCHEDULE_MONTHLY_START  = "2021-04-30"   # first month-end of the monthly grid

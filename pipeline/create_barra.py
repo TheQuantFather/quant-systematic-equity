@@ -2,18 +2,21 @@
 """
 create_barra.py — Barra-equivalent factor risk model.
 
-Factor structure (K = 30):
+Factor structure  [market | sectors | beta | models]:
   Market (1):        Intercept column of 1s. Captures the universe-wide premium
                      so sector factors become pure deviations from market.
   Sector (11):       All GICS sectors as dummies. Cap-weighted sum-to-zero
                      constraint resolves rank deficiency vs the market column.
-  Style (6):         LMC11234, ABC11234, XYZ77890, RVL11234, W52H1234
-                     (forward-filled from factors.db quarterly snapshots) +
-                     beta_60d (computed daily from returns.db vs equal-weight
-                     universe index).
-  Fundamental (12):  TUV44567, WXY77890, JKL44556, ABC12345, DEF67890,
-                     BCD44567, EFG77890, OPQ77890, LMN44567, KLM44567,
-                     YZA11234, FCM11234  (forward-filled from factors.db).
+  Beta (1):          beta_60d — rolling 60-day market beta (computed daily from
+                     returns.db vs the PIT R1000 market proxy).
+  Models (N):        The base models tagged barra_risk_factor=TRUE in
+                     models_reference.csv (e.g. Profitability, Value, Growth,
+                     Momentum, Size, Low Vol, Liquidity, LT/ST Reversal), in
+                     barra_order. Exposures = models.db cross-sectional z-scores
+                     (direction-applied), with Barra-style orthogonalisation per
+                     barra_ortho_against (e.g. Liquidity ⊥ Size). The factor set,
+                     order and ortho rules come from utils.get_barra_layout() — the
+                     single source of truth shared with the risk pages.
 
 Estimation pipeline:
   1. Daily constrained WLS cross-sectional regression: r_t = X_t f_t + ε_t
@@ -64,47 +67,42 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).parent))
 
 from config import (
-    RETURNS_DB, FACTORS_DB, UNIVERSE_DB, RISK_DB, FACTORS_REF,
+    RETURNS_DB, FACTORS_DB, MODELS_DB, UNIVERSE_DB, RISK_DB,
     HL_FACTOR_VAR, HL_FACTOR_CORR, HL_IDIO, NW_LAGS, VRA_WINDOW,
     SHRINK_IDIO, EIGENFLOOR, VRA_MIN, VRA_MAX, MIN_STOCKS,
     BARRA_SECTORS as SECTORS,
 )
-from utils import get_db, get_logger, winsorized_zscore, get_snapshot_schedule
+from utils import (
+    get_db, get_logger, get_snapshot_schedule, get_barra_layout,
+)
 
 log = get_logger("create_barra")
+PIT_MEMBERSHIP_INDEXES = ("russell_1000", "sp500")
 
 # ---------------------------------------------------------------------------
-# Load Barra factor IDs from reference CSV (order = barra_factor_order column)
+# Barra factor layout
 # ---------------------------------------------------------------------------
-_ref = pd.read_csv(str(FACTORS_REF))
-_style_ref = (
-    _ref[_ref["barra_factor_type"] == "style"]
-    .sort_values("barra_factor_order")
-)
-_fund_ref = (
-    _ref[_ref["barra_factor_type"] == "fundamental"]
-    .sort_values("barra_factor_order")
-)
-STYLE_IDS       = _style_ref["factor_id"].tolist()
-FUNDAMENTAL_IDS = _fund_ref["factor_id"].tolist()
+# Single source of truth: utils.get_barra_layout() reads the Barra risk-factor
+# tags from models_reference.csv (barra_risk_factor / barra_order /
+# barra_ortho_against). Layout: [market | sectors | beta | models].
+_LAYOUT       = get_barra_layout()
+FACTOR_NAMES  = _LAYOUT["factor_names"]                  # ordered K-length id vector
+MODEL_FACTORS = _LAYOUT["model_factors"]                 # [(model_id, name, ortho_against), ...]
+MODEL_IDS     = [mid for mid, _, _ in MODEL_FACTORS]
+K             = len(FACTOR_NAMES)
 
-# Ordered list used to index all K×K matrices and exposure vectors
-FACTOR_NAMES = (
-    ["market"]                                                  # index 0
-    + [f"sec_{s.replace(' ', '_').lower()}" for s in SECTORS]   # indices 1-11
-    + STYLE_IDS                                                 # indices 12-16
-    + ["beta_60d"]                                              # index 17
-    + FUNDAMENTAL_IDS                                           # indices 18-29
-)
-K = len(FACTOR_NAMES)  # 30
+# Column-index anchors derived from the layout (no positional hardcoding).
+_ANCHORS      = _LAYOUT["anchors"]
+MARKET_IDX    = _ANCHORS["market_idx"]
+SECTOR_START  = _ANCHORS["sector_start"]
+SECTOR_END    = _ANCHORS["sector_end"]
+BETA_IDX      = _ANCHORS["beta_idx"]
+MODEL_START   = _ANCHORS["model_start"]
 
-# Column-index anchors — keep in sync with FACTOR_NAMES layout above.
-MARKET_IDX    = 0
-SECTOR_START  = 1
-SECTOR_END    = SECTOR_START + len(SECTORS)          # 12
-STYLE_START   = SECTOR_END                           # 12
-BETA_IDX      = STYLE_START + len(STYLE_IDS)         # 17
-FUND_START    = BETA_IDX + 1                         # 18
+# Raw log-market-cap factor — the only non-model input: it supplies the WLS
+# weights (√mktcap, canonical Barra USE4) and the sector cap-weighted sum-to-zero
+# constraint. Structural, not a risk factor, so it is referenced by id directly.
+LMC_FACTOR_ID = "LMC11234"
 
 
 def _get_snapshot_dates() -> list[str]:
@@ -185,59 +183,91 @@ def _load_returns_wide() -> pd.DataFrame:
     return df.pivot(index="date", columns="isin", values="total_return").sort_index()
 
 
+_MKTCAP_KEY = "__mktcap__"   # reserved per-isin key carrying raw market cap
+
+
 def _load_factor_snapshots() -> dict:
     """
-    Returns {snapshot_date_str: {isin: {factor_id: (raw_value, z_value)}}}.
-    Raw LMC value is used for WLS weights; z-scores used for exposure matrix.
+    Returns {snapshot_date_str: {isin: {model_id: z_exposure, _MKTCAP_KEY: cap}}}.
+
+    Model factor exposures are the cross-sectional z-scores from models.db
+    (models.model_value_z), which already carry direction and standardisation.
+    Models tagged with ``barra_ortho_against`` are residualised on their target
+    model within each snapshot and re-standardised (Barra-style orthogonalisation,
+    e.g. Liquidity ⊥ Size). Raw market cap (from the LMC factor in factors.db)
+    is carried separately for the √mktcap WLS weights and sector constraint.
     """
-    all_ids = STYLE_IDS + FUNDAMENTAL_IDS
-    placeholders = ",".join("?" * len(all_ids))
+    placeholders = ",".join("?" * len(MODEL_IDS))
+    with get_db(MODELS_DB) as conn:
+        mdf = pd.read_sql_query(
+            f"SELECT data_date, security_id, model_id, model_value_z "
+            f"FROM models WHERE model_id IN ({placeholders})",
+            conn, params=MODEL_IDS,
+        )
     with get_db(FACTORS_DB) as conn:
-        df = pd.read_sql_query(
-            f"SELECT data_date, security_id, factor_id, factor_value, factor_value_z "
-            f"FROM factors WHERE factor_id IN ({placeholders})",
-            conn, params=all_ids,
+        cap = pd.read_sql_query(
+            "SELECT data_date, security_id, factor_value FROM factors WHERE factor_id = ?",
+            conn, params=[LMC_FACTOR_ID],
         )
 
+    # Orthogonalisation rules from the layout: {model_id: target_model_id}.
+    ortho = {mid: tgt for mid, _, tgt in MODEL_FACTORS if tgt}
+
     snapshots: dict = {}
-    for date_str, grp in df.groupby("data_date"):
+    for date_str, grp in mdf.groupby("data_date"):
+        wide = grp.pivot(index="security_id", columns="model_id", values="model_value_z")
+        # Residualise each ortho'd model on its target, then re-standardise.
+        for mid, tgt in ortho.items():
+            if mid in wide.columns and tgt in wide.columns:
+                pair = wide[[mid, tgt]].dropna()
+                if len(pair) > 30:
+                    x = pair[tgt].values
+                    beta = np.cov(x, pair[mid].values, ddof=0)[0, 1] / np.var(x)
+                    resid = pair[mid].values - beta * x
+                    sd = resid.std(ddof=0)
+                    if sd > 0:
+                        wide.loc[pair.index, mid] = (resid - resid.mean()) / sd
         by_isin: dict = {}
-        for _, row in grp.iterrows():
-            isin = row["security_id"]
-            if isin not in by_isin:
-                by_isin[isin] = {}
-            rv = float(row["factor_value"])   if pd.notna(row["factor_value"])   else None
-            zv = float(row["factor_value_z"]) if pd.notna(row["factor_value_z"]) else None
-            by_isin[isin][row["factor_id"]] = (rv, zv)
+        for isin, row in wide.iterrows():
+            by_isin[isin] = {mid: float(v) for mid, v in row.items() if pd.notna(v)}
         snapshots[str(date_str)] = by_isin
+
+    # Attach raw market cap per (date, isin) for weights / sector constraint.
+    for date_str, grp in cap.groupby("data_date"):
+        by_isin = snapshots.setdefault(str(date_str), {})
+        for isin, val in zip(grp["security_id"], grp["factor_value"]):
+            if pd.notna(val):
+                by_isin.setdefault(isin, {})[_MKTCAP_KEY] = float(val)
     return snapshots
 
 
 def _load_pit_membership() -> tuple[list[pd.Timestamp], dict[pd.Timestamp, set[str]]]:
     """
-    Load Point-In-Time Russell 1000 membership from universe_snapshots.
+    Load Point-In-Time factor-universe membership from universe_snapshots.
 
     Returns:
       pit_snap_dates: sorted list of snapshot pd.Timestamps
-      pit_membership: {snap_date_ts: set of ISINs in R1000 at that date}
+      pit_membership: {snap_date_ts: set of ISINs in the factor universe}
 
     Why: the daily cross-sectional regression should include only stocks that
-    were *actually in R1000* at trade date t, not today's R1000 members. Using
+    were *actually investable* at trade date t, not today's members. Using
     today's `companies` table introduces survivorship bias (dropped names
     excluded everywhere) and inclusion bias (later-added names retroactively
     appearing in earlier regressions). The fix uses N-PORT-backed PIT holdings
     from `universe_snapshots`.
     """
+    placeholders = ",".join("?" * len(PIT_MEMBERSHIP_INDEXES))
     with get_db(UNIVERSE_DB) as conn:
         df = pd.read_sql_query(
             "SELECT snapshot_date, isin FROM universe_snapshots "
-            "WHERE index_name = 'russell_1000' "
+            f"WHERE index_name IN ({placeholders}) "
             "ORDER BY snapshot_date",
             conn,
+            params=PIT_MEMBERSHIP_INDEXES,
         )
     if df.empty:
         raise RuntimeError(
-            "No PIT R1000 membership in universe.db (universe_snapshots empty). "
+            "No PIT factor-universe membership in universe.db (universe_snapshots empty). "
             "Run create_universe.py --rebuild-snapshots first."
         )
     pit: dict[pd.Timestamp, set[str]] = {}
@@ -321,7 +351,7 @@ def _compute_beta_60d(
 def _build_day_exposure(
     isins: list,
     isin_sector: dict,
-    factor_snap: dict,   # {isin: {factor_id: (raw, z)}}
+    factor_snap: dict,   # {isin: {model_id: z_exposure, _MKTCAP_KEY: cap}}
     beta_map: dict,      # {isin: beta_60d_value}
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
@@ -330,7 +360,9 @@ def _build_day_exposure(
 
       • Market column (index 0): all 1s. Captures universe-wide return.
       • Sector dummies (indices SECTOR_START..SECTOR_END-1): binary 0/1.
-      • Style/beta/fundamental (indices STYLE_START..end): z-scores; missing → 0.
+      • Beta_60d (index BETA_IDX): rolling 60-day market beta.
+      • Model factors (indices MODEL_START..end): cross-sectional model z-scores
+        (direction-applied, orthogonalised per layout); missing → 0.
       • WLS weights = √mktcap from raw LMC (canonical Barra USE4 — large caps
         anchor the factor return estimates).
       • Cap-per-sector accumulates mktcap by GICS sector → used to build the
@@ -353,28 +385,22 @@ def _build_day_exposure(
             s_idx = _SECTOR_IDX[sector]
             X[i, SECTOR_START + s_idx] = 1.0
 
-        # Style factors — z-scores
-        for j, fid in enumerate(STYLE_IDS):
-            pair = fvals.get(fid)
-            if pair and pair[1] is not None and np.isfinite(pair[1]):
-                X[i, STYLE_START + j] = pair[1]
-
         # Beta_60d
         b = beta_map.get(isin, np.nan)
         if b is not None and np.isfinite(float(b)):
             X[i, BETA_IDX] = float(b)
 
-        # Fundamental factors — z-scores
-        for j, fid in enumerate(FUNDAMENTAL_IDS):
-            pair = fvals.get(fid)
-            if pair and pair[1] is not None and np.isfinite(pair[1]):
-                X[i, FUND_START + j] = pair[1]
+        # Model factors — cross-sectional z-scores
+        for j, mid in enumerate(MODEL_IDS):
+            z = fvals.get(mid)
+            if z is not None and np.isfinite(z):
+                X[i, MODEL_START + j] = z
 
         # WLS weight = √mktcap = exp(+lmc_raw/2). Cap is also used for the
         # sector sum-to-zero constraint (cap-weighted Barra convention).
-        lmc_pair = fvals.get("LMC11234")
-        if lmc_pair and lmc_pair[0] is not None and np.isfinite(lmc_pair[0]):
-            cap = float(np.exp(lmc_pair[0]))
+        lmc_raw = fvals.get(_MKTCAP_KEY)
+        if lmc_raw is not None and np.isfinite(lmc_raw):
+            cap = float(np.exp(lmc_raw))
             weights[i] = np.sqrt(cap)
             if sector in _SECTOR_IDX:
                 cap_per_sector[_SECTOR_IDX[sector]] += cap
@@ -661,15 +687,14 @@ def _compute_all_factor_returns(
     f_df.index = pd.to_datetime(f_df.index)
     f_df.sort_index(inplace=True)
 
-    # Build eps_sq as wide DataFrame (trade_date × isin)
-    all_isins = sorted({i for d in eps_sq_data.values() for i in d})
-    eps_sq_df = pd.DataFrame(index=pd.to_datetime(sorted(eps_sq_data.keys())),
-                              columns=all_isins, dtype=float)
-    for date_str, row_dict in eps_sq_data.items():
-        for isin, v in row_dict.items():
-            eps_sq_df.loc[pd.Timestamp(date_str), isin] = v
+    # Build eps_sq as wide DataFrame (trade_date × isin). from_dict handles the
+    # dict-of-dicts directly (missing → NaN) — far faster than per-cell .loc.
+    eps_sq_df = pd.DataFrame.from_dict(eps_sq_data, orient="index").astype(float)
+    eps_sq_df.index = pd.to_datetime(eps_sq_df.index)
+    eps_sq_df.sort_index(inplace=True)
+    eps_sq_df.sort_index(axis=1, inplace=True)
 
-    log.info("Done: %d days, %d stocks with residuals", len(f_df), len(all_isins))
+    log.info("Done: %d days, %d stocks with residuals", len(f_df), eps_sq_df.shape[1])
     return f_df, eps_sq_df
 
 
@@ -802,11 +827,12 @@ def main(snapshot_dates: list[str]) -> None:
     isin_sector = _load_universe()
     log.info("  %d companies", len(isin_sector))
 
-    log.info("Loading PIT R1000 membership ...")
+    membership_label = "+".join(PIT_MEMBERSHIP_INDEXES)
+    log.info("Loading PIT %s membership ...", membership_label)
     pit_snap_dates, pit_membership = _load_pit_membership()
-    log.info("  %d snapshots: %s → %s, %d unique ISINs ever in R1000",
+    log.info("  %d snapshots: %s → %s, %d unique ISINs ever in %s",
              len(pit_snap_dates), pit_snap_dates[0].date(), pit_snap_dates[-1].date(),
-             len({i for s in pit_membership.values() for i in s}))
+             len({i for s in pit_membership.values() for i in s}), membership_label)
 
     log.info("Loading factor snapshots...")
     factor_snapshots = _load_factor_snapshots()
@@ -839,6 +865,10 @@ def main(snapshot_dates: list[str]) -> None:
 
     # Persist all factor returns (INSERT OR REPLACE for idempotency)
     log.info("Saving factor returns to DB...")
+    # Self-heal: drop any factor_returns left by a previous factor layout so the
+    # table never mixes old style/fundamental ids with the current model factors.
+    _ph = ",".join("?" * len(FACTOR_NAMES))
+    conn.execute(f"DELETE FROM factor_returns WHERE factor_id NOT IN ({_ph})", FACTOR_NAMES)
     rows = [
         (ts.strftime("%Y-%m-%d"), fn, float(val))
         for ts, row in f_df.iterrows()

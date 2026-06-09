@@ -38,6 +38,18 @@ HISTORY_START     = "2020-01-01"   # earliest date fetched for universe stocks
 ETF_HISTORY_START = "2010-01-01"   # ETFs: more history for momentum strategy backtesting
 YAHOO_DELAY       = 0.15           # seconds between per-ticker requests (avoids rate-limiting)
 
+# Internal tickers are normalized for databases and reports (BRKB, BFB, LENB).
+# Yahoo uses class-share symbols with hyphens. Keep this separate from the
+# legacy SimFin ticker_alias table; those aliases serve a different purpose.
+YAHOO_TICKER_ALIAS = {
+    "BFA":  "BF-A",
+    "BFB":  "BF-B",
+    "BRKA": "BRK-A",
+    "BRKB": "BRK-B",
+    "LENA": "LEN-A",
+    "LENB": "LEN-B",
+}
+
 # ---------------------------------------------------------------------------
 # ETF universe defaults
 # Seeded into etf_universe table on first run; DB is the source of truth after that.
@@ -81,6 +93,14 @@ CREATE TABLE IF NOT EXISTS etf_dividends (
 );
 CREATE INDEX IF NOT EXISTS idx_etfdiv_ticker ON etf_dividends (ticker);
 
+CREATE TABLE IF NOT EXISTS splits (
+    isin  TEXT NOT NULL,
+    date  DATE NOT NULL,
+    ratio REAL NOT NULL,
+    PRIMARY KEY (isin, date)
+);
+CREATE INDEX IF NOT EXISTS idx_splits_isin ON splits (isin);
+
 CREATE TABLE IF NOT EXISTS metadata (
     key   TEXT PRIMARY KEY,
     value TEXT
@@ -106,6 +126,7 @@ def connect() -> sqlite3.Connection:
 def update_from_yahoo(
     conn: sqlite3.Connection,
     history_start: str = HISTORY_START,
+    target_tickers: set[str] | None = None,
 ) -> None:
     """
     Pull daily returns from Yahoo Finance for all universe tickers, one at a time.
@@ -115,7 +136,9 @@ def update_from_yahoo(
     """
     today_str = date.today().strftime("%Y-%m-%d")
 
-    # Load ticker → ISIN mapping for universe tickers
+    target_tickers = {t.upper().strip() for t in target_tickers or set() if t.strip()}
+
+    # Load ticker → newest live ISIN mapping for universe tickers
     ticker_to_isin: dict[str, str] = {}
     if UNIVERSE_DB.exists():
         with get_db(UNIVERSE_DB) as uc:
@@ -125,11 +148,25 @@ def update_from_yahoo(
             # fetching them here would only rack up failures and risk the abort guard.
             has_col = any(r[1] == "delisted_date"
                           for r in uc.execute("PRAGMA table_info(companies)").fetchall())
-            where_live = "AND delisted_date IS NULL" if has_col else ""
-            ticker_to_isin = dict(uc.execute(
-                "SELECT ticker, isin FROM companies "
+            where_live = "AND delisted_date IS NULL" if has_col and not target_tickers else ""
+            rows = uc.execute(
+                "SELECT ticker, isin, update_date, data_date FROM companies "
                 f"WHERE ticker IS NOT NULL AND ticker != '' AND isin IS NOT NULL {where_live}"
-            ).fetchall())
+            ).fetchall()
+            rows = sorted(
+                rows,
+                key=lambda r: (
+                    str(r[0]).upper(),
+                    str(r[2] or ""),
+                    str(r[3] or ""),
+                    str(r[1] or ""),
+                ),
+            )
+            for ticker, isin, _update_date, _data_date in rows:
+                ticker = str(ticker).upper().strip()
+                if target_tickers and ticker not in target_tickers:
+                    continue
+                ticker_to_isin[ticker] = isin
 
     # Per-isin last date in returns table
     per_isin_last: dict[str, str] = dict(conn.execute(
@@ -148,6 +185,10 @@ def update_from_yahoo(
     already_current = len(ticker_to_isin) - len(work)
     if already_current:
         log.info("%s tickers already current — skipping", f"{already_current:,}")
+    if target_tickers:
+        missing_targets = sorted(target_tickers - set(ticker_to_isin))
+        if missing_targets:
+            log.warning("Requested ticker(s) not found in live companies: %s", ", ".join(missing_targets))
     log.info("%s tickers to update", f"{len(work):,}")
 
     # Preflight: wait until Yahoo Finance is actually responding before burning
@@ -160,7 +201,10 @@ def update_from_yahoo(
     consec_none    = 0   # consecutive None returns — used to detect active rate-limit
 
     for i, (ticker, isin, from_str) in enumerate(work):
-        raw_rows = _yahoo_ticker(ticker, from_str, today_str, fast_fail_on_429=True)
+        splits_out: list[tuple[str, float]] = []
+        raw_rows = _yahoo_ticker(ticker, from_str, today_str,
+                                 fast_fail_on_429=True, splits_out=splits_out)
+        _write_splits(conn, isin, splits_out)
 
         if raw_rows is None:
             errors      += 1
@@ -218,6 +262,76 @@ def update_from_yahoo(
     )
     conn.commit()
     log.info("Yahoo update complete — %s rows | %d errors", f"{total_inserted:,}", errors)
+
+
+def _write_splits(conn: sqlite3.Connection, isin: str, splits: list[tuple[str, float]]) -> None:
+    """Upsert split events for one ISIN. INSERT OR IGNORE keeps it idempotent —
+    splits are immutable historical facts, so an existing row is never overwritten."""
+    if not splits:
+        return
+    conn.executemany(
+        "INSERT OR IGNORE INTO splits (isin, date, ratio) VALUES (?, ?, ?)",
+        [(isin, d, r) for d, r in splits if r and r > 0],
+    )
+
+
+def backfill_splits(
+    conn: sqlite3.Connection,
+    history_start: str = HISTORY_START,
+) -> None:
+    """
+    Populate the `splits` table with full split history for every live universe name.
+
+    The incremental --update path only sees splits dated after each ISIN's last stored
+    price, so it captures *new* splits but not historical ones.  This does a one-time
+    full-window pass (history_start → today) per ticker, writing only split events;
+    prices are left untouched.  Idempotent via INSERT OR IGNORE — safe to re-run, and
+    re-running periodically refreshes any newly-announced splits.
+    """
+    today_str = date.today().strftime("%Y-%m-%d")
+
+    ticker_to_isin: dict[str, str] = {}
+    if UNIVERSE_DB.exists():
+        with get_db(UNIVERSE_DB) as uc:
+            has_col = any(r[1] == "delisted_date"
+                          for r in uc.execute("PRAGMA table_info(companies)").fetchall())
+            where_live = "AND delisted_date IS NULL" if has_col else ""
+            ticker_to_isin = dict(uc.execute(
+                "SELECT ticker, isin FROM companies "
+                f"WHERE ticker IS NOT NULL AND ticker != '' AND isin IS NOT NULL {where_live}"
+            ).fetchall())
+
+    work = sorted(ticker_to_isin.items())
+    log.info("Backfilling split history for %d tickers ...", len(work))
+    total_splits = 0
+    errors = 0
+    consec_none = 0
+    for i, (ticker, isin) in enumerate(work):
+        splits_out: list[tuple[str, float]] = []
+        rows = _yahoo_ticker(ticker, history_start, today_str,
+                             fast_fail_on_429=True, splits_out=splits_out)
+        if rows is None:
+            errors += 1
+            consec_none += 1
+            if consec_none >= 20:
+                conn.commit()
+                log.error("[ABORT] 20 consecutive failures — Yahoo is rate-limiting. "
+                          "Committed %s splits so far. Re-run --backfill-splits later.",
+                          f"{total_splits:,}")
+                return
+        else:
+            consec_none = 0
+            _write_splits(conn, isin, splits_out)
+            total_splits += len(splits_out)
+
+        if (i + 1) % 50 == 0:
+            conn.commit()
+            log.info("%s/%s | %s splits | %d errors",
+                     f"{i+1:,}", f"{len(work):,}", f"{total_splits:,}", errors)
+        time.sleep(YAHOO_DELAY)
+
+    conn.commit()
+    log.info("Split backfill complete — %s split events | %d errors", f"{total_splits:,}", errors)
 
 
 # ---------------------------------------------------------------------------
@@ -489,23 +603,32 @@ def _yahoo_ticker(
     to_date: str,
     retries: int = 2,
     fast_fail_on_429: bool = False,
+    splits_out: list | None = None,
 ) -> list | None:
     """
     Fetch daily OHLCV + adj_close for one ticker from Yahoo Finance v8 chart API.
     Returns a list of row tuples on success, None on permanent failure, [] if no data.
 
     adj_close is Yahoo's fully adjusted price (splits + dividends), used for total-
-    return momentum.  close is the raw closing price, used for market-cap calculations.
+    return momentum.  close is the split-adjusted (but not dividend-adjusted) close,
+    used for market-cap calculations — pair it with split-adjusted shares.
+
+    When `splits_out` is supplied, parsed split events for the requested window are
+    appended to it as (date, ratio) tuples (ratio = numerator / denominator, e.g.
+    10.0 for a 10:1 forward split, 0.1 for a 1:10 reverse split).  The list is left
+    untouched on failure, so callers can pass a fresh list per ticker.
     """
+    yahoo_ticker = YAHOO_TICKER_ALIAS.get(str(ticker).upper().strip(), ticker)
     t1 = int(datetime.strptime(from_date, "%Y-%m-%d")
              .replace(tzinfo=timezone.utc).timestamp())
     t2 = int((datetime.strptime(to_date, "%Y-%m-%d")
               .replace(tzinfo=timezone.utc) + timedelta(days=1)).timestamp())
 
+    events = "div,splits" if splits_out is not None else "history"
     url = (
-        f"https://query2.finance.yahoo.com/v8/finance/chart/{ticker}"
+        f"https://query2.finance.yahoo.com/v8/finance/chart/{yahoo_ticker}"
         f"?interval=1d&period1={t1}&period2={t2}"
-        f"&events=history&includeAdjustedClose=true"
+        f"&events={events}&includeAdjustedClose=true"
     )
 
     data = _fetch_url(url, retries=retries, fast_fail_on_429=fast_fail_on_429)
@@ -521,6 +644,16 @@ def _yahoo_ticker(
         adj_close  = result["indicators"]["adjclose"][0]["adjclose"]
     except (KeyError, IndexError, TypeError):
         return []
+
+    if splits_out is not None:
+        for ev in (result.get("events", {}).get("splits") or {}).values():
+            num = ev.get("numerator")
+            den = ev.get("denominator")
+            ts  = ev.get("date")
+            if not (num and den and ts):
+                continue
+            dt_str = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
+            splits_out.append((dt_str, float(num) / float(den)))
 
     rows = []
     for i, ts in enumerate(timestamps):
@@ -847,23 +980,38 @@ def main():
     parser.add_argument("--backfill-delisted", action="store_true",
                         help="Backfill FMP dividend-adjusted prices for delisted names "
                              "(companies.delisted_date set) missing from returns")
+    parser.add_argument("--backfill-splits", action="store_true",
+                        help="Populate the splits table with full split history for all "
+                             "live names (one-time / periodic; --update catches new splits)")
     parser.add_argument("--history-start", default=HISTORY_START,
                         help=f"Start date for tickers with no existing data (default {HISTORY_START})")
+    parser.add_argument("--ticker", action="append", default=[],
+                        help="Limit --update to one ticker. Repeat for multiple.")
     args = parser.parse_args()
 
-    if not any([args.update, args.check, args.backfill_delisted]):
+    if not any([args.update, args.check, args.backfill_delisted, args.backfill_splits]):
         parser.print_help()
         return
 
     conn = connect()
     try:
         if args.update:
-            update_from_yahoo(conn, history_start=args.history_start)
-            log.info("Updating index returns ...")
-            update_index_returns(conn)
+            update_from_yahoo(
+                conn,
+                history_start=args.history_start,
+                target_tickers=set(args.ticker or []),
+            )
+            if args.ticker:
+                log.info("Skipping index returns for targeted ticker update.")
+            else:
+                log.info("Updating index returns ...")
+                update_index_returns(conn)
 
         if args.backfill_delisted:
             backfill_delisted(conn, history_start=args.history_start)
+
+        if args.backfill_splits:
+            backfill_splits(conn, history_start=args.history_start)
 
         if args.check or args.update:
             run_checks(conn)

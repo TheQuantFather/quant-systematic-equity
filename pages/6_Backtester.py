@@ -114,12 +114,13 @@ def _cum_return_chart(
     traces: list[dict],
     title: str = "Cumulative return (base = 1.0)",
     height: int = 420,
-    excess_series: pd.Series | None = None,
+    cumulative_excess_series: pd.Series | None = None,
 ) -> go.Figure:
     """
     Build a cumulative-return line chart.
     Each trace dict: {series (raw returns), name, color, width=2, dash="solid"}.
-    Optional excess_series (raw daily active returns) is plotted on a secondary Y-axis.
+    Optional cumulative_excess_series is portfolio cumulative value minus
+    benchmark cumulative value, plotted on a secondary Y-axis.
     """
     fig = go.Figure()
     for t in traces:
@@ -133,11 +134,10 @@ def _cum_return_chart(
         hovermode="x unified", legend=dict(orientation="h", y=-0.15),
         margin=dict(l=0, r=0, t=40, b=10),
     )
-    if excess_series is not None and not excess_series.empty:
-        cum_excess = (1 + excess_series).cumprod() - 1
+    if cumulative_excess_series is not None and not cumulative_excess_series.empty:
         fig.add_trace(go.Scatter(
-            x=cum_excess.index, y=cum_excess.values * 100,
-            name="Excess return",
+            x=cumulative_excess_series.index, y=cumulative_excess_series.values * 100,
+            name="Cumulative excess return",
             yaxis="y2",
             line=dict(color="#16A34A", width=1.5, dash="dot"),
         ))
@@ -434,13 +434,18 @@ def _run_optimised_backtest(
     objective     = sp["objective"]
     constraints   = dict(sp["constraints"])
 
-    # All available model dates and universe snapshot dates (carry-forward for gaps)
+    # All available model, universe, and benchmark snapshot dates
+    # (carry-forward for gaps).
     with get_db(MODELS_DB) as conn:
         model_dates = sorted(r[0] for r in conn.execute("SELECT DISTINCT data_date FROM models").fetchall())
     with get_db(UNIVERSE_DB) as conn:
         universe_dates = sorted(r[0] for r in conn.execute(
             "SELECT DISTINCT snapshot_date FROM universe_snapshots WHERE index_name = ?",
             (universe_name,),
+        ).fetchall())
+        benchmark_dates = sorted(r[0] for r in conn.execute(
+            "SELECT DISTINCT snapshot_date FROM universe_snapshots WHERE index_name = ?",
+            (benchmark_name,),
         ).fetchall())
     if not model_dates or not universe_dates:
         return {"error": f"Need at least 1 model date and 1 '{universe_name}' universe snapshot."}
@@ -508,6 +513,7 @@ def _run_optimised_backtest(
     period_log:   list[dict]              = []
     return_parts: list[pd.Series]         = []
     warnings:     list[str]               = []
+    benchmark_weights_fallback_warned     = False
 
     for i, snap_date in enumerate(rebal_dates):
         next_snap = (
@@ -519,9 +525,11 @@ def _run_optimised_backtest(
         if t_start is None or t_end is None or t_start >= t_end:
             continue
 
-        # Alpha and universe are carried forward from the most recent available snapshot.
+        # Alpha, universe, and benchmark weights are carried forward from the
+        # most recent available snapshot.
         alpha_date   = _find_nearest_before(snap_date, model_dates)
         uni_snap     = _find_nearest_before(snap_date, universe_dates)
+        bm_snap      = _find_nearest_before(snap_date, benchmark_dates)
         barra_date   = _find_nearest_before(snap_date, barra_dates)
         risk_date    = _find_nearest_before(snap_date, risk_dates)
 
@@ -532,8 +540,20 @@ def _run_optimised_backtest(
             warnings.append(f"{snap_date}: no LW risk date available — skipped.")
             continue
 
-        uni_isins  = db.get_universe_isins_at_date(universe_name, uni_snap)
-        bm_weights = db.get_universe_weights_at_date(universe_name, uni_snap) if objective == "maximize_alpha" else {}
+        uni_isins = db.get_universe_isins_at_date(universe_name, uni_snap)
+        if objective == "maximize_alpha":
+            if bm_snap is not None:
+                bm_weights = db.get_universe_weights_at_date(benchmark_name, bm_snap)
+            else:
+                bm_weights = db.get_universe_weights_at_date(universe_name, uni_snap)
+                if not benchmark_weights_fallback_warned:
+                    warnings.append(
+                        f"No constituent weights found for benchmark '{benchmark_name}' — "
+                        f"optimizer constraints use universe '{universe_name}' weights instead."
+                    )
+                    benchmark_weights_fallback_warned = True
+        else:
+            bm_weights = {}
         if len(uni_isins) < 50:
             warnings.append(f"{snap_date}: only {len(uni_isins)} stocks in '{universe_name}' — skipped.")
             continue
@@ -558,6 +578,7 @@ def _run_optimised_backtest(
                 prev_weights=prev_weights,
                 max_turnover=_to if _to is not None else 9999.0,
                 solver=solver,
+                risk_aversion=sp.get("risk_aversion", 0.0),
             )
             if opt_result is not None:
                 to_used = _to
@@ -637,6 +658,9 @@ def _run_optimised_backtest(
             "snap_date":            snap_date,
             "next_snap":            next_snap[:10],
             "alpha_date":           alpha_date,
+            "universe_snapshot":     uni_snap,
+            "benchmark_name":        benchmark_name,
+            "benchmark_snapshot":    bm_snap if bm_snap is not None else uni_snap,
             "weights":              new_weights,
             "n_trades":             n_trades,
             "tc_pct":               tc_pct,
@@ -665,6 +689,7 @@ def _run_optimised_backtest(
         "objective":     objective,
         "rebal_freq":    rebal_freq,
         "universe_name": universe_name,
+        "benchmark_name": benchmark_name,
         "sector_map":    sector_map,
         "industry_map":  industry_map,
         "ticker_map":    ticker_map,
@@ -1033,6 +1058,8 @@ with tab2:
     with r1c1:
         sel_strat_name = st.selectbox("Strategy", list(strategy_opts.keys()), key="opt_bt_strat")
         sel_strat_id   = strategy_opts[sel_strat_name]
+    sel_strat_row = strats_df[strats_df["strategy_id"].str.strip() == sel_strat_id].iloc[0]
+    default_solver = str(sel_strat_row.get("solver", "CLARABEL") or "CLARABEL").strip().upper()
     with r1c2:
         default_uni = "russell_1000" if "russell_1000" in available_universes else (available_universes[0] if available_universes else "sp500")
         sel_universe = st.selectbox(
@@ -1077,7 +1104,13 @@ with tab2:
         sel_max_pos    = st.selectbox("Max positions", max_pos_opts, index=0, key="opt_bt_maxpos")
         max_positions_override = None if sel_max_pos == "Strategy default" else int(sel_max_pos)
     with r2c5:
-        sel_solver = st.selectbox("Solver", ["CLARABEL", "MOSEK"], key="opt_bt_solver")
+        solver_opts = ["CLARABEL", "MOSEK"]
+        sel_solver = st.selectbox(
+            "Solver",
+            solver_opts,
+            index=solver_opts.index(default_solver) if default_solver in solver_opts else 0,
+            key="opt_bt_solver",
+        )
     run_clicked = st.button("▶ Run Optimised Backtest", type="primary", key="opt_bt_run")
 
     # ── Trigger computation ───────────────────────────────────────────────────
@@ -1139,12 +1172,14 @@ with tab2:
     any_relaxed        = any(p["relaxed_integer"] for p in period_log)
     freq_label         = result.get("rebal_freq", "quarterly").capitalize()
     uni_label          = result.get("universe_name", "sp500").replace("_", " ").title()
-    m1, m2, m3, m4, m5 = st.columns(5)
+    opt_bench_label    = result.get("benchmark_name", sel_bench).replace("_", " ").title()
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
     m1.metric("Universe", uni_label)
-    m2.metric("Periods", f"{len(period_log)} ({freq_label})")
-    m3.metric("Avg turnover (2-way)", f"{avg_to_pct_actual:.0f}%")
-    m4.metric("Total TC (est.)", f"€{total_tc:,.0f}")
-    m5.metric("Risk model", "Barra" if any_barra else "Ledoit-Wolf")
+    m2.metric("Benchmark", opt_bench_label)
+    m3.metric("Periods", f"{len(period_log)} ({freq_label})")
+    m4.metric("Avg turnover (2-way)", f"{avg_to_pct_actual:.0f}%")
+    m5.metric("Total TC (est.)", f"€{total_tc:,.0f}")
+    m6.metric("Risk model", "Barra" if any_barra else "Ledoit-Wolf")
     if any_relaxed:
         st.info(
             "**max_positions / min_position_if_held not applied** — switch solver to MOSEK to enforce cardinality constraints."
@@ -1156,12 +1191,14 @@ with tab2:
     pt1, pt2, pt3 = st.tabs(["Performance", "Analysis", "Holdings"])
 
     with pt1:
-        excess_series = port_series.subtract(bench_series.reindex(port_series.index, fill_value=0.0))
+        port_cum = (1 + port_series).cumprod()
+        bench_cum = (1 + bench_series.reindex(port_series.index, fill_value=0.0)).cumprod()
+        cumulative_excess_series = port_cum.subtract(bench_cum, fill_value=0.0)
         st.plotly_chart(_cum_return_chart([
             {"series": port_series,  "name": result["strategy_name"], "color": "#2563EB"},
             {"series": bench_series, "name": bench_label, "color": "#94A3B8",
              "width": 1.5, "dash": "dot"},
-        ], excess_series=excess_series), use_container_width=True)
+        ], cumulative_excess_series=cumulative_excess_series), use_container_width=True)
 
         st.plotly_chart(_drawdown_chart([
             {"series": port_series,  "name": result["strategy_name"], "color": "#2563EB",

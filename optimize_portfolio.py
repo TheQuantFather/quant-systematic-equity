@@ -12,7 +12,7 @@ Usage:
 Objectives
 ----------
 maximize_alpha      Benchmark-aware: maximize alpha subject to tracking-error and
-                    active-weight constraints. Requires benchmark_file.
+                    active-weight constraints. Requires a benchmark index or file.
 
 maximize_sharpe     Absolute return: maximize Sharpe via Charnes-Cooper transform.
                     No benchmark required.
@@ -70,12 +70,75 @@ from config import (
     OUTPUT_DIR, PARAMS_FILE, UNIVERSE_DB, CONSTITUENTS_DB, RETURNS_DB,
     MODELS_DB, RISK_DB, BENCHMARK_DIR,
 )
+from universe_loader import load_clean_universe
 from utils import get_db, get_logger
 
 log = get_logger("optimize_portfolio")
 
 
 # ── Excel params ──────────────────────────────────────────────────────────────
+
+def _date_is_latest(raw: object) -> bool:
+    val = str(raw or "").strip().lower()
+    return val in ("", "latest", "auto")
+
+
+def _latest_alpha_date(model_ids: list[str]) -> str:
+    if not model_ids:
+        raise ValueError("Cannot resolve alpha_date=latest without alpha models.")
+
+    placeholders = ",".join("?" * len(model_ids))
+    with get_db(MODELS_DB) as conn:
+        row = conn.execute(
+            f"""
+            SELECT data_date
+            FROM models
+            WHERE model_id IN ({placeholders})
+            GROUP BY data_date
+            HAVING COUNT(DISTINCT model_id) = ?
+            ORDER BY data_date DESC
+            LIMIT 1
+            """,
+            [*model_ids, len(model_ids)],
+        ).fetchone()
+
+    if row is None or not row[0]:
+        raise ValueError(f"No model snapshot found for alpha models: {', '.join(model_ids)}")
+    return str(row[0])
+
+
+def _latest_risk_date(use_barra: bool) -> str:
+    with get_db(RISK_DB) as conn:
+        if use_barra:
+            row = conn.execute(
+                """
+                SELECT c.data_date
+                FROM covariance_matrix c
+                JOIN factor_covariance f ON f.snapshot_date = c.data_date
+                ORDER BY c.data_date DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT MAX(data_date) FROM covariance_matrix"
+            ).fetchone()
+
+    if row is None or not row[0]:
+        model = "Ledoit-Wolf + Barra" if use_barra else "Ledoit-Wolf"
+        raise ValueError(f"No {model} risk snapshot found.")
+    return str(row[0])
+
+
+def _param_str(row: pd.Series, key: str, default: str = "") -> str:
+    value = row.get(key, default)
+    if pd.isna(value):
+        return default
+    text = str(value).strip()
+    if text.lower() == "nan":
+        return default
+    return text
+
 
 def load_strategy_params(strategy_id: str | None = None) -> list[dict]:
     xl = pd.ExcelFile(PARAMS_FILE)
@@ -115,19 +178,32 @@ def load_strategy_params(strategy_id: str | None = None) -> list[dict]:
         for _, a in a_rows.iterrows():
             alpha_weights[a["model_id"].strip()] = float(a["weight"])
 
-        benchmark_file = str(row.get("benchmark_file", "") or "").strip()
-        objective      = str(row.get("objective",       "") or "maximize_alpha").strip()
-        use_barra_raw  = str(row.get("use_barra_risk",  "TRUE") or "TRUE").strip().upper()
+        benchmark_file  = _param_str(row, "benchmark_file")
+        benchmark_index = _param_str(row, "benchmark_index")
+        universe_index  = _param_str(row, "universe_index")
+        objective       = _param_str(row, "objective", "maximize_alpha")
+        try:
+            risk_aversion = float(_param_str(row, "risk_aversion", "0") or 0.0)
+        except ValueError:
+            risk_aversion = 0.0
+        use_barra_raw   = _param_str(row, "use_barra_risk", "TRUE").upper()
         use_barra      = use_barra_raw != "FALSE"   # default True unless explicitly FALSE
+        alpha_date_raw = row.get("alpha_date", "")
+        risk_date_raw  = row.get("risk_date", "")
+        alpha_date     = _latest_alpha_date(list(alpha_weights)) if _date_is_latest(alpha_date_raw) else str(alpha_date_raw).strip()
+        risk_date      = _latest_risk_date(use_barra) if _date_is_latest(risk_date_raw) else str(risk_date_raw).strip()
 
         result.append({
             "strategy_id":         sid,
             "name":                row["name"].strip(),
             "benchmark_file":      benchmark_file,
-            "alpha_date":          row["alpha_date"].strip(),
-            "risk_date":           row["risk_date"].strip(),
+            "benchmark_index":     benchmark_index,
+            "universe_index":      universe_index,
+            "alpha_date":          alpha_date,
+            "risk_date":           risk_date,
             "solver":              row["solver"].strip(),
             "objective":           objective,
+            "risk_aversion":       risk_aversion,
             "investable_universe": row["investable_universe"].strip(),
             "constraints":         constraints,
             "alpha_weights":       alpha_weights,
@@ -148,6 +224,32 @@ def load_benchmark(benchmark_file: str) -> pd.DataFrame:
     df = df.rename(columns={"Ticker": "ticker", "Sector": "benchmark_sector"})
     df["weight"] /= df["weight"].sum()
     return df[["ticker", "benchmark_sector", "weight"]].copy()
+
+
+def load_index_benchmark(index_name: str, snapshot_date: str) -> tuple[pd.DataFrame, dict]:
+    result = load_clean_universe(index_name, snapshot_date, mode="live", tradable_only=False)
+    members = result.tradable
+    if members.empty:
+        return pd.DataFrame(columns=["isin", "ticker", "benchmark_sector", "weight"]), {
+            "benchmark_index": index_name,
+            "benchmark_source_snapshot_date": result.source_snapshot_date,
+            "benchmark_tradable": 0,
+            "benchmark_blocked": int((~result.members["is_tradable"]).sum()),
+        }
+
+    df = members[["isin", "ticker", "gics_sector", "raw_weight"]].copy()
+    df = df.rename(columns={"gics_sector": "benchmark_sector", "raw_weight": "weight"})
+    df["weight"] = pd.to_numeric(df["weight"], errors="coerce").fillna(0.0)
+    if df["weight"].sum() > 0:
+        df["weight"] /= df["weight"].sum()
+
+    meta = {
+        "benchmark_index": index_name,
+        "benchmark_source_snapshot_date": result.source_snapshot_date,
+        "benchmark_tradable": int(len(members)),
+        "benchmark_blocked": int((~result.members["is_tradable"]).sum()),
+    }
+    return df, meta
 
 
 def load_universe_metadata() -> pd.DataFrame:
@@ -192,7 +294,7 @@ def load_latest_market_caps(meta_df: pd.DataFrame, investable: list[str]) -> dic
     if not security_ids:
         return {}
 
-    share_ids = ("B3C4D5E6", "IIG88888")  # Shares (Basic), SimFin legacy fallback
+    share_ids = ("B3C4D5E6",)  # IIG88888 excluded: collides with InterestAndDividendIncome in EDGAR concept map
     sid_ph = ",".join("?" * len(security_ids))
     cid_ph = ",".join("?" * len(share_ids))
     with get_db(CONSTITUENTS_DB) as conn:
@@ -308,7 +410,11 @@ def _latest_barra_date() -> str | None:
         return None
 
 
-def load_barra_L(barra_date: str, investable: list[str]) -> np.ndarray | None:
+def load_barra_L(
+    barra_date: str,
+    investable: list[str],
+    identity_aliases: dict[str, str] | None = None,
+) -> np.ndarray | None:
     """
     Build stacked-L matrix for the Barra risk model.
 
@@ -335,29 +441,58 @@ def load_barra_L(barra_date: str, investable: list[str]) -> np.ndarray | None:
             N          = len(investable)
             isin_idx   = {isin: i for i, isin in enumerate(investable)}
             factor_idx = {f: j for j, f in enumerate(factor_names)}
+            alias_lookup = {
+                isin: alias
+                for isin, alias in (identity_aliases or {}).items()
+                if isin in isin_idx and alias and alias != isin
+            }
+            query_isins = sorted(set(investable).union(alias_lookup.values()))
 
-            ph = ",".join("?" * N)
+            ph = ",".join("?" * len(query_isins))
             # Factor exposures
             X      = np.zeros((N, Kf))
+            filled = np.zeros((N, Kf), dtype=bool)
             rows_x = conn.execute(
                 f"SELECT security_id, factor_id, exposure FROM factor_exposures "
                 f"WHERE snapshot_date=? AND security_id IN ({ph})",
-                [barra_date] + list(investable),
+                [barra_date] + query_isins,
             ).fetchall()
             for sec_id, fac_id, exp_val in rows_x:
                 if sec_id in isin_idx and fac_id in factor_idx:
-                    X[isin_idx[sec_id], factor_idx[fac_id]] = float(exp_val)
+                    i = isin_idx[sec_id]
+                    j = factor_idx[fac_id]
+                    X[i, j] = float(exp_val)
+                    filled[i, j] = True
+            alias_to_targets: dict[str, list[str]] = {}
+            for isin, alias in alias_lookup.items():
+                alias_to_targets.setdefault(alias, []).append(isin)
+            for sec_id, fac_id, exp_val in rows_x:
+                if fac_id not in factor_idx:
+                    continue
+                j = factor_idx[fac_id]
+                for target in alias_to_targets.get(sec_id, []):
+                    i = isin_idx[target]
+                    if not filled[i, j]:
+                        X[i, j] = float(exp_val)
 
             # Idiosyncratic variances (annualised); default ≈ 20% annual vol if missing
             delta  = np.full(N, 0.04)
+            filled_delta = np.zeros(N, dtype=bool)
             rows_d = conn.execute(
                 f"SELECT security_id, idio_var FROM idiosyncratic_vars "
                 f"WHERE snapshot_date=? AND security_id IN ({ph})",
-                [barra_date] + list(investable),
+                [barra_date] + query_isins,
             ).fetchall()
             for sec_id, idio_var in rows_d:
                 if sec_id in isin_idx:
-                    delta[isin_idx[sec_id]] = float(idio_var)
+                    i = isin_idx[sec_id]
+                    delta[i] = float(idio_var)
+                    filled_delta[i] = True
+            for sec_id, idio_var in rows_d:
+                for target in alias_to_targets.get(sec_id, []):
+                    i = isin_idx[target]
+                    if not filled_delta[i]:
+                        delta[i] = float(idio_var)
 
         # Cholesky of factor covariance (apply spectral floor if needed)
         try:
@@ -386,11 +521,41 @@ def _variance(w: np.ndarray, Sigma, L: np.ndarray) -> float:
     return float(np.sum((L.T @ w) ** 2))
 
 
+def _covariance(a: np.ndarray, b: np.ndarray, Sigma, L: np.ndarray) -> float:
+    """
+    Portfolio covariance a' Σ b.
+    When Sigma is None (Barra mode) uses (L.T @ a)'(L.T @ b).
+    """
+    if Sigma is not None:
+        return float(a @ Sigma @ b)
+    return float((L.T @ a) @ (L.T @ b))
+
+
 # ── Shared setup helpers ──────────────────────────────────────────────────────
 
-def _build_investable(strategy, bm_df, risk_isins, risk_isin_idx):
+def _load_clean_investable(index_name: str, snapshot_date: str) -> tuple[list[str], dict]:
+    result = load_clean_universe(index_name, snapshot_date, mode="live", tradable_only=False)
+    tradable = result.tradable
+    aliases = {
+        str(row["isin"]): str(row["mapped_from_isin"])
+        for _, row in tradable.iterrows()
+        if str(row.get("mapped_from_isin") or "").strip()
+    }
+    meta = {
+        "universe_index": index_name,
+        "universe_source_snapshot_date": result.source_snapshot_date,
+        "universe_tradable": int(len(tradable)),
+        "universe_blocked": int((~result.members["is_tradable"]).sum()),
+        "identity_aliases": aliases,
+    }
+    return sorted(set(tradable["isin"].dropna().astype(str))), meta
+
+
+def _build_investable(strategy, bm_df, risk_isins, risk_isin_idx, universe_isins=None):
     if strategy["investable_universe"] == "benchmark_only":
         investable = sorted({i for i in bm_df["isin"] if i in risk_isin_idx})
+    elif universe_isins is not None:
+        investable = sorted({i for i in universe_isins if i in risk_isin_idx})
     else:
         investable = sorted(set(risk_isins))
 
@@ -609,6 +774,27 @@ def _add_sector_constraints(cvx, var, scale, sectors, B_sector, c):
                 cvx.append(sw <= max_sw * scale)
 
 
+def _add_benchmark_relative_group_constraints(cvx, var, scale, groups, B_group, benchmark, tolerance):
+    """
+    Keep portfolio group weights within +/- tolerance of benchmark group weights.
+
+    In Charnes-Cooper space `var` is y and `scale` is sum(y), so the benchmark
+    target must be scaled by the same amount as absolute weight constraints.
+    """
+    if tolerance is None or benchmark is None:
+        return
+    benchmark = np.asarray(benchmark, dtype=float)
+    if benchmark.size == 0 or benchmark.sum() <= 1e-10:
+        return
+
+    tol = float(tolerance)
+    for g in range(len(groups)):
+        bm_weight = float(B_group[g] @ benchmark)
+        group_weight = B_group[g] @ var
+        cvx.append(group_weight <= (bm_weight + tol) * scale)
+        cvx.append(group_weight >= max(0.0, bm_weight - tol) * scale)
+
+
 # ── Integer constraint helpers ────────────────────────────────────────────────
 
 # Minimum assumed portfolio vol; used as a denominator for big-M bounds in the
@@ -652,7 +838,7 @@ def _optimize_alpha(strategy, investable, alpha, b, Sigma, L,
         cvx = [cp.sum(w) <= 1.0, cp.sum(w) >= 1.0 - cash_buffer, w >= 0]
     else:
         cvx = [cp.sum(w) == 1.0, w >= 0]
-    max_saw = c.get("max_stock_active_weight", 0.02)
+    max_saw = c.get("max_stock_active_weight", None)
 
     # ── Integer: cardinality + minimum position ────────────────────────────
     max_pos_n = c.get("max_positions")
@@ -673,16 +859,17 @@ def _optimize_alpha(strategy, investable, alpha, b, Sigma, L,
     if prices is not None and portfolio_value is not None:
         q = cp.Variable(N, integer=True, name="shares")
         max_overweight = float(c.get("lot_size_max_overweight", 0.02))
+        lot_active_cap = float(max_saw) if max_saw is not None else float(c.get("max_position", 1.0))
         share_weights = cp.multiply(prices / portfolio_value, q)
         cvx += [
             q >= 0,
             prices @ q <= portfolio_value,
             w == share_weights,
-            share_weights <= b + max_saw + max_overweight,
+            share_weights <= b + lot_active_cap + max_overweight,
         ]
         if z is not None:
             max_shares = np.floor(
-                np.maximum(b + max_saw + max_overweight, max_overweight)
+                np.maximum(b + lot_active_cap + max_overweight, max_overweight)
                 * portfolio_value / prices
             ).astype(int)
             max_shares = np.maximum(max_shares, 1)
@@ -692,10 +879,18 @@ def _optimize_alpha(strategy, investable, alpha, b, Sigma, L,
             ]
 
     # Active-weight constraints
-    cvx += [aw <= max_saw, aw >= -max_saw]
+    if max_saw is not None:
+        cvx += [aw <= float(max_saw), aw >= -float(max_saw)]
 
-    max_ar = c.get("max_active_risk", 0.04)
-    cvx.append(cp.norm(L.T @ aw, 2) <= max_ar)
+    # Active-risk expression in factor (square-root) space; reused by both the
+    # active-risk cap and the risk-aversion penalty so CVXPY builds it once.
+    # L is the low-rank Barra factor/idio loading (or LW Cholesky), so this stays
+    # an efficient SOCP term and never materialises the dense N×N covariance.
+    Lt_aw = L.T @ aw
+
+    max_ar = c.get("max_active_risk", None)
+    if max_ar is not None:
+        cvx.append(cp.norm(Lt_aw, 2) <= float(max_ar))
 
     max_secaw = c.get("max_sector_active_weight", None)
     if max_secaw is not None:
@@ -717,7 +912,22 @@ def _optimize_alpha(strategy, investable, alpha, b, Sigma, L,
     if prev_weights_arr is not None and max_turnover is not None:
         cvx.append(cp.sum(cp.abs(w - prev_weights_arr)) <= max_turnover)
 
-    prob = cp.Problem(cp.Maximize(alpha @ w), cvx)
+    # Objective. `risk_aversion` (Strategies sheet, default 0) turns the pure
+    # linear alpha objective into a mean-variance objective in active space:
+    #   maximize  α·w − ½·risk_aversion·(w−b)'Σ(w−b)
+    # With risk_aversion=0 this is the legacy pure-linear alpha objective (loads
+    # the highest point estimates to their caps, lets beta/active risk drift to
+    # the max_active_risk boundary). With risk_aversion>0 the optimizer trades
+    # alpha off against active variance, so noisy high-alpha/high-risk names are
+    # pulled back and the book de-concentrates; the max_active_risk cap stays as
+    # a backstop. Note: walk-forward backtests show a positive penalty *hurts*
+    # the current ALP001 alpha (its edge is in the conviction tilts), so it is
+    # left at 0 for live strategies — kept as an available knob.
+    risk_aversion = float(strategy.get("risk_aversion", 0.0) or 0.0)
+    objective = alpha @ w
+    if risk_aversion > 0.0:
+        objective = objective - 0.5 * risk_aversion * cp.sum_squares(Lt_aw)
+    prob = cp.Problem(cp.Maximize(objective), cvx)
     _solve(prob, strategy["solver"])
 
     weights = np.array(w.value).clip(0)
@@ -728,23 +938,31 @@ def _optimize_alpha(strategy, investable, alpha, b, Sigma, L,
 
     act         = weights - b
     active_risk = float(np.sqrt(_variance(act, Sigma, L)))
+    port_vol    = float(np.sqrt(_variance(weights, Sigma, L)))
+    bench_var   = float(_variance(b, Sigma, L)) if b.sum() > 1e-10 else 0.0
+    beta        = float(_covariance(weights, b, Sigma, L) / bench_var) if bench_var > 1e-12 else 0.0
     exp_alpha   = float(alpha @ weights)
     n_pos       = int((weights > 1e-4).sum())
     info_ratio  = exp_alpha / active_risk if active_risk > 0 else 0.0
 
-    log.info("Expected alpha: %+.4f | Active risk: %.2f%% | Info ratio: %.2f | Positions: %d",
-             exp_alpha, active_risk * 100, info_ratio, n_pos)
+    log.info(
+        "Expected alpha: %+.4f | Active risk: %.2f%% | Portfolio vol: %.2f%% | "
+        "Beta: %.2f | Info ratio: %.2f | Positions: %d",
+        exp_alpha, active_risk * 100, port_vol * 100, beta, info_ratio, n_pos,
+    )
 
     return weights, {
         "expected_alpha": round(exp_alpha, 4),
         "active_risk":    round(active_risk, 4),
+        "portfolio_vol":  round(port_vol, 4),
+        "beta":           round(beta, 4),
         "info_ratio":     round(info_ratio, 4),
     }
 
 
 # ── Objective 2: maximize_sharpe (Charnes-Cooper) ────────────────────────────
 
-def _optimize_sharpe(strategy, investable, alpha, Sigma, L,
+def _optimize_sharpe(strategy, investable, alpha, b, Sigma, L,
                      sectors, industries, B_sector, B_ind, cap_buckets, B_cap,
                      prev_weights_arr: np.ndarray | None = None,
                      max_turnover: float | None = None):
@@ -789,6 +1007,9 @@ def _optimize_sharpe(strategy, investable, alpha, Sigma, L,
 
     # Sector constraints (y-space: scale by t)
     _add_sector_constraints(cvx, y, t, sectors, B_sector, c)
+    _add_benchmark_relative_group_constraints(
+        cvx, y, t, sectors, B_sector, b, c.get("max_sector_active_weight", None)
+    )
     _add_market_cap_constraints(cvx, y, t, cap_buckets, B_cap, c)
 
     # Industry cap
@@ -796,6 +1017,9 @@ def _optimize_sharpe(strategy, investable, alpha, Sigma, L,
     if max_ind is not None:
         for g in range(len(industries)):
             cvx.append(B_ind[g] @ y <= max_ind * t)
+    _add_benchmark_relative_group_constraints(
+        cvx, y, t, industries, B_ind, b, c.get("max_industry_active_weight", None)
+    )
 
     # Max portfolio vol: σ_p ≤ v  →  ||L.T @ y||₂ ≤ v * t
     max_vol = c.get("max_portfolio_vol", None)
@@ -813,6 +1037,11 @@ def _optimize_sharpe(strategy, investable, alpha, Sigma, L,
     y_val = np.array(y.value).clip(0)
     if z is not None:
         y_val *= (np.array(z.value) > 0.5).astype(float)
+    if not np.isfinite(y_val).all() or y_val.sum() <= 1e-10:
+        raise RuntimeError(
+            "Optimization failed: solver returned no usable Sharpe solution "
+            "(likely MIP time limit without incumbent)."
+        )
     weights = y_val / y_val.sum()
 
     port_vol   = float(np.sqrt(_variance(weights, Sigma, L)))
@@ -866,6 +1095,9 @@ def _optimize_min_variance(strategy, investable, b, Sigma, L,
 
     # Sector constraints (w-space)
     _add_sector_constraints(cvx, w, 1.0, sectors, B_sector, c)
+    _add_benchmark_relative_group_constraints(
+        cvx, w, 1.0, sectors, B_sector, b, c.get("max_sector_active_weight", None)
+    )
     _add_market_cap_constraints(cvx, w, 1.0, cap_buckets, B_cap, c)
 
     # Industry cap
@@ -873,6 +1105,9 @@ def _optimize_min_variance(strategy, investable, b, Sigma, L,
     if max_ind is not None:
         for g in range(len(industries)):
             cvx.append(B_ind[g] @ w <= max_ind)
+    _add_benchmark_relative_group_constraints(
+        cvx, w, 1.0, industries, B_ind, b, c.get("max_industry_active_weight", None)
+    )
 
     # Two-way turnover constraint: sum(|w - w_prev|) ≤ max_turnover
     if prev_weights_arr is not None and max_turnover is not None:
@@ -959,6 +1194,7 @@ def optimize_for_backtest(
     max_turnover: float,
     solver: str = "CLARABEL",
     min_weight: float = 0.0,
+    risk_aversion: float = 0.0,
 ) -> tuple[dict[str, float], dict] | None:
     """
     Single-period optimizer for walk-forward backtest. No file I/O or console output.
@@ -1059,16 +1295,19 @@ def optimize_for_backtest(
             effective_constraints = constraints
 
         strategy = {
-            "constraints": effective_constraints,
-            "solver":      solver,
-            "objective":   objective,
+            "constraints":   effective_constraints,
+            "solver":        solver,
+            "objective":     objective,
+            "risk_aversion": risk_aversion,
         }
 
-        # LP pre-screen for MIP: run fast LP relaxation (CLARABEL) and keep only
-        # top max_positions candidates before handing off to MOSEK. Without this,
-        # MOSEK receives ~478 binary variables and times out (~2.5 min per period).
+        # Optional LP pre-screen for MIP backtests. Disabled by default so
+        # backtests match the live optimizer's full-universe candidate set.
         max_pos_n = effective_constraints.get("max_positions")
-        if max_pos_n is not None and solver.upper() == "MOSEK" and len(investable) > int(max_pos_n):
+        if (max_pos_n is not None
+                and solver.upper() == "MOSEK"
+                and len(investable) > int(max_pos_n)
+                and effective_constraints.get("use_lp_prescreen", False)):
             n_cand = int(max_pos_n)
             lp_idx = _lp_prescreen(
                 strategy, investable, alpha_arr, b, Sigma, L,
@@ -1127,7 +1366,7 @@ def optimize_for_backtest(
         with contextlib.redirect_stdout(buf):
             if objective == "maximize_sharpe":
                 weights, extra = _optimize_sharpe(
-                    strategy, investable, alpha_arr, Sigma, L,
+                    strategy, investable, alpha_arr, b, Sigma, L,
                     sectors, industries, B_sector, B_ind, cap_buckets, B_cap,
                     prev_weights_arr=prev_w_arr, max_turnover=max_turnover,
                 )
@@ -1184,16 +1423,44 @@ def run_optimization(strategy: dict) -> tuple[pd.DataFrame, dict]:
     risk_isin_idx = {isin: i for i, isin in enumerate(risk_isins)}
     log.info("  %d stocks in risk model", len(risk_isins))
 
-    # Benchmark — always load for display if benchmark_file is set;
+    universe_isins: list[str] | None = None
+    universe_meta: dict = {}
+    identity_aliases: dict[str, str] = {}
+    universe_index = strategy.get("universe_index", "")
+    if universe_index:
+        log.info("Loading clean investable universe: %s ...", universe_index)
+        universe_isins, universe_meta = _load_clean_investable(universe_index, strategy["risk_date"])
+        identity_aliases = universe_meta.get("identity_aliases", {})
+        log.info(
+            "  %d tradable stocks from %s (%d blocked)",
+            universe_meta["universe_tradable"],
+            universe_meta["universe_source_snapshot_date"],
+            universe_meta["universe_blocked"],
+        )
+
+    # Benchmark — always load for display if benchmark_index/benchmark_file is set;
     # only fed into the optimiser's b vector for maximize_alpha.
-    if strategy["benchmark_file"]:
-        log.info("Loading benchmark ...")
+    bm_meta: dict = {}
+    benchmark_index = strategy.get("benchmark_index", "")
+    if benchmark_index:
+        log.info("Loading clean benchmark: %s ...", benchmark_index)
+        bm_df, bm_meta = load_index_benchmark(benchmark_index, strategy["risk_date"])
+        log.info(
+            "  %d benchmark stocks from %s (%d blocked)",
+            bm_meta["benchmark_tradable"],
+            bm_meta["benchmark_source_snapshot_date"],
+            bm_meta["benchmark_blocked"],
+        )
+    elif strategy["benchmark_file"]:
+        log.info("Loading benchmark file ...")
         bm_df = load_benchmark(strategy["benchmark_file"])
         ticker_to_isin = map_tickers_to_isins(list(bm_df["ticker"]))
         bm_df["isin"] = bm_df["ticker"].map(ticker_to_isin)
         bm_df = bm_df.dropna(subset=["isin"])
-        bm_df["weight"] /= bm_df["weight"].sum()
+        if bm_df["weight"].sum() > 0:
+            bm_df["weight"] /= bm_df["weight"].sum()
         log.info("  %d benchmark stocks", len(bm_df))
+        bm_meta = {"benchmark_file": strategy["benchmark_file"]}
     else:
         bm_df = pd.DataFrame(columns=["isin", "weight"])
 
@@ -1206,8 +1473,11 @@ def run_optimization(strategy: dict) -> tuple[pd.DataFrame, dict]:
     meta_df = load_universe_metadata()
     gics_df = meta_df.set_index("isin")
 
-    investable  = _build_investable(strategy, bm_df, risk_isins, risk_isin_idx)
-    alpha_arr   = np.array([alpha_lookup.get(isin, 0.0) for isin in investable])
+    investable  = _build_investable(strategy, bm_df, risk_isins, risk_isin_idx, universe_isins)
+    alpha_arr   = np.array([
+        alpha_lookup.get(isin, alpha_lookup.get(identity_aliases.get(isin, ""), 0.0))
+        for isin in investable
+    ])
 
     c_pre       = strategy["constraints"]
 
@@ -1226,7 +1496,7 @@ def run_optimization(strategy: dict) -> tuple[pd.DataFrame, dict]:
         # latest Barra snapshot when that exact date is missing — and log loudly,
         # because a date mismatch silently mixes risk models from different days.
         risk_date  = strategy["risk_date"]
-        L_barra    = load_barra_L(risk_date, investable)
+        L_barra    = load_barra_L(risk_date, investable, identity_aliases)
         barra_date = risk_date
         if L_barra is None:
             fallback = _latest_barra_date()
@@ -1236,7 +1506,7 @@ def run_optimization(strategy: dict) -> tuple[pd.DataFrame, dict]:
                     "Risk-model date now differs from alpha/Ledoit-Wolf (%s).",
                     risk_date, fallback, risk_date,
                 )
-                L_barra    = load_barra_L(fallback, investable)
+                L_barra    = load_barra_L(fallback, investable, identity_aliases)
                 barra_date = fallback
         if L_barra is not None:
             L     = L_barra
@@ -1256,8 +1526,9 @@ def run_optimization(strategy: dict) -> tuple[pd.DataFrame, dict]:
     if bm_display.sum() > 0:
         bm_display /= bm_display.sum()
 
-    # b: benchmark vector fed into the optimiser (only for maximize_alpha)
-    b = bm_display.copy() if objective == "maximize_alpha" else np.zeros(N)
+    # b: benchmark vector. maximize_alpha uses it in the objective constraints;
+    # other objectives may use it for benchmark-relative exposure bands.
+    b = bm_display.copy() if bm_display.sum() > 0 else np.zeros(N)
 
     sectors, industries, B_sector, B_ind, _sector_fn, _industry_fn = \
         _sector_industry_matrices(investable, gics_df)
@@ -1306,7 +1577,7 @@ def run_optimization(strategy: dict) -> tuple[pd.DataFrame, dict]:
             bm_display  = bm_display[lp_arr]
             Sigma, L    = _covariance_submatrix(risk_cov, risk_isin_idx, investable)
             if used_barra_date:
-                L_barra = load_barra_L(used_barra_date, investable)
+                L_barra = load_barra_L(used_barra_date, investable, identity_aliases)
                 if L_barra is not None:
                     L = L_barra
                     Sigma = None
@@ -1344,12 +1615,11 @@ def run_optimization(strategy: dict) -> tuple[pd.DataFrame, dict]:
         else:
             log.info("LP pre-screen failed — using full universe")
 
-    # Alpha-score pre-screen for maximize_sharpe / minimize_variance MIPs.
-    # The LP pre-screen above is only for maximize_alpha (needs a benchmark LP).
-    # For other objectives with cardinality constraints, the full-universe MIP
-    # can be intractable (e.g. 998 binary vars). Pre-screen to top 5× max_positions
-    # by alpha score — fast heuristic that keeps the MIP size manageable.
-    if max_pos_n is not None and objective in ("maximize_sharpe", "minimize_variance"):
+    # Optional alpha-score pre-screen for maximize_sharpe / minimize_variance MIPs.
+    # Disabled by default so cardinality constraints are tested on the real universe.
+    if (max_pos_n is not None
+            and objective in ("maximize_sharpe", "minimize_variance")
+            and c_pre.get("use_alpha_prescreen", False)):
         n_alpha_cand = min(len(investable), int(max_pos_n) * 5)
         if n_alpha_cand < len(investable):
             top_idx = np.argsort(-alpha)[:n_alpha_cand]
@@ -1360,7 +1630,7 @@ def run_optimization(strategy: dict) -> tuple[pd.DataFrame, dict]:
             bm_display  = bm_display[top_arr]
             Sigma, L    = _covariance_submatrix(risk_cov, risk_isin_idx, investable)
             if used_barra_date:
-                L_barra = load_barra_L(used_barra_date, investable)
+                L_barra = load_barra_L(used_barra_date, investable, identity_aliases)
                 if L_barra is not None:
                     L = L_barra
                     Sigma = None
@@ -1378,7 +1648,7 @@ def run_optimization(strategy: dict) -> tuple[pd.DataFrame, dict]:
     # Dispatch to objective
     if objective == "maximize_sharpe":
         weights, extra = _optimize_sharpe(
-            strategy, investable, alpha, Sigma, L,
+            strategy, investable, alpha, b, Sigma, L,
             sectors, industries, B_sector, B_ind, cap_buckets, B_cap)
     elif objective == "minimize_variance":
         weights, extra = _optimize_min_variance(
@@ -1421,6 +1691,8 @@ def run_optimization(strategy: dict) -> tuple[pd.DataFrame, dict]:
         "n_positions": int((weights > 1e-4).sum()),
         "n_benchmark": int((bm_display > 0).sum()),
         "run_date":    datetime.now().strftime("%Y-%m-%d %H:%M"),
+        **universe_meta,
+        **bm_meta,
         **extra,
     }
     if used_barra_date:
