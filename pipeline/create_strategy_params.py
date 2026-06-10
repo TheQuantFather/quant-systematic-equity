@@ -143,7 +143,8 @@ def build_constraints(wb):
 
         # ── abs_return ───────────────────────────────────────────────────────
         ["abs_return",  "long_only",                   "TRUE", "TRUE",  "No short positions"],
-        ["abs_return",  "fully_invested",              "TRUE", "TRUE",  "Weights sum to 1"],
+        ["abs_return",  "fully_invested",              "FALSE","TRUE",  "Cash allowed up to max_cash_weight; held only when the vol cap binds"],
+        ["abs_return",  "max_cash_weight",             "0.20", "TRUE",  "Max 20% cash; de-risk headroom for max_portfolio_vol (sector bands cap cash at ~22% anyway)"],
         ["abs_return",  "max_active_risk",             "0.12", "TRUE",  "Max 12% annual active risk vs configured benchmark"],
         ["abs_return",  "max_position",                "0.04", "TRUE",  "Global max 4% per stock; bucket caps tighten mid/small further"],
         ["abs_return",  "min_positions",               "35",   "TRUE",  "Minimum 35 securities for retail-scale diversification"],
@@ -153,7 +154,7 @@ def build_constraints(wb):
         ["abs_return",  "max_industry_active_weight",   "0.02", "TRUE",  "Industry weight must stay within ±2% of configured benchmark"],
         ["abs_return",  "equal_sector_weight",          "FALSE","FALSE", "Disabled: conflicts with benchmark-relative sector exposure"],
         ["abs_return",  "sector_weight_tolerance",      "0.01", "FALSE", "Unused while equal_sector_weight is disabled"],
-        ["abs_return",  "max_portfolio_vol",            "0.18", "FALSE", "Unused while abs_return is pure maximize_alpha"],
+        ["abs_return",  "max_portfolio_vol",            "0.17", "TRUE",  "Max 17% annual vol; binds in stressed regimes only (ex-ante median ~16.3%)"],
         ["abs_return",  "max_industry_weight",          "0.10", "FALSE", "Disabled: industry exposure is controlled vs benchmark instead"],
         ["abs_return",  "use_alpha_prescreen",          "FALSE","FALSE", "Do not pre-screen the Sharpe MIP; solve on the real universe"],
         ["abs_return",  "large_cap_min_market_cap",     "10000000000", "TRUE", "Large cap threshold: >= $10B"],
@@ -350,7 +351,8 @@ def build_reference(wb):
         ["sector_weight_tolerance",  "all objectives",            "±tolerance around equal-weight target (e.g. 0.01 = ±1%)"],
         ["excluded_sectors",         "all objectives",            "Pipe-separated sectors to zero out, e.g. Energy|Materials"],
         ["max_industry_weight",      "all objectives",            "Max absolute weight per SimFin industry group"],
-        ["max_portfolio_vol",        "maximize_sharpe",           "Max annual portfolio volatility"],
+        ["max_portfolio_vol",        "maximize_sharpe, maximize_alpha", "Max annual portfolio volatility"],
+        ["max_cash_weight",          "maximize_alpha",            "Max cash weight; weights sum in [1 - cash, 1]. Disable to force fully invested"],
     ])
 
     _widths(ws, [28, 28, 75])

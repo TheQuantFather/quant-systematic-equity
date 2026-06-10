@@ -265,6 +265,52 @@ def classify_sector(sector: str | None, industry: str | None) -> str:
     return "general"
 
 
+# Which factor sector_types each company sector_type is allowed to receive.
+# Single source of truth shared by the factor layer (create_factors gating) and
+# the model layer (create_models coverage denominator) so both agree on which
+# factors apply to a company.
+ALLOWED_FACTOR_SECTORS: dict[str, set] = {
+    'general':   {'all', 'general'},
+    'financial': {'all'},              # banks skip revenue/WC/liquidity factors
+    'reit':      {'all', 'general', 'reit'},
+}
+
+
+def factor_applies_to_company(factor_sector_type: str | None,
+                              company_sector_type: str | None) -> bool:
+    """True if a factor with `factor_sector_type` is computed for a company of
+    `company_sector_type` (mirrors create_factors' sector gating)."""
+    allowed = ALLOWED_FACTOR_SECTORS.get(company_sector_type or 'general', {'all', 'general'})
+    return (factor_sector_type or 'all') in allowed
+
+
+def apply_weight_cap(weights: dict[str, float], cap: float = 0.03) -> dict[str, float]:
+    """
+    Redistribute weight above `cap` to uncapped names pro-rata until convergence.
+
+    Standard approach for capped-index construction (e.g. S&P 500 3% Capped).
+    Converges in O(log n) iterations because each pass either resolves all
+    violations or reduces the uncapped pool, guaranteeing termination.
+    Returns a normalised dict (weights sum to 1); zero-weight names are dropped.
+    """
+    w = {k: v for k, v in weights.items() if v > 0}
+    total = sum(w.values())
+    if total <= 0:
+        return {}
+    w = {k: v / total for k, v in w.items()}
+    for _ in range(100):
+        over = {k for k, v in w.items() if v > cap}
+        if not over:
+            break
+        excess = sum(w[k] - cap for k in over)
+        under_total = sum(v for k, v in w.items() if k not in over)
+        if under_total < 1e-10:
+            break
+        scale = (under_total + excess) / under_total
+        w = {k: cap if k in over else min(cap, v * scale) for k, v in w.items()}
+    return w
+
+
 def winsorized_zscore(series: pd.Series, lower: float = 0.01, upper: float = 0.99) -> pd.Series:
     """
     Cross-sectional winsorize at [lower, upper] percentiles, then z-score.

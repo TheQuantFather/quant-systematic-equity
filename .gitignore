@@ -90,6 +90,9 @@ local_settings.py
 # ── Exploratory scripts (not part of core pipeline) ──────────────────────────
 exploratory/
 
+# ── Task / work-in-progress notes (private, not for public repo) ─────────────
+tasks/
+
 # ── Broker / trading infrastructure (private — not for public repo) ──────────
 brokers/
 broker_trade.py

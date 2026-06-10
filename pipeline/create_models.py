@@ -24,10 +24,23 @@ import numpy as np
 import pandas as pd
 
 
-from config import FACTORS_DB, MODELS_DB, MODELS_REF as MODELS_CSV, FACTORS_REF as FACTORS_CSV
-from utils import get_db, get_logger, winsorized_zscore
+from config import (
+    FACTORS_DB, MODELS_DB, UNIVERSE_DB,
+    MODELS_REF as MODELS_CSV, FACTORS_REF as FACTORS_CSV,
+)
+from utils import (
+    get_db, get_logger, winsorized_zscore,
+    classify_sector, factor_applies_to_company,
+)
 
 log = get_logger("create_models")
+
+# A model score is renormalised by the weight of factors actually present, but the
+# divisor is floored at MIN_COVERAGE × (weight applicable to the security's sector).
+# So a name with ≥50% coverage gets full conviction, while a sparsely-covered name
+# is divided by the floor — shrinking its score toward neutral rather than giving
+# one or two factors full conviction or muting whole sectors structurally.
+MIN_COVERAGE = 0.5
 
 
 # ---------------------------------------------------------------------------
@@ -42,7 +55,15 @@ def load_factor_directions() -> dict:
 
 def load_models_reference() -> dict:
     """
-    Returns {model_name: {model_id, is_composite, weights: {factor_id: weight}}}.
+    Returns {model_name: {model_id, is_composite,
+                          weights:  {factor_id: weight},
+                          sectors:  {factor_id: frozenset|None}}}.
+
+    `sectors[factor_id]` is the optional `sector_type` override from
+    models_reference.csv: a pipe-separated set of company sector_types the factor
+    applies to within this model (e.g. earnings yield = general|financial, FFO
+    yield = reit). None means no override — fall back to the factor's own
+    sector gating from factors_reference.csv.
     """
     models: dict = {}
     with open(MODELS_CSV) as f:
@@ -52,10 +73,29 @@ def load_models_reference() -> dict:
             factor_id    = row['Factors']
             weight       = float(row['Weights'])
             is_composite = bool(int(row['IsComposite']))
+            override_raw = (row.get('sector_type') or '').strip()
+            override     = frozenset(s.strip() for s in override_raw.split('|')) if override_raw else None
             if name not in models:
-                models[name] = {'model_id': model_id, 'is_composite': is_composite, 'weights': {}}
+                models[name] = {'model_id': model_id, 'is_composite': is_composite,
+                                'weights': {}, 'sectors': {}}
             models[name]['weights'][factor_id] = weight
+            models[name]['sectors'][factor_id] = override
     return models
+
+
+def load_factor_sector_types() -> dict:
+    """{factor_id: factor-layer sector_type} from factors_reference.csv (default 'all')."""
+    df = pd.read_csv(FACTORS_CSV)
+    return dict(zip(df['factor_id'], df['sector_type'].fillna('all')))
+
+
+def load_security_sector_types() -> dict:
+    """{security_id (isin): company sector_type} via universe.db + classify_sector."""
+    with get_db(UNIVERSE_DB) as conn:
+        rows = conn.execute(
+            "SELECT isin, simfin_sector, simfin_industry FROM companies"
+        ).fetchall()
+    return {isin: classify_sector(sec, ind) for isin, sec, ind in rows}
 
 
 def get_base_models(models: dict) -> dict:
@@ -140,25 +180,49 @@ def compute_base_models(
     base_models: dict,
     factors_data: dict,
     factor_directions: dict,
+    factor_sector_types: dict,
+    security_sector_types: dict,
 ) -> int:
-    """Score each base model as a weighted sum of direction-adjusted factor z-scores."""
+    """Score each base model as a coverage-renormalised weighted sum of
+    direction-adjusted factor z-scores.
+
+    For each security only the factors that apply to its sector contribute to the
+    denominator (`applicable_weight`); the score is divided by
+    max(valid_weight, MIN_COVERAGE × applicable_weight). This keeps a well-covered
+    name at full conviction, shrinks a sparsely-covered name toward neutral, and
+    stops whole sectors (financials/REITs, which are structurally gated out of many
+    factors) from being systematically muted.
+    """
     rows = []
     for data_date, securities in factors_data.items():
         for model_name, model_info in base_models.items():
             model_id     = model_info['model_id']
             is_composite = int(model_info['is_composite'])
             weights      = model_info['weights']
+            overrides    = model_info['sectors']
             for security_id, factor_zscores in securities.items():
-                score        = 0.0
-                valid_weight = 0.0
+                ctype = security_sector_types.get(security_id, 'general')
+                score             = 0.0
+                valid_weight      = 0.0
+                applicable_weight = 0.0
                 for factor_id, weight in weights.items():
+                    override = overrides.get(factor_id)
+                    if override is not None:
+                        applies = ctype in override
+                    else:
+                        applies = factor_applies_to_company(
+                            factor_sector_types.get(factor_id, 'all'), ctype)
+                    if not applies:
+                        continue
+                    applicable_weight += weight
                     z = factor_zscores.get(factor_id)
                     if z is not None and not math.isnan(z):
                         direction     = factor_directions.get(factor_id, 1)
                         score        += z * weight * direction
                         valid_weight += weight
-                if valid_weight > 0:
-                    rows.append((data_date, model_id, security_id, score, is_composite))
+                if applicable_weight > 0 and valid_weight > 0:
+                    denom = max(valid_weight, MIN_COVERAGE * applicable_weight)
+                    rows.append((data_date, model_id, security_id, score / denom, is_composite))
 
     conn.executemany(
         "INSERT OR REPLACE INTO models "
@@ -193,16 +257,18 @@ def compute_alpha_models(
             is_composite = int(model_info['is_composite'])
             weights      = model_info['weights']
             for security_id in securities:
-                sid_scores   = base_scores.get(security_id, {})
-                score        = 0.0
-                valid_weight = 0.0
+                sid_scores        = base_scores.get(security_id, {})
+                score             = 0.0
+                valid_weight      = 0.0
+                applicable_weight = sum(weights.values())  # all base models apply to all names
                 for base_model_id, weight in weights.items():
                     v = sid_scores.get(base_model_id)
                     if v is not None and not math.isnan(v):
                         score        += v * weight
                         valid_weight += weight
                 if valid_weight > 0:
-                    rows.append((data_date, model_id, security_id, score, is_composite))
+                    denom = max(valid_weight, MIN_COVERAGE * applicable_weight)
+                    rows.append((data_date, model_id, security_id, score / denom, is_composite))
 
     conn.executemany(
         "INSERT OR REPLACE INTO models "
@@ -248,10 +314,12 @@ def main() -> None:
                         help='Drop and rebuild the models table before running')
     args = parser.parse_args()
 
-    models            = load_models_reference()
-    base_models       = get_base_models(models)
-    alpha_models      = get_alpha_models(models)
-    factor_directions = load_factor_directions()
+    models                = load_models_reference()
+    base_models           = get_base_models(models)
+    alpha_models          = get_alpha_models(models)
+    factor_directions     = load_factor_directions()
+    factor_sector_types   = load_factor_sector_types()
+    security_sector_types = load_security_sector_types()
 
     log.info("Models to create : %s", list(models.keys()))
     log.info("Base models      : %s", list(base_models.keys()))
@@ -266,7 +334,8 @@ def main() -> None:
         setup_models_db(conn, clean=args.clean)
 
         log.info("=== Stage 1: Base models from factor z-scores ===")
-        n1 = compute_base_models(conn, base_models, factors_data, factor_directions)
+        n1 = compute_base_models(conn, base_models, factors_data, factor_directions,
+                                 factor_sector_types, security_sector_types)
         log.info("  %s base model records written", f"{n1:,}")
 
         if alpha_models:
