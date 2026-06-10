@@ -2185,6 +2185,61 @@ _NPORT_AUTO_INDEXES: list[dict] = [
     },
 ]
 
+# Capped index definitions: index_name -> (base_index, cap).
+# For each entry, real N-PORT holdings (from index_registry + nport_accessions) are used
+# when available; all other base-index snapshot dates are filled synthetically.
+_CAPPED_INDEX_DEFINITIONS: dict[str, tuple[str, float]] = {
+    "sp500_3pct_capped": ("sp500", 0.03),
+}
+
+
+def _backfill_capped_index_snapshots(
+    index_name: str,
+    base_index: str,
+    cap: float,
+) -> int:
+    """Fill universe_snapshots for a capped index for all base-index dates not already covered.
+
+    Dates already present (real N-PORT rows fetched by rebuild_snapshots) are skipped
+    via INSERT OR IGNORE. Returns the number of synthetic rows inserted.
+    """
+    from utils import apply_weight_cap
+
+    with get_db(DB_PATH) as conn:
+        base_dates = [r[0] for r in conn.execute(
+            "SELECT DISTINCT snapshot_date FROM universe_snapshots WHERE index_name=? ORDER BY snapshot_date",
+            (base_index,),
+        ).fetchall()]
+        existing = {r[0] for r in conn.execute(
+            "SELECT DISTINCT snapshot_date FROM universe_snapshots WHERE index_name=?",
+            (index_name,),
+        ).fetchall()}
+
+        rows: list[tuple[str, str, str, float, None]] = []
+        for snap_date in base_dates:
+            if snap_date in existing:
+                continue
+            base_rows = conn.execute(
+                "SELECT isin, weight FROM universe_snapshots WHERE index_name=? AND snapshot_date=?",
+                (base_index, snap_date),
+            ).fetchall()
+            if not base_rows:
+                continue
+            raw = {isin: w for isin, w in base_rows if w is not None and w > 0}
+            capped = apply_weight_cap(raw, cap=cap)
+            for isin, w in capped.items():
+                rows.append((snap_date, isin, index_name, w, None))
+
+        if rows:
+            conn.executemany(
+                "INSERT OR IGNORE INTO universe_snapshots "
+                "(snapshot_date, isin, index_name, weight, market_value) VALUES (?, ?, ?, ?, ?)",
+                rows,
+            )
+            conn.commit()
+
+    return len(rows)
+
 
 def ensure_snapshot(snap_date_iso: str, *, include_legacy_csv: bool = False) -> None:
     """
@@ -2427,6 +2482,12 @@ def rebuild_snapshots(*, include_legacy_csv: bool = False) -> None:
             log.info("  %s: %d companies", d, n)
 
     _audit_pit_coverage()
+
+    # Fill synthetic capped-index snapshots for all dates not covered by real N-PORT.
+    for capped_name, (base_idx, cap) in _CAPPED_INDEX_DEFINITIONS.items():
+        n = _backfill_capped_index_snapshots(capped_name, base_idx, cap)
+        log.info("[%s] %d synthetic snapshot rows added (cap=%.0f%%)", capped_name, n, cap * 100)
+
     log.info("Done.")
 
 
@@ -3129,6 +3190,14 @@ def main() -> None:
         help="Only materialize the latest raw universe snapshot date.",
     )
     parser.add_argument(
+        "--backfill-capped-snapshots", metavar="INDEX_NAME",
+        help=(
+            "Backfill universe_snapshots for a capped index (e.g. sp500_3pct_capped) "
+            "by applying the weight cap to all base-index snapshot dates not already "
+            "covered by real N-PORT filings. Safe to re-run; skips existing rows."
+        ),
+    )
+    parser.add_argument(
         "--limit", type=int, default=None,
         help="Cap the number of names processed (debug; applies to --recover-delisted)",
     )
@@ -3146,6 +3215,17 @@ def main() -> None:
             mode=args.clean_mode,
             only_latest=args.clean_latest_only,
         )
+        return
+
+    if args.backfill_capped_snapshots:
+        iname = args.backfill_capped_snapshots
+        if iname not in _CAPPED_INDEX_DEFINITIONS:
+            log.error("Unknown capped index '%s'. Known: %s", iname, list(_CAPPED_INDEX_DEFINITIONS))
+            sys.exit(1)
+        base_idx, cap = _CAPPED_INDEX_DEFINITIONS[iname]
+        log.info("=== BACKFILL CAPPED SNAPSHOTS: %s (base=%s cap=%.0f%%) ===", iname, base_idx, cap * 100)
+        n = _backfill_capped_index_snapshots(iname, base_idx, cap)
+        log.info("Done. %d synthetic rows inserted.", n)
         return
 
     if args.rebuild_snapshots:

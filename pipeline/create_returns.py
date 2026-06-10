@@ -115,6 +115,15 @@ def connect() -> sqlite3.Connection:
         stmt = stmt.strip()
         if stmt:
             conn.execute(stmt)
+    # Migration: add source column (idempotent — OperationalError if already present).
+    # 'yahoo'    = real ETF price data fetched from Yahoo Finance.
+    # 'synthetic' = computed from a base index (e.g. cap-applied S&P 500) when the
+    #               tracking ETF has no price history yet.  See _build_synthetic_capped_series.
+    try:
+        conn.execute("ALTER TABLE benchmark_returns ADD COLUMN source TEXT DEFAULT 'yahoo'")
+        conn.execute("UPDATE benchmark_returns SET source='yahoo' WHERE source IS NULL")
+    except sqlite3.OperationalError:
+        pass  # column already exists
     conn.commit()
     return conn
 
@@ -335,6 +344,158 @@ def backfill_splits(
 
 
 # ---------------------------------------------------------------------------
+# Synthetic capped-index series
+# ---------------------------------------------------------------------------
+
+def _build_synthetic_capped_series(
+    conn: sqlite3.Connection,
+    index_name: str,
+    base_index: str = "sp500",
+    cap: float = 0.03,
+) -> int:
+    """
+    Build (or rebuild) a synthetic daily benchmark_returns series by applying a
+    weight cap to a base index held in universe_snapshots.
+
+    Method
+    ------
+    1. Load all month-end base-index snapshots from universe_snapshots (PIT weights
+       from iShares N-PORT filings, e.g. IVV for sp500).
+    2. At each month-end rebalance date, apply the weight cap iteratively until no
+       name exceeds `cap`, redistributing the excess to uncapped names pro-rata.
+    3. Hold those weights constant through the following calendar month (buy-and-hold).
+       Daily portfolio return = weighted sum of constituent returns.
+    4. Insert rows with source='synthetic' so update_index_returns can replace them
+       with real Yahoo data once the tracking ETF (e.g. TOPC) becomes available.
+
+    Safe to re-run — deletes all synthetic rows for this index_name before rebuilding.
+    Does NOT overwrite rows already stored with source='yahoo'.
+
+    IMPORTANT — approximation caveats (documented in GOTCHAS.md):
+    - Rebalance dates are month-ends from our snapshot schedule, not the actual index
+      reconstitution dates (S&P 500 3% Capped rebalances quarterly).
+    - For dates before the ETF launched, weights are derived from the base index
+      N-PORT (IVV for sp500), not the capped ETF's actual filings.
+    - Missing-return names (delisted / no Yahoo data) are excluded and weights
+      are renormalised to sum to 1 for each period — a minor undercount.
+    """
+    from utils import apply_weight_cap
+
+    if not UNIVERSE_DB.exists():
+        log.error("universe.db not found — cannot build synthetic series")
+        return 0
+
+    with get_db(UNIVERSE_DB) as uc:
+        snap_df = pd.read_sql(
+            "SELECT snapshot_date, isin, weight FROM universe_snapshots "
+            "WHERE index_name=? AND weight IS NOT NULL ORDER BY snapshot_date",
+            uc, params=[base_index],
+        )
+
+    if snap_df.empty:
+        log.error("No universe_snapshots rows for base index '%s'", base_index)
+        return 0
+
+    snap_df["snapshot_date"] = pd.to_datetime(snap_df["snapshot_date"])
+
+    # Keep only the last snapshot per calendar month (month-end rebalance points)
+    snap_df["ym"] = snap_df["snapshot_date"].dt.to_period("M")
+    month_ends = (
+        snap_df.groupby("ym")["snapshot_date"].max().sort_values().reset_index(drop=True)
+    )
+    rebal_dates: list[pd.Timestamp] = month_ends.tolist()
+
+    if len(rebal_dates) < 2:
+        log.error("Need at least 2 month-end snapshots for base index '%s'", base_index)
+        return 0
+
+    # Build cap-adjusted weight dict for each rebalance date
+    snap_by_date = snap_df.groupby("snapshot_date")
+    capped: dict[pd.Timestamp, dict[str, float]] = {}
+    for rd in rebal_dates:
+        if rd not in snap_by_date.groups:
+            continue
+        g = snap_by_date.get_group(rd)
+        raw_w = dict(zip(g["isin"], g["weight"].astype(float)))
+        capped[rd] = apply_weight_cap(raw_w, cap)
+
+    # Load daily returns for every ISIN ever in these snapshots (one query, ~500 × 1250 rows)
+    all_isins = sorted({isin for w in capped.values() for isin in w})
+    start_str = rebal_dates[0].strftime("%Y-%m-%d")
+    end_str   = date.today().strftime("%Y-%m-%d")
+    ph = ",".join("?" * len(all_isins))
+    ret_df = pd.read_sql(
+        f"SELECT isin, date, total_return FROM returns "
+        f"WHERE isin IN ({ph}) AND date > ? AND date <= ? "
+        f"AND total_return IS NOT NULL ORDER BY date",
+        conn, params=all_isins + [start_str, end_str],
+    )
+    if ret_df.empty:
+        log.error("No returns data found for base index ISINs")
+        return 0
+
+    ret_df["date"] = pd.to_datetime(ret_df["date"])
+    ret_pivot = ret_df.pivot(index="date", columns="isin", values="total_return").fillna(0.0)
+
+    # Walk forward period by period, computing daily portfolio returns
+    rows: list[tuple] = []
+    running_close = 100.0
+
+    for i in range(len(rebal_dates) - 1):
+        rd_start = rebal_dates[i]
+        rd_end   = rebal_dates[i + 1]
+        weights  = capped.get(rd_start)
+        if not weights:
+            continue
+
+        # Trading days strictly after rd_start (weights set at close) up to rd_end inclusive
+        mask = (ret_pivot.index > rd_start) & (ret_pivot.index <= rd_end)
+        period_ret = ret_pivot.loc[mask]
+        if period_ret.empty:
+            continue
+
+        # Intersect with columns that have return data; renormalise for gaps
+        common = [k for k in weights if k in period_ret.columns]
+        if not common:
+            continue
+        w = pd.Series({k: weights[k] for k in common})
+        w /= w.sum()
+
+        daily_r = (period_ret[common] @ w).values
+        for day, r in zip(period_ret.index, daily_r):
+            running_close *= (1 + float(r))
+            rows.append((
+                index_name,
+                day.strftime("%Y-%m-%d"),
+                round(running_close, 6),
+                round(float(r), 8),
+                "synthetic",
+            ))
+
+    if not rows:
+        log.warning("No rows generated for synthetic series '%s'", index_name)
+        return 0
+
+    # Delete previous synthetic rows and insert fresh (safe to re-run;
+    # INSERT OR IGNORE skips any 'yahoo' rows already stored for the same dates)
+    conn.execute(
+        "DELETE FROM benchmark_returns WHERE index_name=? AND source='synthetic'",
+        [index_name],
+    )
+    conn.executemany(
+        "INSERT OR IGNORE INTO benchmark_returns "
+        "(index_name, date, close, total_return, source) VALUES (?, ?, ?, ?, ?)",
+        rows,
+    )
+    conn.commit()
+    log.info(
+        "Synthetic series '%s': %d daily rows across %d rebal periods (cap=%.0f%%)",
+        index_name, len(rows), len(rebal_dates) - 1, cap * 100,
+    )
+    return len(rows)
+
+
+# ---------------------------------------------------------------------------
 # Index / benchmark returns + dividends (unified)
 # ---------------------------------------------------------------------------
 
@@ -411,6 +572,17 @@ def update_index_returns(
                         else None
                     )
                 price_rows.append((index_name, d, float(c) if c else None, tr))
+
+            # Clear any synthetic rows for dates we are about to cover with real
+            # Yahoo data. This fires when an ETF transitions from synthetic to live
+            # (e.g. TOPC once Yahoo Finance starts carrying it). No-op otherwise.
+            real_dates = [r[1] for r in price_rows]
+            ph_d = ",".join("?" * len(real_dates))
+            conn.execute(
+                f"DELETE FROM benchmark_returns "
+                f"WHERE index_name=? AND source='synthetic' AND date IN ({ph_d})",
+                [index_name] + real_dates,
+            )
 
             conn.executemany(
                 "INSERT OR IGNORE INTO benchmark_returns "
@@ -983,13 +1155,23 @@ def main():
     parser.add_argument("--backfill-splits", action="store_true",
                         help="Populate the splits table with full split history for all "
                              "live names (one-time / periodic; --update catches new splits)")
+    parser.add_argument("--index-returns", action="store_true",
+                        help="Refresh benchmark_returns for every index_registry entry only "
+                             "(skips the full equity universe Yahoo pull; new indices backfill "
+                             "from ETF_HISTORY_START)")
+    parser.add_argument("--backfill-capped-benchmark", metavar="INDEX_NAME",
+                        help="Build (or rebuild) a synthetic daily benchmark_returns series "
+                             "for INDEX_NAME by capping the sp500 base index at 3%% per name. "
+                             "Example: --backfill-capped-benchmark sp500_3pct_capped. "
+                             "Safe to re-run; replaces synthetic rows, never touches yahoo rows.")
     parser.add_argument("--history-start", default=HISTORY_START,
                         help=f"Start date for tickers with no existing data (default {HISTORY_START})")
     parser.add_argument("--ticker", action="append", default=[],
                         help="Limit --update to one ticker. Repeat for multiple.")
     args = parser.parse_args()
 
-    if not any([args.update, args.check, args.backfill_delisted, args.backfill_splits]):
+    if not any([args.update, args.check, args.backfill_delisted, args.backfill_splits,
+                args.index_returns, args.backfill_capped_benchmark]):
         parser.print_help()
         return
 
@@ -1012,6 +1194,15 @@ def main():
 
         if args.backfill_splits:
             backfill_splits(conn, history_start=args.history_start)
+
+        if args.index_returns and not args.update:
+            log.info("Refreshing index returns (index_registry only) ...")
+            update_index_returns(conn)
+
+        if args.backfill_capped_benchmark:
+            log.info("Building synthetic capped benchmark: %s ...", args.backfill_capped_benchmark)
+            n = _build_synthetic_capped_series(conn, args.backfill_capped_benchmark)
+            log.info("Inserted %d synthetic rows for '%s'", n, args.backfill_capped_benchmark)
 
         if args.check or args.update:
             run_checks(conn)
