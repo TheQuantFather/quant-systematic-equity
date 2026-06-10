@@ -7,6 +7,7 @@ Tab 2 — Optimised Backtest: CVXPY walk-forward with quarterly rebalancing,
          and per-trade EUR transaction costs.
 """
 
+import io
 import sys
 from pathlib import Path
 
@@ -112,42 +113,38 @@ def active_metrics(ret: pd.Series, bench: pd.Series, turnover_pct: float | None)
 
 def _cum_return_chart(
     traces: list[dict],
-    title: str = "Cumulative return (base = 1.0)",
+    title: str = "Cumulative return (%)",
     height: int = 420,
     cumulative_excess_series: pd.Series | None = None,
 ) -> go.Figure:
     """
-    Build a cumulative-return line chart.
+    Build a cumulative-return line chart. Every line is a cumulative total
+    return in %, starting at 0 — i.e. ((1 + r).cumprod() − 1) × 100.
     Each trace dict: {series (raw returns), name, color, width=2, dash="solid"}.
-    Optional cumulative_excess_series is portfolio cumulative value minus
-    benchmark cumulative value, plotted on a secondary Y-axis.
+    Optional cumulative_excess_series is cumulative portfolio return minus
+    cumulative benchmark return (a fraction); it is the gap between those two
+    lines and is plotted as % on the SAME axis.
     """
     fig = go.Figure()
     for t in traces:
-        cum = (1 + t["series"]).cumprod()
+        cum = ((1 + t["series"]).cumprod() - 1) * 100
         fig.add_trace(go.Scatter(
             x=cum.index, y=cum.values, name=t["name"],
             line=dict(color=t["color"], width=t.get("width", 2), dash=t.get("dash", "solid")),
         ))
-    layout_kwargs: dict = dict(
-        title=title, height=height, yaxis_title="Portfolio value",
-        hovermode="x unified", legend=dict(orientation="h", y=-0.15),
-        margin=dict(l=0, r=0, t=40, b=10),
-    )
     if cumulative_excess_series is not None and not cumulative_excess_series.empty:
         fig.add_trace(go.Scatter(
             x=cumulative_excess_series.index, y=cumulative_excess_series.values * 100,
             name="Cumulative excess return",
-            yaxis="y2",
             line=dict(color="#16A34A", width=1.5, dash="dot"),
         ))
-        layout_kwargs["yaxis2"] = dict(
-            title="Excess return (%)",
-            overlaying="y", side="right",
-            tickformat=".1f", showgrid=False,
-            zeroline=True, zerolinecolor="#E2E8F0", zerolinewidth=1,
-        )
-    fig.update_layout(**layout_kwargs)
+    fig.add_hline(y=0, line_dash="dot", line_color="#94A3B8", line_width=1)
+    fig.update_layout(
+        title=title, height=height,
+        yaxis=dict(title="Cumulative return (%)", ticksuffix="%"),
+        hovermode="x unified", legend=dict(orientation="h", y=-0.15),
+        margin=dict(l=0, r=0, t=40, b=10),
+    )
     return fig
 
 
@@ -175,6 +172,139 @@ def _drawdown_chart(
         title="Drawdown", height=height,
         yaxis_tickformat=".0%", hovermode="x unified",
         legend=dict(orientation="h", y=-0.3),
+        margin=dict(l=0, r=0, t=40, b=10),
+    )
+    return fig
+
+
+def _rolling_risk_chart(
+    port: pd.Series,
+    bench: pd.Series,
+    window: int = 63,
+    height: int = 320,
+) -> go.Figure | None:
+    """
+    Rolling annualised risk metrics for a portfolio vs its benchmark.
+
+      • Tracking error  = std(port − bench) · √252   (left %, blue)
+      • Absolute risk   = std(port)        · √252   (left %, slate)
+      • Beta            = cov(port, bench) / var(bench)  (right axis, amber)
+
+    Tracking error and absolute risk are both annualised % and share the left
+    axis so their magnitudes are directly comparable. Beta is unitless (~1) and
+    sits on a secondary right axis, so the level differences don't crush the
+    % series — all three are readable on one chart.
+    """
+    common = port.index.intersection(bench.index)
+    p = port.loc[common]
+    b = bench.loc[common]
+    if len(p) < window + 5:
+        return None
+
+    ann       = np.sqrt(252)
+    active    = p - b
+    roll_te   = (active.rolling(window).std() * ann * 100).dropna()
+    roll_vol  = (p.rolling(window).std() * ann * 100).dropna()
+    roll_var  = b.rolling(window).var()
+    roll_beta = (p.rolling(window).cov(b) / roll_var).where(roll_var > 0).dropna()
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=roll_vol.index, y=roll_vol.values, name="Absolute risk (vol)",
+        line=dict(color="#94A3B8", width=1.5),
+    ))
+    fig.add_trace(go.Scatter(
+        x=roll_te.index, y=roll_te.values, name="Tracking error",
+        line=dict(color="#2563EB", width=2),
+    ))
+    fig.add_trace(go.Scatter(
+        x=roll_beta.index, y=roll_beta.values, name="Beta (vs benchmark)",
+        yaxis="y2", line=dict(color="#F59E0B", width=2, dash="dot"),
+    ))
+    fig.add_shape(
+        type="line", xref="paper", x0=0, x1=1, yref="y2", y0=1, y1=1,
+        line=dict(color="#F59E0B", width=1, dash="dot"),
+    )
+    fig.update_layout(
+        title=f"Rolling risk ({window}-day, annualised)", height=height,
+        hovermode="x unified",
+        yaxis=dict(title="Risk (% annualised)", ticksuffix="%", rangemode="tozero"),
+        yaxis2=dict(title="Beta", overlaying="y", side="right",
+                    showgrid=False, zeroline=False),
+        legend=dict(orientation="h", y=-0.2),
+        margin=dict(l=0, r=0, t=40, b=10),
+    )
+    return fig
+
+
+_FACTOR_PALETTE = [
+    "#2563EB", "#DC2626", "#16A34A", "#F59E0B", "#7C3AED", "#0891B2",
+    "#DB2777", "#65A30D", "#EA580C", "#0D9488", "#4F46E5", "#9333EA",
+]
+
+
+def _factor_exposure_chart(
+    period_log: list[dict],
+    active: bool,
+    height: int = 400,
+) -> go.Figure | None:
+    """
+    Portfolio Barra style/beta factor exposures across rebalance periods.
+
+      active=True  → portfolio − benchmark exposure (centred on 0)
+      active=False → absolute portfolio exposure
+
+    Exposures are in standardised Barra units, so a single shared Y-axis keeps
+    every factor directly comparable. Sector and market factors are excluded —
+    sector tilts are covered by the "Sector weights over time" chart.
+
+    Reuses db.load_barra_components / weighted_factor_exposures so the exposure
+    maths matches the optimiser and Risk Explorer exactly.
+    """
+    records: dict[str, dict] = {}
+    style_order: list[str] = []
+    for p in period_log:
+        bdate = p.get("barra_date")
+        if not bdate:
+            continue
+        comps = db.load_barra_components(bdate)
+        if comps is None:
+            continue
+        _F, fnames, X_df, _delta = comps
+        styles = db.barra_style_factor_names(fnames)
+        if not style_order:
+            style_order = styles
+        port = db.weighted_factor_exposures(X_df, p["weights"])
+        if active:
+            bm = p.get("bm_weights") or {}
+            if not bm:
+                continue
+            exp = port - db.weighted_factor_exposures(X_df, bm)
+        else:
+            exp = port
+        records[p["snap_date"][:10]] = {f: float(exp.get(f, 0.0)) for f in styles}
+
+    if not records:
+        return None
+    df = pd.DataFrame.from_dict(records, orient="index").reindex(columns=style_order)
+    df.index = pd.to_datetime(df.index)
+    df = df.sort_index()
+
+    fig = go.Figure()
+    for j, f in enumerate(style_order):
+        fig.add_trace(go.Scatter(
+            x=df.index, y=df[f].values, name=db.barra_factor_label(f),
+            mode="lines+markers",
+            line=dict(color=_FACTOR_PALETTE[j % len(_FACTOR_PALETTE)], width=1.8),
+            marker=dict(size=4),
+        ))
+    if active:
+        fig.add_hline(y=0, line_dash="dot", line_color="#64748B", line_width=1)
+    fig.update_layout(
+        title=f"{'Active' if active else 'Absolute'} factor exposure over time",
+        height=height, hovermode="x unified",
+        yaxis_title="Exposure (Barra std. units)",
+        legend=dict(orientation="h", y=-0.25),
         margin=dict(l=0, r=0, t=40, b=10),
     )
     return fig
@@ -400,6 +530,7 @@ def _find_nearest_before(target: str, dates: list[str]) -> str | None:
     return max(candidates) if candidates else None
 
 
+@st.cache_data(show_spinner=False, max_entries=8)
 def _run_optimised_backtest(
     strategy_id: str,
     portfolio_eur: float,
@@ -415,6 +546,10 @@ def _run_optimised_backtest(
     """
     Walk-forward optimised backtest. Starts from the first date where a Barra risk model
     snapshot is available, so all periods use a consistent risk model.
+
+    Cached on the full parameter set (@st.cache_data): an identical configuration
+    returns instantly on re-run instead of recomputing the walk-forward. The cache
+    is invalidated automatically when any argument changes.
 
     Returns a results dict or {"error": str} on failure.
     """
@@ -619,8 +754,13 @@ def _run_optimised_backtest(
         period = ret_matrix.loc[(ret_matrix.index >= t_start) & (ret_matrix.index < t_end)]
         avail  = [isin for isin in new_weights if isin in period.columns]
         if avail:
-            w_arr        = np.array([new_weights[isin] for isin in avail])
-            w_arr       /= w_arr.sum()
+            w_arr = np.array([new_weights[isin] for isin in avail])
+            # Scale to the invested fraction: names without return data are
+            # redistributed pro-rata (as before), but a deliberate cash buffer
+            # (weights summing below 1 under max_cash_weight) is preserved and
+            # earns 0% for the period.
+            invested = min(1.0, sum(new_weights.values()))
+            w_arr   *= invested / w_arr.sum()
             port_returns = pd.Series(
                 period[avail].fillna(0.0).values @ w_arr, index=period.index
             )
@@ -662,6 +802,8 @@ def _run_optimised_backtest(
             "benchmark_name":        benchmark_name,
             "benchmark_snapshot":    bm_snap if bm_snap is not None else uni_snap,
             "weights":              new_weights,
+            "bm_weights":           dict(bm_weights),
+            "barra_date":           barra_date,
             "n_trades":             n_trades,
             "tc_pct":               tc_pct,
             "turnover":             actual_to,
@@ -695,6 +837,138 @@ def _run_optimised_backtest(
         "ticker_map":    ticker_map,
         "name_map":      name_map,
     }
+
+
+# ---------------------------------------------------------------------------
+# Optimised backtest — export
+# ---------------------------------------------------------------------------
+
+def _build_backtest_workbook(
+    result: dict,
+    bench_series: pd.Series,
+    bench_label: str,
+    portfolio_eur: float,
+) -> bytes:
+    """
+    Assemble an optimised-backtest result into a multi-sheet Excel workbook
+    (in memory) for offline analysis. Sheets:
+
+      summary           — run parameters + date range
+      daily_returns     — portfolio vs benchmark daily & cumulative returns (%)
+      periods           — per-rebalance turnover, costs and optimiser metrics
+      holdings          — every position held at each rebalance
+      factor_exposures  — Barra style/beta exposure (active + absolute) per rebalance
+
+    The factor-exposure maths reuses db.* so the export matches the on-screen
+    charts exactly.
+    """
+    port_series  = result["port_series"]
+    period_log   = result["period_log"]
+    ticker_map   = result["ticker_map"]
+    name_map     = result["name_map"]
+    sector_map   = result["sector_map"]
+    industry_map = result["industry_map"]
+
+    bench  = bench_series.reindex(port_series.index).fillna(0.0)
+    active = port_series - bench
+    cum_port  = ((1 + port_series).cumprod() - 1) * 100
+    cum_bench = ((1 + bench).cumprod() - 1) * 100
+    daily_df = pd.DataFrame({
+        "date":              port_series.index,
+        "portfolio_return":  port_series.values,
+        "benchmark_return":  bench.values,
+        "active_return":     active.values,
+        "cum_portfolio_pct": cum_port.values,
+        "cum_benchmark_pct": cum_bench.values,
+        "cum_excess_pct":    (cum_port - cum_bench).values,
+    })
+
+    period_rows = []
+    for p in period_log:
+        m = p.get("metrics", {}) or {}
+        period_rows.append({
+            "snap_date":         p["snap_date"][:10],
+            "next_snap":         p.get("next_snap", ""),
+            "turnover_2way_pct": round(p["turnover"] * 100, 2),
+            "n_positions":       p["n_positions"],
+            "n_trades":          p["n_trades"],
+            "tc_eur":            round(p["tc_pct"] * portfolio_eur, 2),
+            "expected_alpha":    m.get("expected_alpha"),
+            "portfolio_vol":     m.get("portfolio_vol"),
+            "active_risk":       m.get("active_risk"),
+            "sharpe_ratio":      m.get("sharpe_ratio"),
+            "info_ratio":        m.get("info_ratio"),
+            "used_barra":        p["used_barra"],
+            "turnover_relaxed":  p.get("turnover_relaxed", False),
+            "alpha_date":        p.get("alpha_date", ""),
+            "barra_date":        p.get("barra_date", ""),
+        })
+    periods_df = pd.DataFrame(period_rows)
+
+    holding_rows = []
+    for p in period_log:
+        snap = p["snap_date"][:10]
+        for isin, w in sorted(p["weights"].items(), key=lambda x: -x[1]):
+            holding_rows.append({
+                "snap_date": snap,
+                "isin":      isin,
+                "ticker":    ticker_map.get(isin, isin),
+                "company":   name_map.get(isin, ""),
+                "sector":    sector_map.get(isin, "Unknown"),
+                "industry":  industry_map.get(isin, ""),
+                "weight":    round(w, 6),
+                "value_eur": round(w * portfolio_eur, 2),
+            })
+    holdings_df = pd.DataFrame(holding_rows)
+
+    exp_rows = []
+    for p in period_log:
+        bdate = p.get("barra_date")
+        bm    = p.get("bm_weights") or {}
+        if not bdate:
+            continue
+        comps = db.load_barra_components(bdate)
+        if comps is None:
+            continue
+        _F, fnames, X_df, _delta = comps
+        port_exp = db.weighted_factor_exposures(X_df, p["weights"])
+        bench_exp = db.weighted_factor_exposures(X_df, bm) if bm else None
+        for f in db.barra_style_factor_names(fnames):
+            exp_rows.append({
+                "snap_date":         p["snap_date"][:10],
+                "factor":            db.barra_factor_label(f),
+                "absolute_exposure": round(float(port_exp.get(f, 0.0)), 4),
+                "active_exposure": (
+                    round(float(port_exp.get(f, 0.0) - bench_exp.get(f, 0.0)), 4)
+                    if bench_exp is not None else None
+                ),
+            })
+    exposures_df = pd.DataFrame(exp_rows)
+
+    summary_df = pd.DataFrame(
+        [
+            ("Strategy",             result.get("strategy_name", "")),
+            ("Objective",            result.get("objective", "")),
+            ("Universe",             result.get("universe_name", "")),
+            ("Benchmark",            result.get("benchmark_name", bench_label)),
+            ("Rebalancing",          result.get("rebal_freq", "")),
+            ("Periods",              len(period_log)),
+            ("Portfolio size (EUR)", portfolio_eur),
+            ("Start",                str(port_series.index.min().date())),
+            ("End",                  str(port_series.index.max().date())),
+        ],
+        columns=["metric", "value"],
+    )
+
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as xl:
+        summary_df.to_excel(xl, sheet_name="summary", index=False)
+        daily_df.to_excel(xl, sheet_name="daily_returns", index=False)
+        periods_df.to_excel(xl, sheet_name="periods", index=False)
+        holdings_df.to_excel(xl, sheet_name="holdings", index=False)
+        if not exposures_df.empty:
+            exposures_df.to_excel(xl, sheet_name="factor_exposures", index=False)
+    return buf.getvalue()
 
 
 # ---------------------------------------------------------------------------
@@ -1185,20 +1459,61 @@ with tab2:
             "**max_positions / min_position_if_held not applied** — switch solver to MOSEK to enforce cardinality constraints."
         )
 
+    # ── Download — full result as a multi-sheet workbook for offline analysis ──
+    # Built once per result and cached in session_state (keyed on result_key) so
+    # the workbook isn't re-assembled on every widget interaction / rerun.
+    export_key = f"{result_key}__xlsx"
+    if export_key not in st.session_state:
+        st.session_state[export_key] = _build_backtest_workbook(
+            result, bench_series, bench_label, portfolio_eur
+        )
+    st.download_button(
+        "⬇ Download backtest data (Excel)",
+        data=st.session_state[export_key],
+        file_name=f"backtest_{sel_strat_id}_{sel_universe}_{rebal_freq}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="opt_bt_download",
+        help="Summary, daily returns, per-period metrics, holdings and factor exposures.",
+    )
+
     st.divider()
 
     # ── Result tabs ───────────────────────────────────────────────────────────
     pt1, pt2, pt3 = st.tabs(["Performance", "Analysis", "Holdings"])
 
     with pt1:
-        port_cum = (1 + port_series).cumprod()
-        bench_cum = (1 + bench_series.reindex(port_series.index, fill_value=0.0)).cumprod()
-        cumulative_excess_series = port_cum.subtract(bench_cum, fill_value=0.0)
-        st.plotly_chart(_cum_return_chart([
-            {"series": port_series,  "name": result["strategy_name"], "color": "#2563EB"},
-            {"series": bench_series, "name": bench_label, "color": "#94A3B8",
-             "width": 1.5, "dash": "dot"},
-        ], cumulative_excess_series=cumulative_excess_series), use_container_width=True)
+        # Cumulative excess return = cumulative portfolio return − cumulative
+        # benchmark return. Both start at 0, so the excess starts at 0.
+        bench_aligned = bench_series.reindex(port_series.index, fill_value=0.0)
+        port_cum  = (1 + port_series).cumprod()
+        bench_cum = (1 + bench_aligned).cumprod()
+        cumulative_excess_series = (port_cum - 1) - (bench_cum - 1)
+
+        # Always show both major US large-cap indices for context; add the
+        # selected benchmark separately only when it is neither of them (so the
+        # excess line's reference is always visible on the chart).
+        perf_traces = [{"series": port_series, "name": result["strategy_name"], "color": "#2563EB"}]
+        ref_benches = [("sp500", "S&P 500", "#94A3B8"), ("russell_1000", "Russell 1000", "#F59E0B"),
+                       ("sp500_equal_weight", "S&P 500 Equal Weight", "#10B981")]
+        for ref_name, ref_label, ref_color in ref_benches:
+            ref_s = db.get_benchmark_returns(ref_name)
+            if ref_s.empty:
+                continue
+            perf_traces.append({
+                "series": ref_s.reindex(port_series.index).fillna(0.0),
+                "name": ref_label, "color": ref_color, "width": 1.5, "dash": "dot",
+            })
+        if sel_bench not in {r[0] for r in ref_benches}:
+            perf_traces.append({
+                "series": bench_series, "name": bench_label, "color": "#7C3AED",
+                "width": 1.5, "dash": "dash",
+            })
+
+        st.plotly_chart(
+            _cum_return_chart(perf_traces, cumulative_excess_series=cumulative_excess_series),
+            use_container_width=True,
+        )
+        st.caption(f"Cumulative excess return is the strategy minus the selected benchmark (**{bench_label}**).")
 
         st.plotly_chart(_drawdown_chart([
             {"series": port_series,  "name": result["strategy_name"], "color": "#2563EB",
@@ -1206,6 +1521,19 @@ with tab2:
             {"series": bench_series, "name": bench_label, "color": "#94A3B8",
              "width": 1, "dash": "dot"},
         ]), use_container_width=True)
+
+        st.divider()
+        st.subheader("Rolling risk")
+        st.caption(
+            "Tracking error and absolute risk are both annualised % on the left "
+            "axis (directly comparable); beta (~1) is on the right axis. "
+            "63-day rolling window."
+        )
+        fig_rr = _rolling_risk_chart(port_series, bench_series, window=63)
+        if fig_rr is not None:
+            st.plotly_chart(fig_rr, use_container_width=True)
+        else:
+            st.info("Not enough history for rolling risk metrics (need > 68 daily observations).")
 
         st.divider()
         mc1, mc2 = st.columns(2)
@@ -1310,6 +1638,29 @@ with tab2:
                                  legend=dict(orientation="h", y=-0.3),
                                  margin=dict(l=0, r=0, t=10, b=10))
             st.plotly_chart(fig_sw, use_container_width=True)
+
+        st.divider()
+        fe_h1, fe_h2 = st.columns([3, 1])
+        with fe_h1:
+            st.subheader("Factor exposure over time")
+        with fe_h2:
+            fe_view = st.segmented_control(
+                "Exposure view", ["Active", "Absolute"], default="Active", key="opt_bt_fe_view"
+            )
+        st.caption(
+            "Portfolio Barra style & beta exposures at each rebalance. "
+            "**Active** = portfolio − benchmark (tilts vs the benchmark); "
+            "**Absolute** = portfolio level. Standardised units → all factors comparable on one axis. "
+            "Sector tilts are shown above."
+        )
+        fig_fe = _factor_exposure_chart(period_log, active=(fe_view != "Absolute"))
+        if fig_fe is not None:
+            st.plotly_chart(fig_fe, use_container_width=True)
+        elif fe_view == "Active":
+            st.info("Active factor exposure needs Barra snapshots and benchmark weights "
+                    "(maximize_alpha strategies). Try the Absolute view.")
+        else:
+            st.info("Factor exposure requires Barra snapshots for the backtest periods.")
 
     with pt3:
         st.subheader("Holdings snapshot")

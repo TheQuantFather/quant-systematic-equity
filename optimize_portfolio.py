@@ -829,12 +829,23 @@ def _optimize_alpha(strategy, investable, alpha, b, Sigma, L,
     c = strategy["constraints"]
     N = len(investable)
     prices, portfolio_value = _lot_size_inputs(investable, c)
-    cash_buffer = float(c.get("max_cash_weight", 0.002)) if portfolio_value is not None else None
+    # Cash buffer: an explicit max_cash_weight allows the optimizer to hold cash
+    # (weights sum in [1 - buffer, 1]) so a binding max_portfolio_vol can de-risk
+    # by scaling down instead of distorting the alpha portfolio toward low-vol
+    # names. Cash has zero alpha, so it is only used when a risk cap binds.
+    # Whole-share sizing keeps its small rounding slack when no cap is set.
+    max_cash = c.get("max_cash_weight", None)
+    if max_cash is not None:
+        cash_buffer = float(max_cash)
+    elif portfolio_value is not None:
+        cash_buffer = 0.002
+    else:
+        cash_buffer = None
 
     w  = cp.Variable(N, name="weights")
     aw = w - b
 
-    if portfolio_value is not None:
+    if cash_buffer is not None:
         cvx = [cp.sum(w) <= 1.0, cp.sum(w) >= 1.0 - cash_buffer, w >= 0]
     else:
         cvx = [cp.sum(w) == 1.0, w >= 0]
@@ -892,6 +903,13 @@ def _optimize_alpha(strategy, investable, alpha, b, Sigma, L,
     if max_ar is not None:
         cvx.append(cp.norm(Lt_aw, 2) <= float(max_ar))
 
+    # Absolute portfolio vol cap (annualised, same L as active risk). With a
+    # cash buffer enabled this de-risks by scaling into cash; without one it
+    # can only rotate the composition toward lower-vol names.
+    max_vol = c.get("max_portfolio_vol", None)
+    if max_vol is not None:
+        cvx.append(cp.norm(L.T @ w, 2) <= float(max_vol))
+
     max_secaw = c.get("max_sector_active_weight", None)
     if max_secaw is not None:
         for s in range(len(sectors)):
@@ -933,7 +951,7 @@ def _optimize_alpha(strategy, investable, alpha, b, Sigma, L,
     weights = np.array(w.value).clip(0)
     if z is not None:
         weights *= (np.array(z.value) > 0.5).astype(float)
-    if portfolio_value is None:
+    if portfolio_value is None and cash_buffer is None:
         weights /= weights.sum()
 
     act         = weights - b
@@ -1139,9 +1157,9 @@ def _optimize_min_variance(strategy, investable, b, Sigma, L,
 
 _MOSEK_PARAMS = {
     "MSK_IPAR_NUM_THREADS":             4,
-    "MSK_DPAR_INTPNT_CO_TOL_PFEAS":     1e-8,
-    "MSK_DPAR_INTPNT_CO_TOL_DFEAS":     1e-8,
-    "MSK_DPAR_INTPNT_CO_TOL_REL_GAP":   1e-8,
+    "MSK_DPAR_INTPNT_CO_TOL_PFEAS":     1e-6,
+    "MSK_DPAR_INTPNT_CO_TOL_DFEAS":     1e-6,
+    "MSK_DPAR_INTPNT_CO_TOL_REL_GAP":   1e-6,
 }
 
 # Extra params applied only when the problem contains integer variables.
@@ -1281,9 +1299,11 @@ def optimize_for_backtest(
 
         # Integer constraints (max_positions, min_position_if_held) require a MIP-capable
         # solver (MOSEK). Strip them when CLARABEL is selected; pass through for MOSEK.
+        # max_cash_weight is NOT stripped here: it is a continuous constraint
+        # (cash buffer for the vol cap), not an integer/lot-sizing one.
         _INTEGER_CONSTRAINT_KEYS = (
             "max_positions", "min_positions", "min_position_if_held",
-            "portfolio_value_usd", "max_cash_weight", "lot_size_max_overweight",
+            "portfolio_value_usd", "lot_size_max_overweight",
         )
         has_integer = any(constraints.get(k) is not None for k in _INTEGER_CONSTRAINT_KEYS)
         if solver.upper() != "MOSEK" and has_integer:

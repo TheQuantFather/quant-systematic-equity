@@ -417,6 +417,101 @@ def get_risk_metadata() -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# Barra factor model — shared loaders / exposure maths (reused by the
+# Portfolio Optimiser, Risk Explorer and Backtester pages)
+# ---------------------------------------------------------------------------
+
+@st.cache_data(ttl=300)
+def load_barra_components(barra_date: str) -> tuple | None:
+    """
+    Load Barra factor-model components from risk.db for a snapshot date.
+
+    Returns (F, fnames, X_df, delta_s) or None when the date is missing:
+      F       : K×K factor covariance matrix (annualised)
+      fnames  : factor names in canonical [market | sectors | styles | beta]
+                order (the columns of X_df / rows·cols of F)
+      X_df    : factor exposure matrix indexed by security_id (isin),
+                columns = fnames, missing exposures filled with 0.0
+      delta_s : Series[security_id → idiosyncratic variance]
+    """
+    try:
+        with get_db(RISK_DB) as conn:
+            row = conn.execute(
+                "SELECT factor_names, cov_blob FROM factor_covariance WHERE snapshot_date=?",
+                (barra_date,),
+            ).fetchone()
+            if row is None:
+                return None
+            fnames = json.loads(row[0])
+            K      = len(fnames)
+            F      = np.frombuffer(zlib.decompress(row[1]), dtype=np.float32).reshape(K, K).astype(np.float64)
+            x_rows = conn.execute(
+                "SELECT security_id, factor_id, exposure FROM factor_exposures WHERE snapshot_date=?",
+                (barra_date,),
+            ).fetchall()
+            d_rows = conn.execute(
+                "SELECT security_id, idio_var FROM idiosyncratic_vars WHERE snapshot_date=?",
+                (barra_date,),
+            ).fetchall()
+    except Exception:
+        return None
+    x_data: dict = {}
+    for sec_id, fac_id, exp in x_rows:
+        x_data.setdefault(sec_id, {})[fac_id] = float(exp)
+    X_df = (
+        pd.DataFrame.from_dict(x_data, orient="index")
+        .reindex(columns=fnames, fill_value=0.0)
+        .fillna(0.0)
+    )
+    delta_s = pd.Series({r[0]: float(r[1]) for r in d_rows})
+    return F, fnames, X_df, delta_s
+
+
+def weighted_factor_exposures(X_df: pd.DataFrame, weights: dict[str, float]) -> pd.Series:
+    """
+    Portfolio factor exposures = Σ_i wᵢ·Xᵢ for a {security_id → weight} dict.
+    Weights are renormalised to sum to 1 (so partial coverage of the universe
+    still yields a properly scaled exposure). Returns Series[factor_name → exposure].
+    """
+    if not weights or X_df.empty:
+        return pd.Series(0.0, index=X_df.columns)
+    w = pd.Series(weights, dtype=float).reindex(X_df.index).fillna(0.0)
+    total = w.sum()
+    if total > 1e-12:
+        w = w / total
+    return X_df.mul(w, axis=0).sum()
+
+
+def barra_factor_label(fname: str) -> str:
+    """
+    Human-readable label for a Barra factor name as stored in risk.db.
+      'market'                     → 'Market'
+      'sec_information_technology' → 'Information Technology'
+      'beta_60d'                   → 'Beta (60d)'
+      model id (e.g. 'MOM001')     → model display name via models_reference
+      anything else                → title-cased fallback
+    """
+    if fname == "market":
+        return "Market"
+    if fname.startswith("sec_"):
+        return fname[4:].replace("_", " ").title()
+    if fname.startswith("beta"):
+        suffix = fname.replace("beta_", "").replace("beta", "")
+        return f"Beta ({suffix})" if suffix else "Beta"
+    model_names = get_model_metadata().set_index("ModelID")["Model"].to_dict()
+    return model_names.get(fname, fname.replace("_", " ").title())
+
+
+def barra_style_factor_names(fnames: list[str]) -> list[str]:
+    """
+    The style/beta block of `fnames` — everything except the market intercept
+    and the GICS sector dummies (those are better shown as sector weights).
+    Preserves the canonical ordering in `fnames`.
+    """
+    return [f for f in fnames if f != "market" and not f.startswith("sec_")]
+
+
+# ---------------------------------------------------------------------------
 # Benchmark returns
 # ---------------------------------------------------------------------------
 
@@ -478,10 +573,7 @@ def get_universe_isins_at_date(index_name: str, snapshot_date: str) -> list[str]
 
 @st.cache_data
 def get_universe_weights_at_date(index_name: str, snapshot_date: str) -> dict[str, float]:
-    """
-    Return {isin: weight} for any tracked index at snapshot_date, normalised to sum=1.
-    Weights come from universe_snapshots.weight (iShares N-PORT-P % weights).
-    """
+    """Return {isin: weight} for any tracked index at snapshot_date, normalised to sum=1."""
     with get_db(UNIVERSE_DB) as conn:
         rows = conn.execute(
             "SELECT isin, weight FROM universe_snapshots "

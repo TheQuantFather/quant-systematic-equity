@@ -16,6 +16,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
+import db
 from config import (
     OUTPUT_DIR, PARAMS_FILE, MODELS_DB, RISK_DB,
     UNIVERSE_DB as UNIV_DB, BENCHMARK_DIR,
@@ -237,45 +238,6 @@ def load_risk_contributions_barra(barra_date: str, isins: tuple,
         "vol_contribution": vol_contrib * 100,
         "sigma_p":          sigma_p,
     })
-
-
-@st.cache_data(ttl=300)
-def load_barra_components(barra_date: str) -> tuple | None:
-    """
-    Return (F, fnames, X_df, delta_s) from risk.db (Barra tables) for a snapshot date.
-    Shared across portfolio risk and active risk attribution.
-    """
-    try:
-        with get_db(RISK_DB) as conn:
-            row = conn.execute(
-                "SELECT factor_names, cov_blob FROM factor_covariance WHERE snapshot_date=?",
-                (barra_date,),
-            ).fetchone()
-            if row is None:
-                return None
-            fnames = json.loads(row[0])
-            K      = len(fnames)
-            F      = np.frombuffer(zlib.decompress(row[1]), dtype=np.float32).reshape(K, K).astype(np.float64)
-            x_rows = conn.execute(
-                "SELECT security_id, factor_id, exposure FROM factor_exposures WHERE snapshot_date=?",
-                (barra_date,),
-            ).fetchall()
-            d_rows = conn.execute(
-                "SELECT security_id, idio_var FROM idiosyncratic_vars WHERE snapshot_date=?",
-                (barra_date,),
-            ).fetchall()
-    except Exception:
-        return None
-    x_data: dict = {}
-    for sec_id, fac_id, exp in x_rows:
-        x_data.setdefault(sec_id, {})[fac_id] = float(exp)
-    X_df = (
-        pd.DataFrame.from_dict(x_data, orient="index")
-        .reindex(columns=fnames, fill_value=0.0)
-        .fillna(0.0)
-    )
-    delta_s = pd.Series({r[0]: float(r[1]) for r in d_rows})
-    return F, fnames, X_df, delta_s
 
 
 @st.cache_data(ttl=300)
@@ -717,7 +679,7 @@ with tab4:
 
     # Load risk components once — reused for both portfolio and active attribution
     if barra_date:
-        barra_comps = load_barra_components(barra_date)
+        barra_comps = db.load_barra_components(barra_date)
         lw_raw      = None
         risk_model_label = f"Barra ({barra_date})"
     else:

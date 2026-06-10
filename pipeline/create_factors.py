@@ -38,6 +38,7 @@ from config import (
 from utils import (
     classify_sector, get_db, get_logger, winsorized_zscore,
     get_snapshot_schedule, mark_snapshot_computed,
+    ALLOWED_FACTOR_SECTORS as _ALLOWED_FACTOR_SECTORS,
 )
 
 log = get_logger("create_factors")
@@ -435,62 +436,107 @@ def load_constituent_data() -> dict:
     if annual_direct:
         log.info("[annual-only] assigned %s FY Flow values to Q4 for annual-only filers", f"{annual_direct:,}")
 
-    # Pass split history so legitimate split step-changes in EDGAR point-in-time
-    # shares are not mistaken for unit errors (e.g. CMG's 50:1 split).
-    _fix_shares_units(data, load_splits())
+    # Price-anchor the share-unit check: split history keeps real splits (e.g.
+    # CMG's 50:1) from looking like unit errors; latest closes resolve which
+    # share scale yields a plausible market cap (handles reverse mergers like QXO).
+    _fix_shares_units(data, load_splits(), _load_latest_closes())
     log.info("Loaded quarterly constituent data for %s companies", f"{len(data):,}")
     return data
 
 
-def _fix_shares_units(data: dict, splits: dict | None = None) -> None:
+# Plausibility bounds for the price-anchored share-unit check. A unit error is
+# always a clean factor of 1e3/1e6, so it pushes BOTH implied market cap and the
+# share count far outside these bounds. We test both because a ×1000 error of a
+# $1–5B name lands in the same market-cap zone as a real mega-cap (NVDA ~$5T) —
+# the share-count ceiling disambiguates (real names never carry tens of billions
+# of shares the way an inflated count does).
+_MCAP_BAND_LO = 1e7       # $10M   — below any name in this universe
+_MCAP_BAND_HI = 1e13      # $10T   — above the largest mega-cap, with headroom
+_MAX_PLAUSIBLE_SHARES = 5e10   # 50B shares — NVDA ~24B is the realistic ceiling
+_SHARE_UNIT_POWERS = (-6, -3, 3, 6)
+
+
+def _load_latest_closes() -> dict:
+    """{isin: latest close} from returns.db — used to price-anchor share-unit checks."""
+    if not RETURNS_DB.exists():
+        return {}
+    with get_db(RETURNS_DB) as conn:
+        rows = conn.execute(
+            "SELECT isin, close FROM ("
+            "  SELECT isin, close, ROW_NUMBER() OVER "
+            "    (PARTITION BY isin ORDER BY date DESC) AS rn "
+            "  FROM returns WHERE close > 0"
+            ") WHERE rn = 1"
+        ).fetchall()
+    return {isin: close for isin, close in rows}
+
+
+def _fix_shares_units(
+    data: dict, splits: dict | None = None, latest_closes: dict | None = None
+) -> None:
     """
-    Correct unit errors in 'Shares (Basic)' in place using log-median correction.
+    Correct order-of-magnitude unit errors in 'Shares (Basic)' in place, anchored
+    on price rather than a per-company median.
 
-    SimFin quarterly balance sheet files occasionally store shares in millions
-    (e.g. 718 instead of 718,000,000) or thousands (e.g. 106,831 instead of
-    106,831,000) for certain companies in certain quarters, and conversely
-    sometimes spike by 1000x.  Correction is applied when a value deviates
-    from the per-company log-median by ≥1.5 orders of magnitude; the power of
-    10 needed to bring it back to the median is rounded to the nearest integer.
-    Companies with fewer than 3 quarterly observations are skipped.
+    Source balance-sheet files occasionally store shares in thousands or millions
+    (e.g. 957,800 stored as 957,800,000,000) for some companies in some quarters.
+    A unit error is always a clean factor of 1e3 or 1e6, so it moves the implied
+    market cap (split-normalised shares × latest price) and the share count far
+    outside their plausible bounds. We keep the stored value when its market cap is
+    in [$10M, $10T] AND its share count is ≤ 50B; otherwise we rescale by the single
+    clean factor (10^±3 / 10^±6) that lands both back in-bounds, choosing the one
+    whose market cap is closest to the band centre. Values with no clean factor that
+    fits, and companies with no price, are left untouched — the rule never guesses a
+    scale. The share-count ceiling is what separates a real mega-cap (NVDA ~$5T,
+    ~24B shares) from a ×1000-inflated mid-cap that lands at a similar market cap.
 
-    Split-awareness: EDGAR shares are point-in-time, so a real stock split is a
-    legitimate step-change in the series (e.g. CMG 27M → 1,372M across its 50:1
-    split).  The median/threshold test runs on shares first normalised to the
-    current split basis (× the product of split ratios dated after each quarter's
-    publish date), so a large split no longer looks like a unit error.  Detection
-    happens on the normalised series; the correction is applied to the raw stored
-    value (the unit error lives there).  Without `splits` the normalisation is a
-    no-op and behaviour is unchanged.
+    This replaces an earlier log-median heuristic that failed on two cases:
+      • identity changes / reverse mergers (e.g. QXO: ~5M shell shares → ~700M
+        post-merger) where the median spans two real regimes and flags the real
+        current count as an error; and
+      • persistently corrupt series where the median picks the wrong scale.
+
+    Split-awareness: shares are normalised to the current split basis (× product
+    of split ratios dated after each quarter's publish date) before the price
+    check, so a real split (e.g. CMG 50:1) is never seen as a unit error. The
+    correction is applied to the raw stored value (the unit error lives there).
     """
     shares_key = 'Shares (Basic)'
     splits = splits or {}
+    latest_closes = latest_closes or {}
+    center_log = float(np.log10(np.sqrt(_MCAP_BAND_LO * _MCAP_BAND_HI)))
     fixed = 0
     for sid, quarters in data.items():
+        price = latest_closes.get(sid)
+        if not (price and price > 0):
+            continue
         sid_splits = splits.get(sid, ())
-        entries = []
-        for qkey, qdict in quarters.items():
-            val = qdict.get(shares_key)
-            if not (val and val > 0):
+        for qdict in quarters.values():
+            raw = qdict.get(shares_key)
+            if not (raw and raw > 0):
                 continue
             asof = qdict.get('_publish_date')
-            factor = 1.0
+            norm_factor = 1.0
             for split_date, ratio in sid_splits:
                 if asof is not None and split_date > asof:
-                    factor *= ratio
-            entries.append((qkey, val, val * factor))   # (key, raw, split-normalised)
-        if len(entries) < 3:
-            continue
-        norm_values = np.array([e[2] for e in entries])
-        median_log = float(np.median(np.log10(norm_values)))
-        for qkey, raw, norm in entries:
-            diff = np.log10(norm) - median_log
-            if abs(diff) >= 1.5:
-                power = -round(float(diff))
-                data[sid][qkey][shares_key] = raw * (10 ** power)
-                fixed += 1
+                    norm_factor *= ratio
+            norm = raw * norm_factor
+            if (_MCAP_BAND_LO <= norm * price <= _MCAP_BAND_HI
+                    and norm <= _MAX_PLAUSIBLE_SHARES):
+                continue  # already plausible — keep stored value
+            inbounds = [
+                (p, norm * (10 ** p) * price)
+                for p in _SHARE_UNIT_POWERS
+                if _MCAP_BAND_LO <= norm * (10 ** p) * price <= _MCAP_BAND_HI
+                and norm * (10 ** p) <= _MAX_PLAUSIBLE_SHARES
+            ]
+            if not inbounds:
+                continue  # no clean factor fits — don't guess
+            power = min(inbounds, key=lambda pm: abs(np.log10(pm[1]) - center_log))[0]
+            qdict[shares_key] = raw * (10 ** power)
+            fixed += 1
     if fixed:
-        log.info("[shares fix] corrected %d unit-mismatched Shares (Basic) values", fixed)
+        log.info("[shares fix] price-anchored correction of %d Shares (Basic) values", fixed)
 
 
 def load_kind_map() -> dict:
@@ -645,12 +691,9 @@ def load_log_transform_factor_ids() -> set[str]:
     return set(df.loc[df['log_transform'] == True, 'factor_id'])
 
 
-# Allowed factor sector_types per company sector_type
-_ALLOWED_FACTOR_SECTORS: dict[str, set] = {
-    'general':   {'all', 'general'},
-    'financial': {'all'},              # skip revenue/WC/liquidity factors for banks
-    'reit':      {'all', 'general', 'reit'},
-}
+# _ALLOWED_FACTOR_SECTORS is imported from utils (shared with create_models, the
+# model-layer coverage denominator) so the factor and model layers agree on which
+# factors apply to a company.
 
 
 # ---------------------------------------------------------------------------
@@ -1017,6 +1060,7 @@ def compute_value_factors(
     equity     = cdata.get('Total Equity')
     revenue    = cdata.get('Revenue')
     op_cf      = cdata.get('Net Cash from Operating Activities')
+    capex      = cdata.get('Change in Fixed Assets & Intangibles')  # negative cash outflow
     op_income  = cdata.get('Operating Income (Loss)')
     short_debt = cdata.get('Short Term Debt')
     long_debt  = cdata.get('Long Term Debt')
@@ -1028,12 +1072,19 @@ def compute_value_factors(
 
     if net_income is not None:
         f['Earnings Yield'] = net_income / market_cap
-    if equity is not None:
+    # Book-to-Price only when equity is positive: negative book equity (buyback-heavy
+    # names like ABBV/MCD/SBUX) is not "expensive" — B/M is undefined there (the
+    # Fama-French convention excludes negative-BE firms rather than ranking them).
+    if equity is not None and equity > 0:
         f['Book-to-Price'] = equity / market_cap
     if revenue is not None and revenue != 0:
         f['Sales-to-Price'] = revenue / market_cap
     if op_cf is not None:
         f['Cash Yield'] = op_cf / market_cap
+    # FCF Yield: free cash flow (OCF − capex) over market cap. capex is stored as a
+    # negative cash outflow, so op_cf + capex = OCF − |capex| (matches FCF Margin).
+    if op_cf is not None and capex is not None:
+        f['FCF Yield'] = (op_cf + capex) / market_cap
     if cash is not None and op_income is not None and op_income > 0:
         ev = _enterprise_value(market_cap, short_debt, long_debt, cash)
         if ev is not None:
