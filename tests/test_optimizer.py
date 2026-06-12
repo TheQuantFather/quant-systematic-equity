@@ -279,6 +279,33 @@ def test_excluded_sector_gets_zero_weight():
     assert weights[:4].sum() == pytest.approx(1.0, abs=1e-5)
 
 
+def test_max_issuer_weight_caps_dual_share_classes():
+    investable, _, b, Sigma, L = _make_universe()
+    sectors, industries, B_sector, B_ind, cap_buckets, B_cap = _single_sector_industry()
+    alpha = np.array([10.0, 9.0, 2.0, 1.0, 1.0])
+    issuers = ["Alphabet", "Issuer-2", "Issuer-3", "Issuer-4"]
+    B_issuer = np.array([
+        [1, 1, 0, 0, 0],
+        [0, 0, 1, 0, 0],
+        [0, 0, 0, 1, 0],
+        [0, 0, 0, 0, 1],
+    ], dtype=float)
+    strat = _basic_strategy(
+        "maximize_alpha",
+        max_stock_active_weight=1.0,
+        max_issuer_weight=0.40,
+    )
+
+    weights, _ = _optimize_alpha(
+        strat, investable, alpha, b, Sigma, L,
+        sectors, industries, B_sector, B_ind, cap_buckets, B_cap,
+        issuers, B_issuer,
+    )
+
+    assert weights[:2].sum() <= 0.40 + 1e-5
+    assert weights[:2].sum() == pytest.approx(0.40, abs=1e-4)
+
+
 # ── Turnover constraint ─────────────────────────────────────────────────────
 
 def test_max_turnover_limits_one_way_change():

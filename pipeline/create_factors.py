@@ -892,6 +892,13 @@ def select_growth_series(
     if all(v is not None for v in ffo) and len(ffo) >= 2:
         series['FFO'] = ffo
 
+    # Stock-item annual series (latest-in-window balance-sheet value) — feeds the
+    # earnings-stability factor (cross-time ROA volatility), not the growth trends.
+    for stock_field in ('Total Assets',):
+        vals = [w.get(stock_field) for w in windows]
+        if all(v is not None for v in vals) and len(vals) >= 2:
+            series[stock_field] = vals
+
     return series
 
 
@@ -973,6 +980,7 @@ def compute_quality_factors(cdata: dict) -> dict:
     pretax       = cdata.get('Pretax Income (Loss)')
     tax_exp      = cdata.get('Income Tax (Expense) Benefit, Net')
     cash         = cdata.get('Cash, Cash Equivalents & Short Term Investments') or 0
+    retained     = cdata.get('Retained Earnings')
 
     if revenue is not None and gross_p is not None and revenue != 0:
         f['Gross Margin'] = gross_p / revenue
@@ -1043,6 +1051,44 @@ def compute_quality_factors(cdata: dict) -> dict:
     if gross_p is not None and assets is not None and assets > 0:
         f['Gross Profit to Assets'] = gross_p / assets
 
+    # Altman Z''-score (1995 non-manufacturer / emerging-market variant): a
+    # distress/safety composite that drops the Sales/Assets term of the original
+    # Z-score (which is heavily industry-sensitive). Higher = further from
+    # bankruptcy = safer. The classification constant (+3.25) is omitted because a
+    # cross-sectional z-score is invariant to it. Not meaningful for banks/REITs —
+    # gated to general companies via the DEF001 model override.
+    #   Z'' = 6.56·(WC/TA) + 3.26·(RE/TA) + 6.72·(EBIT/TA) + 1.05·(BookEquity/TL)
+    if (assets is not None and assets > 0 and total_liab is not None and total_liab > 0
+            and retained is not None and op_income is not None and equity is not None
+            and cur_assets is not None and cur_liab is not None):
+        working_capital = cur_assets - cur_liab
+        f['Altman Z-Score'] = (
+            6.56 * (working_capital / assets)
+            + 3.26 * (retained / assets)
+            + 6.72 * (op_income / assets)
+            + 1.05 * (equity / total_liab)
+        )
+
+    return f
+
+
+def compute_stability_factors(growth_series: dict) -> dict:
+    """Earnings-stability safety factor (QMJ 'Safety' pillar).
+
+    Cross-time volatility of annual ROA over the trailing window — lower
+    variability of profitability = more stable earnings = safer (direction −1).
+    ROA (Net Income / Total Assets) is used rather than ROE because many
+    buyback-heavy large caps carry negative book equity, which makes ROE
+    undefined; assets are always positive, preserving coverage. Requires ≥3
+    aligned annual points (else NULL — matches the growth-trend minimum).
+    """
+    f = {}
+    ni = growth_series.get('Net Income')
+    ta = growth_series.get('Total Assets')
+    if (ni and ta and len(ni) == len(ta) and len(ni) >= 3
+            and all(a is not None and a > 0 for a in ta)):
+        roa = [n / a for n, a in zip(ni, ta)]
+        f['Earnings Stability'] = float(np.std(roa, ddof=1))
     return f
 
 
@@ -1391,6 +1437,83 @@ def compute_reit_factors(
     if ffo_growth is not None:
         f['FFO Growth'] = ffo_growth
 
+    # FFO Payout = distributions paid / FFO. Lower payout = bigger coverage cushion
+    # = safer (direction −1). Dividends Paid is stored negative (cash outflow).
+    dividends = cdata.get('Dividends Paid')
+    if dividends is not None and dividends < 0 and ffo > 0:
+        payout = abs(dividends) / ffo
+        if payout <= 5:   # cap at 500%; higher = unreliable FFO/dividend data
+            f['FFO Payout'] = payout
+
+    return f
+
+
+def compute_bank_factors(
+    cdata: dict, isin: str, prices: dict, ref_date: date = None
+) -> dict:
+    """
+    Bank-specific factors for sector_type == 'bank' (depository banks + consumer
+    lenders). Built from EDGAR bank line items ingested 2026-06 (Net Interest
+    Income, Noninterest Income/Expense, Provision/NII-after-provision, Loans,
+    Goodwill, Intangibles). Every factor is NULL-safe — a bank missing a concept
+    (e.g. JPM, which combines goodwill+intangibles) simply omits that one factor
+    and is renormalised over what it has.
+
+    Generic margin/revenue factors don't fit banks, so banks are gated out of
+    those (sector_type) and scored here on bank economics instead:
+      Net Interest Margin    NII / total assets            (+1; earning-asset proxy)
+      Efficiency Ratio       NonIntExp / (NII + NonIntInc) (−1; lower = leaner)
+      PPOP Return on Assets  (NII + NonIntInc − NonIntExp) / assets (+1)
+      Credit Cost            provision / loans             (−1; higher = riskier)
+      PPOP Yield             PPOP / market cap             (+1; value)
+      Tangible Book-to-Price (equity − goodwill − intang) / market cap (+1; value)
+    """
+    f = {}
+    nii    = cdata.get('Net Interest Income')
+    nonii  = cdata.get('Noninterest Income')
+    nonie  = cdata.get('Noninterest Expense')
+    niiap  = cdata.get('Net Interest Income After Provision')
+    prov   = cdata.get('Provision for Credit Losses')
+    loans  = cdata.get('Loans Receivable')
+    gw     = cdata.get('Goodwill')
+    intang = cdata.get('Intangible Assets')
+    assets = cdata.get('Total Assets')
+    equity = cdata.get('Total Equity')
+
+    # Pre-provision operating profit (pre-provision, pre-tax).
+    ppop = (nii + nonii - nonie) if (nii is not None and nonii is not None
+                                     and nonie is not None) else None
+
+    if nii is not None and assets is not None and assets > 0:
+        f['Net Interest Margin'] = nii / assets
+
+    if nii is not None and nonii is not None and nonie is not None:
+        total_rev = nii + nonii
+        if total_rev > 0:
+            f['Efficiency Ratio'] = nonie / total_rev
+
+    if ppop is not None and assets is not None and assets > 0:
+        f['PPOP Return on Assets'] = ppop / assets
+
+    # Credit Cost: prefer the direct provision; else derive NII − NII-after-provision.
+    provision = prov if prov is not None else (
+        (nii - niiap) if (nii is not None and niiap is not None) else None)
+    if provision is not None and loans is not None and loans > 0:
+        f['Credit Cost'] = provision / loans
+
+    shares = cdata.get('Shares (Basic)')
+    price  = get_close(prices, isin, ref_date=ref_date)
+    if price and shares and price > 0 and shares > 0:
+        market_cap = price * shares
+        if ppop is not None:
+            f['PPOP Yield'] = ppop / market_cap
+        # Tangible book only when positive (mirrors the Book-to-Price equity gate):
+        # goodwill/intangibles default to 0 when a bank doesn't break them out.
+        if equity is not None and equity > 0:
+            tangible = equity - (gw or 0) - (intang or 0)
+            if tangible > 0:
+                f['Tangible Book-to-Price'] = tangible / market_cap
+
     return f
 
 
@@ -1488,6 +1611,7 @@ def run_for_date(
         factors.update(compute_quality_factors(cdata))
         factors.update(compute_value_factors(cdata, isin, prices, ref_date=snapshot))
         factors.update(compute_growth_factors(growth_series))
+        factors.update(compute_stability_factors(growth_series))
         factors.update(compute_momentum_factors(isin, prices, ref_date=snapshot))
         factors.update(compute_size_factor(cdata, isin, prices, ref_date=snapshot))
         factors.update(compute_low_vol_factors(isin, prices, ref_date=snapshot))
@@ -1495,6 +1619,8 @@ def run_for_date(
         factors.update(compute_svr_factors(isin, svr_data, ref_date=snapshot))
         if sector_type == 'reit':
             factors.update(compute_reit_factors(cdata, growth_series, isin, prices, ref_date=snapshot))
+        if sector_type == 'bank':
+            factors.update(compute_bank_factors(cdata, isin, prices, ref_date=snapshot))
 
         allowed = _ALLOWED_FACTOR_SECTORS.get(sector_type, {'all', 'general'})
 
