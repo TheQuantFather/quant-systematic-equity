@@ -255,12 +255,24 @@ def get_barra_layout() -> dict:
 
 
 def classify_sector(sector: str | None, industry: str | None) -> str:
-    """Map SimFin sector/industry to one of: 'reit', 'financial', 'general'."""
+    """Map SimFin sector/industry to one of: 'reit', 'bank', 'financial', 'general'.
+
+    'bank' = depository banks + consumer lenders (Credit Services: AmEx, Capital
+    One, Discover, Sallie Mae…) — they have net interest income, loans and loan-loss
+    provisions, so they get the bank-specific factors. Insurers, asset managers and
+    brokers/exchanges stay 'financial' (their net interest income is incidental,
+    not a lending model) and are scored on the generic 'all' factors.
+    """
     s = (sector   or "").lower()
     i = (industry or "").lower()
     if s == "real estate" or "reit" in i:
         return "reit"
     if s == "financial services":
+        # Exact SimFin industry strings — 'Banks' and 'Credit Services' are the
+        # depository/consumer lenders. Investment banks sit under 'Brokers,
+        # Exchanges & Other' and are NOT matched here (no naive "bank" substring).
+        if i in ("banks", "credit services"):
+            return "bank"
         return "financial"
     return "general"
 
@@ -271,7 +283,8 @@ def classify_sector(sector: str | None, industry: str | None) -> str:
 # factors apply to a company.
 ALLOWED_FACTOR_SECTORS: dict[str, set] = {
     'general':   {'all', 'general'},
-    'financial': {'all'},              # banks skip revenue/WC/liquidity factors
+    'financial': {'all'},              # insurers/asset-mgrs: revenue/margin factors don't fit
+    'bank':      {'all', 'bank'},      # banks: 'all' factors + bank-specific; skip general revenue/margin
     'reit':      {'all', 'general', 'reit'},
 }
 

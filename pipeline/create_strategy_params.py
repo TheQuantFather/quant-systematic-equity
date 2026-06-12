@@ -1,8 +1,7 @@
 """
 create_strategy_params.py — Create/reset the strategy_params.xlsx template.
 
-Run once to create, then edit in Excel.
-Re-running will OVERWRITE any manual edits — only use to reset.
+The Python file is the source of truth; re-running overwrites the workbook.
 """
 
 import pandas as pd
@@ -28,12 +27,6 @@ CAT_FILLS = {
     "core_active":         PatternFill("solid", fgColor="E3F2FD"),
     "core_active_strict":  PatternFill("solid", fgColor="BBDEFB"),
     "abs_return":          PatternFill("solid", fgColor="E8F5E9"),
-    "min_variance":        PatternFill("solid", fgColor="FFF3E0"),
-    "quality_compounder":  PatternFill("solid", fgColor="F3E5F5"),
-    "defensive":           PatternFill("solid", fgColor="FCE4EC"),
-    "value_hunt":          PatternFill("solid", fgColor="E0F7FA"),
-    "momentum":            PatternFill("solid", fgColor="FFF8E1"),
-    "all_weather":         PatternFill("solid", fgColor="E8EAF6"),
 }
 
 
@@ -68,7 +61,6 @@ def build_strategies(wb):
     headers = [
         "strategy_id", "name", "active",
         "benchmark_file", "benchmark_index", "universe_index",
-        "alpha_model", "alpha_date", "risk_date",
         "solver", "objective", "risk_aversion", "investable_universe", "description",
     ]
     # risk_aversion: objective parameter for maximize_alpha. 0 = pure linear alpha
@@ -76,16 +68,10 @@ def build_strategies(wb):
     # (w-b)'Σ(w-b), shrinking bets toward the benchmark. Left at 0 — walk-forward
     # backtests show a positive penalty hurts the current ALP001 alpha.
     data = [
-        # id               name                       active  benchmark                  bench_idx universe_idx alpha    a_date       r_date       solver     objective           ra    universe         description
-        ["core_active",    "Core Active",             "TRUE", "",                         "sp500",  "",           "ALP001","2026-04-01","2026-04-01","MOSEK","maximize_alpha",   "0","benchmark_only","Live-sized core active portfolio: benchmark investable universe, 55-60 names, whole-share sizing for a 35k USD account, and 5% TE."],
-        ["core_active_strict","Core Active (Strict)", "FALSE","",                         "",       "",           "ALP001","2026-04-01","2026-04-01","CLARABEL","maximize_alpha",   "0","benchmark_only","Tighter benchmark-aware. Max 2% active risk, ±1% per stock and sector."],
-        ["abs_return",     "Absolute Return",         "TRUE", "",                         "sp500",  "sp500",      "ALP001","latest","latest","MOSEK","maximize_alpha",  "0","universe",      "Maximize alpha with core-like exposure bands: 35-45 names, benchmark-relative sector/industry, cap-bucket diversification, and 12% active-risk cap."],
-        ["min_variance",   "Minimum Variance",        "FALSE","",                         "",       "",           "ALP001","2026-04-01","2026-04-01","CLARABEL","minimize_variance","0","universe",      "Pure risk minimisation — no alpha signal. Capital preservation mandate."],
-        ["quality_compounder","Quality Compounder",   "FALSE","",                         "",       "",           "PROF001","2026-04-01","2026-04-01","CLARABEL","maximize_sharpe", "0","universe",      "Profitability-only alpha. High ROIC, FCF, margins. Buffett-style. Excludes Energy & Materials."],
-        ["defensive",      "Defensive Income",        "FALSE","",                         "",       "",           "DEF001","2026-04-01","2026-04-01","CLARABEL","maximize_sharpe",  "0","universe",      "Defensive Quality + Low-Vol blend. Low vol cap (12%), sector floors to stay diversified."],
-        ["value_hunt",     "Value Hunt",              "FALSE","",                         "",       "",           "VAL001","2026-04-01","2026-04-01","CLARABEL","maximize_alpha",   "0","benchmark_only","Value-only alpha vs MSCI USA benchmark. Wider active risk budget (6%)."],
-        ["momentum",       "Momentum",                "FALSE","",                         "",       "",           "MOM001","2026-04-01","2026-04-01","CLARABEL","maximize_sharpe",  "0","universe",      "Momentum-only alpha. Chases what's working. Higher vol tolerance (20%)."],
-        ["all_weather",    "All-Weather GARP",        "FALSE","",                         "",       "",           "ALP001","2026-04-01","2026-04-01","CLARABEL","maximize_sharpe",  "0","universe",      "Quality + Growth + Value blend. Equal sector weight ±2%. Balanced core holding."],
+        # id                   name                    active  benchmark_file benchmark_index universe_index solver  objective          risk_aversion universe          description
+        ["core_active",        "Core Active",          "TRUE", "",            "sp500",        "",            "MOSEK", "maximize_alpha",  "0",          "benchmark_only", "Live-sized core active portfolio: benchmark investable universe, 55-60 names, whole-share sizing for a 35k USD account, and 5% TE."],
+        ["core_active_strict", "Core Active (Strict)", "FALSE","",            "sp500",        "",            "MOSEK", "maximize_alpha",  "0",          "benchmark_only", "Core active constraint set with stricter 2% TE, ±1% active exposure bands, and a 4% issuer cap."],
+        ["abs_return",        "Absolute Return",      "TRUE", "",            "sp500",        "sp500",       "MOSEK", "maximize_alpha",  "0",          "universe",       "Maximize alpha with core-like exposure bands: 35-45 names, benchmark-relative sector/industry, cap-bucket diversification, and 12% active-risk cap."],
     ]
 
     ws.append(headers)
@@ -94,128 +80,104 @@ def build_strategies(wb):
         ws.append(row)
         _data_row(ws, i, len(headers), sid=row[0])
 
-    _widths(ws, [20, 22, 7, 28, 18, 18, 12, 12, 12, 10, 18, 13, 18, 60])
+    _widths(ws, [20, 22, 7, 28, 18, 18, 10, 18, 13, 18, 60])
     ws.row_dimensions[1].height = 22
     ws.freeze_panes = "A2"
 
 
 # ── Sheet 2: Constraints ──────────────────────────────────────────────────────
 
+CORE_CONSTRAINTS = [
+    ["long_only",                  "TRUE",  "TRUE",  "No short positions"],
+    ["fully_invested",             "TRUE",  "TRUE",  "Weights sum to 1"],
+    ["max_active_risk",            "0.05",  "TRUE",  "Max annual tracking error 5%"],
+    ["max_stock_active_weight",    "0.05",  "TRUE",  "Max ±5% active weight per stock; TE remains binding"],
+    ["max_sector_active_weight",   "0.03",  "FALSE", "Disabled while testing whole-share live portfolio feasibility"],
+    ["max_industry_active_weight", "0.03",  "FALSE", "Disabled while testing whole-share live portfolio feasibility"],
+    ["min_positions",             "55",    "TRUE",  "Minimum 55 securities for lower tracking error with whole-share sizing"],
+    ["max_positions",             "60",    "TRUE",  "Maximum 60 securities for 30k live-sized whole-share portfolio"],
+    ["min_position_if_held",       "0.01",  "TRUE",  "Minimum 1% if selected; 400 EUR trading minimum handled at broker sizing"],
+    ["portfolio_value_usd",        "35000", "TRUE",  "Approximate live/paper account value for whole-share lot-size optimisation"],
+    ["max_cash_weight",            "0.005", "TRUE",  "Max 0.5% residual cash in whole-share optimisation"],
+    ["lot_size_max_overweight",    "0.03",  "TRUE",  "Allow up to 3% extra per-name weight from whole-share lot rounding"],
+    ["use_lp_prescreen",           "FALSE", "FALSE", "Disabled for live lot-size optimisation; full universe is cleaner while exploratory"],
+    ["lp_prescreen_multiplier",    "10",    "FALSE", "Unused while pre-screen is disabled"],
+    ["excluded_tickers",           "AL",    "TRUE",  "Exclude untradable/delisted tickers from live-sized optimisation"],
+    ["large_cap_min_market_cap",   "10000000000", "TRUE", "Large cap threshold: >= $10B"],
+    ["mid_cap_min_market_cap",     "2000000000",  "TRUE", "Mid cap threshold: >= $2B and < $10B"],
+    ["max_large_cap_position",     "0.05",  "TRUE",  "Max 5% per large-cap stock"],
+    ["min_large_cap_weight",       "0.80",  "TRUE",  "Benchmark-only live sizing: min 80% large-cap exposure"],
+    ["max_large_cap_weight",       "1.00",  "TRUE",  "Benchmark-only live sizing: allow up to 100% large-cap exposure"],
+    ["max_mid_cap_position",       "0.04",  "TRUE",  "Max 4% per mid-cap stock"],
+    ["min_mid_cap_weight",         "0.00",  "FALSE", "No mid-cap floor for benchmark-only live sizing"],
+    ["max_mid_cap_weight",         "0.15",  "TRUE",  "Benchmark-only live sizing: max 15% mid-cap exposure"],
+    ["max_small_cap_position",     "0.03",  "TRUE",  "Max 3% per small-cap or missing-cap stock"],
+    ["min_small_cap_weight",       "0.00",  "FALSE", "No small-cap floor for benchmark-only live sizing"],
+    ["max_small_cap_weight",       "0.10",  "TRUE",  "Benchmark-only live sizing: max 10% small-cap exposure"],
+]
+
+STRICT_OVERRIDES = {
+    "max_active_risk":            ["0.02", "TRUE", "Max annual tracking error 2%"],
+    "max_stock_active_weight":    ["0.01", "TRUE", "Max ±1% active weight per stock"],
+    "max_sector_active_weight":   ["0.01", "TRUE", "Max ±1% active weight per GICS sector"],
+    "max_industry_active_weight": ["0.01", "TRUE", "Max ±1% active weight per industry"],
+}
+
+STRICT_EXTRA_CONSTRAINTS = [
+    ["max_issuer_weight", "0.04", "TRUE", "Max 4% total weight per issuer across share classes"],
+]
+
+ABS_RETURN_CONSTRAINTS = [
+    ["long_only",                  "TRUE",  "TRUE",  "No short positions"],
+    ["fully_invested",             "FALSE", "TRUE",  "Cash allowed up to max_cash_weight; held only when the vol cap binds"],
+    ["max_cash_weight",            "0.20",  "TRUE",  "Max 20% cash; de-risk headroom for max_portfolio_vol (sector bands cap cash at ~22% anyway)"],
+    ["max_active_risk",            "0.12",  "TRUE",  "Max 12% annual active risk vs configured benchmark"],
+    ["max_position",               "0.04",  "TRUE",  "Global max 4% per stock; bucket caps tighten mid/small further"],
+    ["min_positions",              "35",    "TRUE",  "Minimum 35 securities for retail-scale diversification"],
+    ["max_positions",              "45",    "TRUE",  "Maximum 45 securities initially"],
+    ["min_position_if_held",        "0.01",  "TRUE",  "Minimum 1% if selected; avoids small live-account positions"],
+    ["max_sector_active_weight",    "0.02",  "TRUE",  "Sector weight must stay within ±2% of configured benchmark"],
+    ["max_industry_active_weight",  "0.02",  "TRUE",  "Industry weight must stay within ±2% of configured benchmark"],
+    ["equal_sector_weight",         "FALSE", "FALSE", "Disabled: conflicts with benchmark-relative sector exposure"],
+    ["sector_weight_tolerance",     "0.01",  "FALSE", "Unused while equal_sector_weight is disabled"],
+    ["max_portfolio_vol",           "0.17",  "TRUE",  "Max 17% annual vol; binds in stressed regimes only (ex-ante median ~16.3%)"],
+    ["max_industry_weight",         "0.10",  "FALSE", "Disabled: industry exposure is controlled vs benchmark instead"],
+    ["use_alpha_prescreen",         "FALSE", "FALSE", "Do not pre-screen the Sharpe MIP; solve on the real universe"],
+    ["large_cap_min_market_cap",    "10000000000", "TRUE", "Large cap threshold: >= $10B"],
+    ["mid_cap_min_market_cap",      "2000000000",  "TRUE", "Mid cap threshold: >= $2B and < $10B"],
+    ["max_large_cap_position",      "0.04",  "TRUE",  "Max 4% per large-cap stock"],
+    ["min_large_cap_weight",        "0.60",  "TRUE",  "Large-cap sleeve floor: 60%"],
+    ["max_large_cap_weight",        "0.75",  "TRUE",  "Large-cap sleeve cap: 75%"],
+    ["max_mid_cap_position",        "0.03",  "TRUE",  "Max 3% per mid-cap stock"],
+    ["min_mid_cap_weight",          "0.15",  "TRUE",  "Mid-cap sleeve floor: 15%"],
+    ["max_mid_cap_weight",          "0.30",  "TRUE",  "Mid-cap sleeve cap: 30%"],
+    ["max_small_cap_position",      "0.02",  "TRUE",  "Max 2% per small-cap or missing-cap stock"],
+    ["min_small_cap_weight",        "0.00",  "TRUE",  "Small-cap sleeve floor: 0%"],
+    ["max_small_cap_weight",        "0.10",  "TRUE",  "Small-cap sleeve cap: 10%"],
+]
+
+
+def _constraint_rows(strategy_id: str, constraints: list[list]) -> list[list]:
+    return [[strategy_id, *row] for row in constraints]
+
+
+def _strict_constraints() -> list[list]:
+    rows = []
+    for name, value, enabled, notes in CORE_CONSTRAINTS:
+        rows.append([name, *STRICT_OVERRIDES.get(name, [value, enabled, notes])])
+        if name == "max_stock_active_weight":
+            rows.extend(STRICT_EXTRA_CONSTRAINTS)
+    return rows
+
+
 def build_constraints(wb):
     ws = wb.create_sheet("Constraints")
     headers = ["strategy_id", "constraint", "value", "enabled", "notes"]
-    data = [
-        # ── core_active ──────────────────────────────────────────────────────
-        ["core_active", "long_only",                   "TRUE", "TRUE",  "No short positions"],
-        ["core_active", "fully_invested",              "TRUE", "TRUE",  "Weights sum to 1"],
-        ["core_active", "max_active_risk",             "0.05", "TRUE",  "Max annual tracking error 5%"],
-        ["core_active", "max_stock_active_weight",     "0.05", "TRUE",  "Max ±5% active weight per stock; TE remains binding"],
-        ["core_active", "max_sector_active_weight",    "0.03", "FALSE", "Disabled while testing whole-share live portfolio feasibility"],
-        ["core_active", "max_industry_active_weight",  "0.03", "FALSE", "Disabled while testing whole-share live portfolio feasibility"],
-        ["core_active", "min_positions",              "55",   "TRUE",  "Minimum 55 securities for lower tracking error with whole-share sizing"],
-        ["core_active", "max_positions",              "60",   "TRUE",  "Maximum 60 securities for 30k live-sized whole-share portfolio"],
-        ["core_active", "min_position_if_held",        "0.01", "TRUE",  "Minimum 1% if selected; 400 EUR trading minimum handled at broker sizing"],
-        ["core_active", "portfolio_value_usd",         "35000", "TRUE", "Approximate live/paper account value for whole-share lot-size optimisation"],
-        ["core_active", "max_cash_weight",             "0.005", "TRUE", "Max 0.5% residual cash in whole-share optimisation"],
-        ["core_active", "lot_size_max_overweight",     "0.03",  "TRUE", "Allow up to 3% extra per-name weight from whole-share lot rounding"],
-        ["core_active", "use_lp_prescreen",            "FALSE", "FALSE", "Disabled for live lot-size optimisation; full universe is cleaner while exploratory"],
-        ["core_active", "lp_prescreen_multiplier",     "10",    "FALSE", "Unused while pre-screen is disabled"],
-        ["core_active", "excluded_tickers",            "AL",    "TRUE",  "Exclude untradable/delisted tickers from live-sized optimisation"],
-        ["core_active", "large_cap_min_market_cap",    "10000000000", "TRUE", "Large cap threshold: >= $10B"],
-        ["core_active", "mid_cap_min_market_cap",      "2000000000",  "TRUE", "Mid cap threshold: >= $2B and < $10B"],
-        ["core_active", "max_large_cap_position",      "0.05", "TRUE",  "Max 5% per large-cap stock"],
-        ["core_active", "min_large_cap_weight",        "0.80", "TRUE",  "Benchmark-only live sizing: min 80% large-cap exposure"],
-        ["core_active", "max_large_cap_weight",        "1.00", "TRUE",  "Benchmark-only live sizing: allow up to 100% large-cap exposure"],
-        ["core_active", "max_mid_cap_position",        "0.04", "TRUE",  "Max 4% per mid-cap stock"],
-        ["core_active", "min_mid_cap_weight",          "0.00", "FALSE", "No mid-cap floor for benchmark-only live sizing"],
-        ["core_active", "max_mid_cap_weight",          "0.15", "TRUE",  "Benchmark-only live sizing: max 15% mid-cap exposure"],
-        ["core_active", "max_small_cap_position",      "0.03", "TRUE",  "Max 3% per small-cap or missing-cap stock"],
-        ["core_active", "min_small_cap_weight",        "0.00", "FALSE", "No small-cap floor for benchmark-only live sizing"],
-        ["core_active", "max_small_cap_weight",        "0.10", "TRUE",  "Benchmark-only live sizing: max 10% small-cap exposure"],
-
-        # ── core_active_strict ───────────────────────────────────────────────
-        ["core_active_strict", "long_only",                  "TRUE", "TRUE",  "No short positions"],
-        ["core_active_strict", "fully_invested",             "TRUE", "TRUE",  "Weights sum to 1"],
-        ["core_active_strict", "max_active_risk",            "0.02", "TRUE",  "Max 2% annual tracking error"],
-        ["core_active_strict", "max_stock_active_weight",    "0.01", "TRUE",  "Max ±1% active weight per stock"],
-        ["core_active_strict", "max_sector_active_weight",   "0.01", "TRUE",  "Max ±1% active weight per GICS sector"],
-        ["core_active_strict", "max_industry_active_weight", "0.01", "TRUE",  "Max ±1% active weight per industry"],
-
-        # ── abs_return ───────────────────────────────────────────────────────
-        ["abs_return",  "long_only",                   "TRUE", "TRUE",  "No short positions"],
-        ["abs_return",  "fully_invested",              "FALSE","TRUE",  "Cash allowed up to max_cash_weight; held only when the vol cap binds"],
-        ["abs_return",  "max_cash_weight",             "0.20", "TRUE",  "Max 20% cash; de-risk headroom for max_portfolio_vol (sector bands cap cash at ~22% anyway)"],
-        ["abs_return",  "max_active_risk",             "0.12", "TRUE",  "Max 12% annual active risk vs configured benchmark"],
-        ["abs_return",  "max_position",                "0.04", "TRUE",  "Global max 4% per stock; bucket caps tighten mid/small further"],
-        ["abs_return",  "min_positions",               "35",   "TRUE",  "Minimum 35 securities for retail-scale diversification"],
-        ["abs_return",  "max_positions",               "45",   "TRUE",  "Maximum 45 securities initially"],
-        ["abs_return",  "min_position_if_held",         "0.01", "TRUE",  "Minimum 1% if selected; avoids small live-account positions"],
-        ["abs_return",  "max_sector_active_weight",     "0.02", "TRUE",  "Sector weight must stay within ±2% of configured benchmark"],
-        ["abs_return",  "max_industry_active_weight",   "0.02", "TRUE",  "Industry weight must stay within ±2% of configured benchmark"],
-        ["abs_return",  "equal_sector_weight",          "FALSE","FALSE", "Disabled: conflicts with benchmark-relative sector exposure"],
-        ["abs_return",  "sector_weight_tolerance",      "0.01", "FALSE", "Unused while equal_sector_weight is disabled"],
-        ["abs_return",  "max_portfolio_vol",            "0.17", "TRUE",  "Max 17% annual vol; binds in stressed regimes only (ex-ante median ~16.3%)"],
-        ["abs_return",  "max_industry_weight",          "0.10", "FALSE", "Disabled: industry exposure is controlled vs benchmark instead"],
-        ["abs_return",  "use_alpha_prescreen",          "FALSE","FALSE", "Do not pre-screen the Sharpe MIP; solve on the real universe"],
-        ["abs_return",  "large_cap_min_market_cap",     "10000000000", "TRUE", "Large cap threshold: >= $10B"],
-        ["abs_return",  "mid_cap_min_market_cap",       "2000000000",  "TRUE", "Mid cap threshold: >= $2B and < $10B"],
-        ["abs_return",  "max_large_cap_position",       "0.04", "TRUE",  "Max 4% per large-cap stock"],
-        ["abs_return",  "min_large_cap_weight",         "0.60", "TRUE",  "Large-cap sleeve floor: 60%"],
-        ["abs_return",  "max_large_cap_weight",         "0.75", "TRUE",  "Large-cap sleeve cap: 75%"],
-        ["abs_return",  "max_mid_cap_position",         "0.03", "TRUE",  "Max 3% per mid-cap stock"],
-        ["abs_return",  "min_mid_cap_weight",           "0.15", "TRUE",  "Mid-cap sleeve floor: 15%"],
-        ["abs_return",  "max_mid_cap_weight",           "0.30", "TRUE",  "Mid-cap sleeve cap: 30%"],
-        ["abs_return",  "max_small_cap_position",       "0.02", "TRUE",  "Max 2% per small-cap or missing-cap stock"],
-        ["abs_return",  "min_small_cap_weight",         "0.00", "TRUE",  "Small-cap sleeve floor: 0%"],
-        ["abs_return",  "max_small_cap_weight",         "0.10", "TRUE",  "Small-cap sleeve cap: 10%"],
-
-        # ── min_variance ─────────────────────────────────────────────────────
-        ["min_variance","long_only",                   "TRUE", "TRUE",  "No short positions"],
-        ["min_variance","fully_invested",              "TRUE", "TRUE",  "Weights sum to 1"],
-        ["min_variance","max_position",                "0.05", "TRUE",  "Max 5% per stock — prevents degenerate concentration"],
-        ["min_variance","max_sector_weight",           "0.25", "TRUE",  "Max 25% in any single sector"],
-        ["min_variance","max_industry_weight",         "0.10", "TRUE",  "Max 10% in any single industry"],
-
-        # ── quality_compounder ───────────────────────────────────────────────
-        ["quality_compounder","long_only",             "TRUE", "TRUE",  "No short positions"],
-        ["quality_compounder","fully_invested",        "TRUE", "TRUE",  "Weights sum to 1"],
-        ["quality_compounder","max_position",          "0.08", "TRUE",  "Max 8% per stock — more concentrated than abs_return"],
-        ["quality_compounder","max_sector_weight",     "0.25", "TRUE",  "Max 25% in any single sector"],
-        ["quality_compounder","excluded_sectors",      "Energy|Materials","TRUE","Exclude cyclical capital-intensive sectors"],
-        ["quality_compounder","max_portfolio_vol",     "0.16", "TRUE",  "Max 16% annual volatility"],
-
-        # ── defensive ────────────────────────────────────────────────────────
-        ["defensive",   "long_only",                   "TRUE", "TRUE",  "No short positions"],
-        ["defensive",   "fully_invested",              "TRUE", "TRUE",  "Weights sum to 1"],
-        ["defensive",   "max_position",                "0.04", "TRUE",  "Max 4% per stock"],
-        ["defensive",   "min_sector_weight",           "0.05", "TRUE",  "Min 5% in every sector — prevents sector exclusion"],
-        ["defensive",   "max_sector_weight",           "0.20", "TRUE",  "Max 20% in any sector"],
-        ["defensive",   "max_portfolio_vol",           "0.12", "TRUE",  "Max 12% annual vol — low-risk mandate"],
-        ["defensive",   "max_industry_weight",         "0.08", "TRUE",  "Max 8% per industry"],
-
-        # ── value_hunt ───────────────────────────────────────────────────────
-        ["value_hunt",  "long_only",                   "TRUE", "TRUE",  "No short positions"],
-        ["value_hunt",  "fully_invested",              "TRUE", "TRUE",  "Weights sum to 1"],
-        ["value_hunt",  "max_active_risk",             "0.06", "TRUE",  "Max 6% active risk — wider than core_active"],
-        ["value_hunt",  "max_stock_active_weight",     "0.03", "TRUE",  "Max ±3% active weight per stock"],
-        ["value_hunt",  "max_sector_active_weight",    "0.04", "TRUE",  "Max ±4% sector active weight — allow value sector tilts"],
-
-        # ── momentum ─────────────────────────────────────────────────────────
-        ["momentum",    "long_only",                   "TRUE", "TRUE",  "No short positions"],
-        ["momentum",    "fully_invested",              "TRUE", "TRUE",  "Weights sum to 1"],
-        ["momentum",    "max_position",                "0.05", "TRUE",  "Max 5% per stock"],
-        ["momentum",    "max_sector_weight",           "0.30", "TRUE",  "Max 30% per sector — momentum clusters in sectors"],
-        ["momentum",    "max_portfolio_vol",           "0.20", "TRUE",  "Max 20% vol — momentum accepts higher risk"],
-
-        # ── all_weather ──────────────────────────────────────────────────────
-        ["all_weather", "long_only",                   "TRUE", "TRUE",  "No short positions"],
-        ["all_weather", "fully_invested",              "TRUE", "TRUE",  "Weights sum to 1"],
-        ["all_weather", "max_position",                "0.04", "TRUE",  "Max 4% per stock"],
-        ["all_weather", "equal_sector_weight",         "TRUE", "TRUE",  "Equal weight across all 11 GICS sectors"],
-        ["all_weather", "sector_weight_tolerance",     "0.02", "TRUE",  "±2% around equal sector target"],
-        ["all_weather", "max_portfolio_vol",           "0.15", "TRUE",  "Max 15% annual volatility"],
-        ["all_weather", "max_industry_weight",         "0.08", "TRUE",  "Max 8% per industry"],
-    ]
+    data = (
+        _constraint_rows("core_active", CORE_CONSTRAINTS)
+        + _constraint_rows("core_active_strict", _strict_constraints())
+        + _constraint_rows("abs_return", ABS_RETURN_CONSTRAINTS)
+    )
 
     ws.append(headers)
     _header(ws, 1, len(headers))
@@ -239,22 +201,6 @@ def build_alpha_weights(wb):
         ["core_active_strict", "ALP001",  "Alpha Composite", "1.0", "Same composite alpha, tighter risk budget"],
         # abs_return — composite
         ["abs_return",        "ALP001",  "Alpha Composite", "1.0", "Composite alpha for Sharpe optimisation"],
-        # min_variance — alpha unused but required as placeholder
-        ["min_variance",      "ALP001",  "Alpha Composite", "1.0", "Placeholder — alpha is ignored for minimize_variance"],
-        # quality_compounder — pure profitability
-        ["quality_compounder","PROF001", "Profitability",       "1.0", "ROIC, margins, FCF — high-quality earners"],
-        # defensive — defensive quality + low vol blend
-        ["defensive",         "DEF001",  "Defensive Quality",  "0.5", "Balance sheet strength, interest coverage, accruals"],
-        ["defensive",         "LVOL001", "Low Volatility",     "0.5", "Half-weight low-vol signal"],
-        # value_hunt — pure value
-        ["value_hunt",        "VAL001",  "Value",           "1.0", "Earnings yield, P/B, P/S, P/CF, EV/EBIT"],
-        # momentum — pure momentum
-        ["momentum",          "MOM001",  "Momentum",        "1.0", "12m and 6m price momentum"],
-        # all_weather — (profitability 2x + defensive 1x) + growth + value; normalises to 1/3 quality, 1/3 growth, 1/3 value
-        ["all_weather",       "PROF001", "Profitability",      "0.20", "Two-thirds of quality weight: earners"],
-        ["all_weather",       "DEF001",  "Defensive Quality",  "0.10", "One-third of quality weight: balance sheet"],
-        ["all_weather",       "GRO001",  "Growth",             "0.30", "One-third: earnings, revenue, asset growth"],
-        ["all_weather",       "VAL001",  "Value",              "0.30", "One-third: valuation multiples"],
     ]
 
     ws.append(headers)
@@ -302,13 +248,8 @@ def build_reference(wb):
     r = table(r + 2, [
         ["strategy_id",        "Objective",           "Alpha signal",                          "Universe",      "Investor profile"],
         ["core_active",        "maximize_alpha",       "Composite (all factors)",               "Benchmark",     "Institutional — benchmark-aware"],
+        ["core_active_strict", "maximize_alpha",       "Composite (all factors)",               "Benchmark",     "Strict benchmark-aware core with issuer cap"],
         ["abs_return",         "maximize_alpha",       "Composite (all factors)",               "Full universe", "Absolute return — alpha with benchmark-aware exposures"],
-        ["min_variance",       "minimize_variance",    "None",                                  "Full universe", "Capital preservation / retirees"],
-        ["quality_compounder", "maximize_sharpe",      "Profitability only",                    "Full universe", "Long-term buy-and-hold, Buffett-style"],
-        ["defensive",          "maximize_sharpe",      "Defensive Quality + Low Vol (50/50)",   "Full universe", "Conservative income — low drawdown"],
-        ["value_hunt",         "maximize_alpha",       "Value only",                            "Benchmark",     "Contrarian / deep-value investors"],
-        ["momentum",           "maximize_sharpe",      "Momentum only",                         "Full universe", "Growth / trend-following investors"],
-        ["all_weather",        "maximize_sharpe",      "Profitability + Defensive + Growth + Value", "Full universe", "Balanced core — GARP approach"],
     ])
 
     r += 2
@@ -320,8 +261,6 @@ def build_reference(wb):
     r = table(r + 2, [
         ["Objective",         "Description"],
         ["maximize_alpha",    "Benchmark-aware: maximize active alpha (tracking-error constrained). Needs benchmark_index or benchmark_file."],
-        ["maximize_sharpe",   "Absolute return: maximize Sharpe via Charnes-Cooper transform. No benchmark needed."],
-        ["minimize_variance", "Pure risk minimisation: ignores alpha, finds lowest-vol portfolio. No benchmark needed."],
     ])
 
     r += 2
@@ -344,14 +283,15 @@ def build_reference(wb):
         ["max_small_cap_position",   "all objectives",            "Max absolute weight per small-cap or missing-cap stock"],
         ["min_small_cap_weight",     "all objectives",            "Min total weight in small-cap bucket"],
         ["max_small_cap_weight",     "all objectives",            "Max total weight in small-cap bucket"],
-        ["max_position",             "maximize_sharpe, min_var",  "Max absolute weight per stock"],
+        ["max_position",             "all objectives",            "Max absolute weight per stock"],
         ["max_sector_weight",        "all objectives",            "Max absolute weight per GICS sector"],
         ["min_sector_weight",        "all objectives",            "Min absolute weight per non-excluded sector"],
         ["equal_sector_weight",      "all objectives",            "Each sector gets 1/n_sectors ± sector_weight_tolerance"],
         ["sector_weight_tolerance",  "all objectives",            "±tolerance around equal-weight target (e.g. 0.01 = ±1%)"],
         ["excluded_sectors",         "all objectives",            "Pipe-separated sectors to zero out, e.g. Energy|Materials"],
+        ["max_issuer_weight",        "all objectives",            "Max absolute weight per issuer across share classes (CIK-based when available)"],
         ["max_industry_weight",      "all objectives",            "Max absolute weight per SimFin industry group"],
-        ["max_portfolio_vol",        "maximize_sharpe, maximize_alpha", "Max annual portfolio volatility"],
+        ["max_portfolio_vol",        "maximize_alpha",            "Max annual portfolio volatility"],
         ["max_cash_weight",          "maximize_alpha",            "Max cash weight; weights sum in [1 - cash, 1]. Disable to force fully invested"],
     ])
 
