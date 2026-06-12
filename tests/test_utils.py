@@ -64,7 +64,11 @@ def test_winsorized_zscore_handles_nan():
     ("Real Estate",        "Office REITs",        "reit"),
     ("Real Estate",        "",                    "reit"),
     ("Financial Services", "Mortgage REITs",      "reit"),     # industry beats sector
-    ("Financial Services", "Investment Banking",  "financial"),
+    ("Financial Services", "Investment Banking",  "financial"), # investment banks ≠ depository 'bank'
+    ("Financial Services", "Banks",               "bank"),      # depository banks
+    ("Financial Services", "Credit Services",     "bank"),      # consumer lenders (AmEx, COF, SLM)
+    ("Financial Services", "Asset Management",    "financial"),
+    ("Financial Services", "Insurance - Life",    "financial"),
     ("Technology",         "Software",            "general"),
     ("Health Care",        "Pharmaceuticals",     "general"),
     (None,                 None,                  "general"),
