@@ -302,25 +302,57 @@ def apply_weight_cap(weights: dict[str, float], cap: float = 0.03) -> dict[str, 
     Redistribute weight above `cap` to uncapped names pro-rata until convergence.
 
     Standard approach for capped-index construction (e.g. S&P 500 3% Capped).
-    Converges in O(log n) iterations because each pass either resolves all
-    violations or reduces the uncapped pool, guaranteeing termination.
+    Each pass fixes at least one additional name at the cap and rescales the
+    remaining names to the residual budget, guaranteeing termination.
     Returns a normalised dict (weights sum to 1); zero-weight names are dropped.
     """
+    if cap <= 0 or cap > 1:
+        raise ValueError("cap must be in the interval (0, 1]")
+
     w = {k: v for k, v in weights.items() if v > 0}
     total = sum(w.values())
     if total <= 0:
         return {}
     w = {k: v / total for k, v in w.items()}
-    for _ in range(100):
-        over = {k for k, v in w.items() if v > cap}
-        if not over:
+
+    if len(w) * cap < 1 - 1e-12:
+        raise ValueError("cap is infeasible for the number of positive-weight names")
+
+    capped: set[str] = set()
+    for _ in range(len(w)):
+        remaining = [k for k in w if k not in capped]
+        if not remaining:
             break
-        excess = sum(w[k] - cap for k in over)
-        under_total = sum(v for k, v in w.items() if k not in over)
-        if under_total < 1e-10:
+
+        target = 1.0 - cap * len(capped)
+        rem_total = sum(w[k] for k in remaining)
+        if rem_total <= 0:
             break
-        scale = (under_total + excess) / under_total
-        w = {k: cap if k in over else min(cap, v * scale) for k, v in w.items()}
+
+        scale = target / rem_total
+        for k in remaining:
+            w[k] *= scale
+
+        newly_capped = {k for k in remaining if w[k] > cap + 1e-12}
+        if not newly_capped:
+            break
+
+        for k in newly_capped:
+            w[k] = cap
+        capped.update(newly_capped)
+
+    # Remove harmless floating-point dust without creating a cap breach.
+    residual = 1.0 - sum(w.values())
+    if abs(residual) > 1e-12:
+        room = {k: cap - v for k, v in w.items() if v < cap - 1e-12}
+        room_total = sum(room.values())
+        if residual > 0 and room_total > 0:
+            for k, available in room.items():
+                w[k] += residual * available / room_total
+        else:
+            scale = 1.0 / sum(w.values())
+            w = {k: v * scale for k, v in w.items()}
+
     return w
 
 

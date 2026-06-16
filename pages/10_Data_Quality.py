@@ -217,20 +217,89 @@ def _factor_anomalies(snapshot_date: str) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=300)
-def _model_null_rates() -> pd.DataFrame:
-    """Null rate per model per date."""
-    ref = pd.read_csv(MODELS_REF)[["ModelID", "Model"]].drop_duplicates()
-    with get_db(MODELS_DB) as conn:
-        df = pd.read_sql(
-            "SELECT data_date, model_id, "
-            "  COUNT(*) AS total, "
-            "  SUM(CASE WHEN model_value_z IS NULL THEN 1 ELSE 0 END) AS nulls "
-            "FROM models GROUP BY data_date, model_id ORDER BY data_date",
+def _factor_coverage_over_time(model_id: str) -> pd.DataFrame:
+    """% of the PIT Russell 1000 with a value for each factor in `model_id`, per date.
+
+    Same universe denominator as _model_coverage_over_time, so absolute coverage is
+    comparable. This is the view that catches a silent data regression: per-factor
+    fill % is ~100% by construction (it divides by rows that exist), so it can read
+    green while a factor actually covers a fraction of the universe.
+    Sector-gated factors (bank/REIT-only) sit structurally low by design.
+    """
+    mref = pd.read_csv(MODELS_REF)
+    fids = mref.loc[mref["ModelID"] == model_id, "Factors"].dropna().astype(str).tolist()
+    if not fids:
+        return pd.DataFrame()
+    fref = pd.read_csv(FACTORS_REF)[["factor_id", "factor_name"]]
+    names = dict(zip(fref["factor_id"], fref["factor_name"]))
+    placeholders = ",".join("?" * len(fids))
+    with get_db(FACTORS_DB) as conn:
+        cov = pd.read_sql(
+            f"SELECT data_date, factor_id, COUNT(DISTINCT security_id) AS scored "
+            f"FROM factors WHERE factor_id IN ({placeholders}) AND factor_value IS NOT NULL "
+            f"GROUP BY data_date, factor_id",
+            conn, params=fids,
+        )
+    with get_db(UNIVERSE_DB) as conn:
+        uni = pd.read_sql(
+            "SELECT snapshot_date, COUNT(DISTINCT isin) AS uni_n "
+            "FROM universe_snapshots WHERE index_name = 'russell_1000' "
+            "GROUP BY snapshot_date ORDER BY snapshot_date",
             conn,
         )
-    df["null_pct"] = (df["nulls"] / df["total"] * 100).round(2)
+    if cov.empty or uni.empty:
+        return pd.DataFrame()
+    uni = uni.sort_values("snapshot_date")
+    uni["_ts"] = pd.to_datetime(uni["snapshot_date"])
+    mdates = pd.DataFrame({"data_date": sorted(cov["data_date"].unique())})
+    mdates["_ts"] = pd.to_datetime(mdates["data_date"])
+    mapped = pd.merge_asof(mdates, uni[["_ts", "uni_n"]], on="_ts", direction="backward").drop(columns="_ts")
+    df = cov.merge(mapped, on="data_date", how="left")
+    df["coverage_pct"] = (df["scored"] / df["uni_n"] * 100).round(1)
+    df["Factor"] = df["factor_id"].map(names).fillna(df["factor_id"])
+    return df.sort_values("data_date")
+
+
+@st.cache_data(ttl=300)
+def _model_coverage_over_time() -> pd.DataFrame:
+    """% of the point-in-time universe scored by each model, per snapshot date.
+
+    Denominator is the russell_1000 membership at the nearest universe snapshot
+    on or before each model date (the true PIT investable universe). This is the
+    coverage signal that matters — null_pct is ~0 everywhere since models never
+    store NULL z-scores, so it tells us nothing.
+    """
+    ref = pd.read_csv(MODELS_REF)[["ModelID", "Model"]].drop_duplicates()
+    with get_db(MODELS_DB) as conn:
+        scored = pd.read_sql(
+            "SELECT data_date, model_id, COUNT(DISTINCT security_id) AS scored "
+            "FROM models WHERE model_value_z IS NOT NULL "
+            "GROUP BY data_date, model_id",
+            conn,
+        )
+    with get_db(UNIVERSE_DB) as conn:
+        uni = pd.read_sql(
+            "SELECT snapshot_date, COUNT(DISTINCT isin) AS uni_n "
+            "FROM universe_snapshots WHERE index_name = 'russell_1000' "
+            "GROUP BY snapshot_date ORDER BY snapshot_date",
+            conn,
+        )
+    if scored.empty or uni.empty:
+        return pd.DataFrame()
+
+    # Map each model date to the nearest universe snapshot on or before it.
+    # merge_asof needs datetime keys, so map on a parsed column then drop it.
+    uni = uni.sort_values("snapshot_date")
+    uni["_ts"] = pd.to_datetime(uni["snapshot_date"])
+    model_dates = pd.DataFrame({"data_date": sorted(scored["data_date"].unique())})
+    model_dates["_ts"] = pd.to_datetime(model_dates["data_date"])
+    mapped = pd.merge_asof(
+        model_dates, uni[["_ts", "uni_n"]], on="_ts", direction="backward",
+    ).drop(columns="_ts")
+    df = scored.merge(mapped, on="data_date", how="left")
+    df["coverage_pct"] = (df["scored"] / df["uni_n"] * 100).round(1)
     df = df.merge(ref.rename(columns={"ModelID": "model_id"}), on="model_id", how="left")
-    return df
+    return df.sort_values("data_date")
 
 
 @st.cache_data(ttl=300)
@@ -752,30 +821,63 @@ with tab_snap:
 # TAB 3: Factor Quality
 # ============================================================
 with tab_factor:
-    st.subheader("Factor fill rates")
+    st.subheader("Factor coverage over time")
+    st.caption(
+        "Share of the PIT Russell 1000 with a value for each factor in the selected "
+        "model. **This is the regression-catching view** — per-factor *fill %* (table "
+        "below) divides by rows that exist, so it reads ~100% even when a factor covers "
+        "a fraction of the universe. A drop or a structurally low line here is the real "
+        "signal. Sector-gated factors (bank/REIT-only) sit low by design."
+    )
 
+    _mref = pd.read_csv(MODELS_REF)
+    _base = _mref[_mref["IsComposite"] == 0][["ModelID", "Model"]].drop_duplicates()
+    _model_opts = dict(zip(_base["Model"] + " (" + _base["ModelID"] + ")", _base["ModelID"]))
+    sel_model_label = st.selectbox("Model", list(_model_opts), index=0, key="fq_model")
+    sel_model_id = _model_opts[sel_model_label]
+
+    with st.spinner("Loading factor coverage…"):
+        fcov = _factor_coverage_over_time(sel_model_id)
+
+    if fcov.empty:
+        st.info("No factor coverage data for this model.")
+    else:
+        # Regression detector: flag a factor whose CURRENT coverage dropped materially
+        # from its own historical peak. This ignores structurally-low sector-gated
+        # factors (always low ≠ regression) and catches the silent drops that the
+        # all-green fill % missed.
+        peak = fcov.groupby("Factor")["coverage_pct"].max().rename("peak")
+        cur  = (fcov[fcov["data_date"] == fcov["data_date"].max()]
+                .set_index("Factor")["coverage_pct"].rename("cur"))
+        chk  = pd.concat([peak, cur], axis=1).dropna()
+        drops = chk[(chk["peak"] >= 40) & (chk["cur"] < chk["peak"] - 15)]
+        if not drops.empty:
+            st.warning(
+                "⚠️ Coverage regression vs each factor's own peak: "
+                + ", ".join(f"{f} {r.cur:.0f}% (peak {r.peak:.0f}%)" for f, r in drops.iterrows())
+            )
+        else:
+            st.success("✅ No factor coverage regressions (each factor near its historical peak).")
+        fig_fcov = px.line(
+            fcov, x="data_date", y="coverage_pct", color="Factor", markers=False,
+            labels={"data_date": "", "coverage_pct": "Coverage (%)", "Factor": "Factor"},
+        )
+        fig_fcov.update_layout(
+            height=440, margin=dict(l=0, r=0, t=10, b=10),
+            yaxis=dict(range=[0, 102], ticksuffix="%"),
+            legend=dict(orientation="h", y=-0.2), hovermode="x unified",
+        )
+        st.plotly_chart(fig_fcov, use_container_width=True)
+
+    st.divider()
+
+    # Per-date detail (fill %, z health, anomalies) — needs a specific snapshot.
     factor_dates = snap_cov["data_date"].tolist()
-    sel_date_f   = st.selectbox("Snapshot date", factor_dates, index=len(factor_dates)-1, key="fq_date")
+    sel_date_f   = st.selectbox("Snapshot date (for the detail below)", factor_dates,
+                                index=len(factor_dates) - 1, key="fq_date")
 
     with st.spinner("Loading factor data…"):
         fill_df = _factor_fill(sel_date_f)
-
-    # Fill rate bar — primary signal: which factors have gaps
-    fig_fill = px.bar(
-        fill_df.sort_values("fill_pct", ascending=True),
-        x="fill_pct", y="factor_name", orientation="h",
-        color="category",
-        labels={"fill_pct": "Fill rate (%)", "factor_name": ""},
-        text="fill_pct",
-        hover_data={"filled": True, "total": True, "n_extreme": True},
-    )
-    fig_fill.update_traces(texttemplate="%{text:.0f}%", textposition="outside")
-    fig_fill.update_layout(
-        height=max(400, len(fill_df) * 22),
-        margin=dict(l=0, r=60, t=20, b=20),
-        xaxis_range=[0, 115],
-    )
-    st.plotly_chart(fig_fill, use_container_width=True)
 
     # Compact quality table: fill %, avg z, extreme count
     st.markdown("**Factor quality summary**")
@@ -842,30 +944,31 @@ with tab_model:
     st.subheader("Model score quality")
 
     with st.spinner("Loading model data…"):
-        null_rates = _model_null_rates()
+        coverage = _model_coverage_over_time()
 
-    model_dates = sorted(null_rates["data_date"].unique(), reverse=True)
+    model_dates = sorted(coverage["data_date"].unique(), reverse=True)
     sel_date_m  = st.selectbox("Snapshot date", model_dates, index=0, key="mq_date")
 
-    # Null rate heatmap: date × model — shows both coverage and temporal consistency
-    st.markdown("**Null rate per model per date (%)**")
-    pivot_null = null_rates.pivot_table(
-        index="data_date", columns="Model", values="null_pct", aggfunc="first"
-    ).fillna(0)
-
-    fig_heat = px.imshow(
-        pivot_null.T,
-        color_continuous_scale=["#34A853", "#FBBC04", "#EA4335"],
-        zmin=0, zmax=5,
-        labels={"color": "Null %"},
-        aspect="auto",
+    # Coverage over time: % of the PIT russell_1000 universe each model scores.
+    st.markdown("**Model coverage over time (% of point-in-time Russell 1000 scored)**")
+    st.caption(
+        "Share of the PIT universe with a model score at each snapshot. Sector-gated "
+        "models (e.g. Growth, Short Interest) sit structurally lower; watch for "
+        "*drops* over time, which signal a data-coverage regression."
     )
-    fig_heat.update_layout(
-        height=380,
-        margin=dict(l=0, r=0, t=20, b=60),
-        xaxis_tickangle=-45,
+    fig_cov = px.line(
+        coverage, x="data_date", y="coverage_pct", color="Model",
+        markers=False,
+        labels={"data_date": "", "coverage_pct": "Coverage (%)", "Model": "Model"},
     )
-    st.plotly_chart(fig_heat, use_container_width=True)
+    fig_cov.update_layout(
+        height=420,
+        margin=dict(l=0, r=0, t=10, b=10),
+        yaxis=dict(range=[0, 102], ticksuffix="%"),
+        legend=dict(orientation="h", y=-0.18),
+        hovermode="x unified",
+    )
+    st.plotly_chart(fig_cov, use_container_width=True)
 
     st.divider()
 

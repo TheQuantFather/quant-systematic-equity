@@ -117,6 +117,8 @@ def connect() -> sqlite3.Connection:
             conn.execute(stmt)
     # Migration: add source column (idempotent — OperationalError if already present).
     # 'yahoo'    = real ETF price data fetched from Yahoo Finance.
+    # 'sp_index' = official index returns loaded manually for benchmarks where we
+    #              have index-level history but no convenient public price feed.
     # 'synthetic' = computed from a base index (e.g. cap-applied S&P 500) when the
     #               tracking ETF has no price history yet.  See _build_synthetic_capped_series.
     try:
@@ -136,12 +138,18 @@ def update_from_yahoo(
     conn: sqlite3.Connection,
     history_start: str = HISTORY_START,
     target_tickers: set[str] | None = None,
+    full_history: bool = False,
 ) -> None:
     """
     Pull daily returns from Yahoo Finance for all universe tickers, one at a time.
     Writes pre-computed total_return rows into the `returns` table (keyed by ISIN).
     Uses per-isin last date so each ticker fetches only its own gap.
     Progress is committed every 50 tickers so re-runs resume from where they left off.
+
+    full_history: re-fetch each ticker from history_start (ignoring the last-date
+    anchor) to backfill missing early history. INSERT OR IGNORE keeps existing
+    rows, so this only fills gaps. Tickers already covered back to history_start
+    are skipped, so an aborted run resumes cheaply.
     """
     today_str = date.today().strftime("%Y-%m-%d")
 
@@ -177,17 +185,33 @@ def update_from_yahoo(
                     continue
                 ticker_to_isin[ticker] = isin
 
-    # Per-isin last date in returns table
-    per_isin_last: dict[str, str] = dict(conn.execute(
-        "SELECT isin, MAX(date) FROM returns GROUP BY isin"
-    ).fetchall())
+    # Per-isin last (and, for full-history backfill, first) date in returns table
+    if full_history:
+        per_isin_range = {
+            isin: (mn, mx) for isin, mn, mx in conn.execute(
+                "SELECT isin, MIN(date), MAX(date) FROM returns GROUP BY isin"
+            ).fetchall()
+        }
+        per_isin_last = {isin: rng[1] for isin, rng in per_isin_range.items()}
+    else:
+        per_isin_last = dict(conn.execute(
+            "SELECT isin, MAX(date) FROM returns GROUP BY isin"
+        ).fetchall())
 
     # Build work list: (ticker, isin, fetch_from_date)
     # fetch_from = last date in returns (to use as adj_close anchor) or history_start
     work: list[tuple[str, str, str]] = []
     for ticker, isin in sorted(ticker_to_isin.items()):
         last = per_isin_last.get(isin)
-        from_str = last if last else history_start
+        if full_history:
+            # Re-fetch from history_start to fill the early gap. Skip tickers whose
+            # earliest stored date is already at/before history_start (nothing to add).
+            earliest = per_isin_range.get(isin, (None, None))[0]
+            if earliest is not None and earliest <= history_start:
+                continue
+            from_str = history_start
+        else:
+            from_str = last if last else history_start
         if from_str <= today_str:
             work.append((ticker, isin, from_str))
 
@@ -369,7 +393,8 @@ def _build_synthetic_capped_series(
        with real Yahoo data once the tracking ETF (e.g. TOPC) becomes available.
 
     Safe to re-run — deletes all synthetic rows for this index_name before rebuilding.
-    Does NOT overwrite rows already stored with source='yahoo'.
+    Does NOT overwrite rows already stored from non-synthetic sources such as
+    'yahoo' or manually-loaded official index history ('sp_index').
 
     IMPORTANT — approximation caveats (documented in GOTCHAS.md):
     - Rebalance dates are month-ends from our snapshot schedule, not the actual index
@@ -435,7 +460,7 @@ def _build_synthetic_capped_series(
         return 0
 
     ret_df["date"] = pd.to_datetime(ret_df["date"])
-    ret_pivot = ret_df.pivot(index="date", columns="isin", values="total_return").fillna(0.0)
+    ret_pivot = ret_df.pivot(index="date", columns="isin", values="total_return")
 
     # Walk forward period by period, computing daily portfolio returns
     rows: list[tuple] = []
@@ -458,11 +483,16 @@ def _build_synthetic_capped_series(
         common = [k for k in weights if k in period_ret.columns]
         if not common:
             continue
-        w = pd.Series({k: weights[k] for k in common})
+        w = pd.Series({k: weights[k] for k in common}, dtype=float)
         w /= w.sum()
 
-        daily_r = (period_ret[common] @ w).values
-        for day, r in zip(period_ret.index, daily_r):
+        period_common = period_ret[common]
+        valid_weight = period_common.notna().mul(w, axis=1).sum(axis=1)
+        daily_r = (
+            period_common.fillna(0.0).mul(w, axis=1).sum(axis=1) / valid_weight
+        ).dropna()
+
+        for day, r in daily_r.items():
             running_close *= (1 + float(r))
             rows.append((
                 index_name,
@@ -476,23 +506,25 @@ def _build_synthetic_capped_series(
         log.warning("No rows generated for synthetic series '%s'", index_name)
         return 0
 
-    # Delete previous synthetic rows and insert fresh (safe to re-run;
-    # INSERT OR IGNORE skips any 'yahoo' rows already stored for the same dates)
+    # Delete previous synthetic rows and insert fresh. INSERT OR IGNORE preserves
+    # any official/index or Yahoo rows already stored for the same dates.
     conn.execute(
         "DELETE FROM benchmark_returns WHERE index_name=? AND source='synthetic'",
         [index_name],
     )
+    before = conn.total_changes
     conn.executemany(
         "INSERT OR IGNORE INTO benchmark_returns "
         "(index_name, date, close, total_return, source) VALUES (?, ?, ?, ?, ?)",
         rows,
     )
+    inserted = conn.total_changes - before
     conn.commit()
     log.info(
-        "Synthetic series '%s': %d daily rows across %d rebal periods (cap=%.0f%%)",
-        index_name, len(rows), len(rebal_dates) - 1, cap * 100,
+        "Synthetic series '%s': %d/%d daily rows inserted across %d rebal periods (cap=%.0f%%)",
+        index_name, inserted, len(rows), len(rebal_dates) - 1, cap * 100,
     )
-    return len(rows)
+    return inserted
 
 
 # ---------------------------------------------------------------------------
@@ -559,6 +591,20 @@ def update_index_returns(
         if raw_rows is None:
             log.warning("[%-30s] %s  price fetch failed", index_name, etf_ticker)
         elif raw_rows:
+            prev_row = conn.execute(
+                "SELECT date, close, source FROM benchmark_returns "
+                "WHERE index_name=? ORDER BY date DESC LIMIT 1",
+                (index_name,),
+            ).fetchone()
+            has_non_yahoo_history = conn.execute(
+                "SELECT 1 FROM benchmark_returns "
+                "WHERE index_name=? AND source IS NOT NULL AND source != 'yahoo' LIMIT 1",
+                (index_name,),
+            ).fetchone() is not None
+            chain_close = None
+            if prev_row and prev_row[0] == from_price and prev_row[1] is not None and has_non_yahoo_history:
+                chain_close = float(prev_row[1])
+
             price_rows: list[tuple] = []
             for j, row in enumerate(raw_rows):
                 d, c, ac = row[1], row[5], row[6]
@@ -571,7 +617,14 @@ def update_index_returns(
                         if prev_ac and prev_ac > 0 and ac and ac > 0
                         else None
                     )
-                price_rows.append((index_name, d, float(c) if c else None, tr))
+                close = float(c) if c else None
+                if chain_close is not None:
+                    if d <= from_price:
+                        close = chain_close
+                    elif tr is not None:
+                        chain_close *= (1 + float(tr))
+                        close = chain_close
+                price_rows.append((index_name, d, close, tr))
 
             # Clear any synthetic rows for dates we are about to cover with real
             # Yahoo data. This fires when an ETF transitions from synthetic to live
@@ -593,6 +646,8 @@ def update_index_returns(
             total_price_rows += new_count
             if new_count:
                 log.info("[%-30s] %-6s  +%d rows", index_name, etf_ticker, new_count)
+
+        _chain_link_yahoo_tail_after_official_history(conn, index_name)
 
         time.sleep(YAHOO_DELAY)
 
@@ -620,6 +675,49 @@ def update_index_returns(
         "Index update complete — %d price rows | %d dividend events",
         total_price_rows, total_div_rows,
     )
+
+
+def _chain_link_yahoo_tail_after_official_history(
+    conn: sqlite3.Connection,
+    index_name: str,
+) -> None:
+    """Keep ETF-sourced closes on the same level as official/manual history.
+
+    Returns remain untouched. This repairs existing Yahoo tail rows as well as
+    newly inserted ones for benchmarks whose history starts from an official
+    index source such as `sp_index`.
+    """
+    anchor = conn.execute(
+        "SELECT date, close FROM benchmark_returns "
+        "WHERE index_name=? AND source IS NOT NULL AND source NOT IN ('yahoo', 'synthetic') "
+        "AND close IS NOT NULL ORDER BY date DESC LIMIT 1",
+        (index_name,),
+    ).fetchone()
+    if not anchor:
+        return
+
+    anchor_date, running_close = anchor[0], float(anchor[1])
+    rows = conn.execute(
+        "SELECT date, total_return FROM benchmark_returns "
+        "WHERE index_name=? AND source='yahoo' AND date>? "
+        "ORDER BY date",
+        (index_name, anchor_date),
+    ).fetchall()
+    if not rows:
+        return
+
+    updates: list[tuple[float, str, str]] = []
+    for row_date, total_return in rows:
+        if total_return is None:
+            continue
+        running_close *= (1 + float(total_return))
+        updates.append((round(running_close, 6), index_name, row_date))
+
+    if updates:
+        conn.executemany(
+            "UPDATE benchmark_returns SET close=? WHERE index_name=? AND date=?",
+            updates,
+        )
 
 
 def _yahoo_dividends(
@@ -1168,6 +1266,10 @@ def main():
                         help=f"Start date for tickers with no existing data (default {HISTORY_START})")
     parser.add_argument("--ticker", action="append", default=[],
                         help="Limit --update to one ticker. Repeat for multiple.")
+    parser.add_argument("--full-history", action="store_true",
+                        help="With --update: re-fetch each ticker from --history-start "
+                             "(ignore the per-isin last-date anchor) to backfill missing "
+                             "early history. INSERT OR IGNORE keeps existing rows.")
     args = parser.parse_args()
 
     if not any([args.update, args.check, args.backfill_delisted, args.backfill_splits,
@@ -1182,6 +1284,7 @@ def main():
                 conn,
                 history_start=args.history_start,
                 target_tickers=set(args.ticker or []),
+                full_history=args.full_history,
             )
             if args.ticker:
                 log.info("Skipping index returns for targeted ticker update.")

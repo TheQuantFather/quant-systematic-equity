@@ -35,12 +35,11 @@ from utils import (
 
 log = get_logger("create_models")
 
-# A model score is renormalised by the weight of factors actually present, but the
-# divisor is floored at MIN_COVERAGE × (weight applicable to the security's sector).
-# So a name with ≥50% coverage gets full conviction, while a sparsely-covered name
-# is divided by the floor — shrinking its score toward neutral rather than giving
-# one or two factors full conviction or muting whole sectors structurally.
-MIN_COVERAGE = 0.5
+# Missing-but-applicable factors are treated as neutral rather than removed from
+# the denominator, then the score is shrunk by the valid/applicable coverage ratio.
+# This prevents sparse names from receiving full-conviction model scores from a
+# small set of extreme available factors, while sector overrides still exclude
+# factors that genuinely do not apply to a company type.
 
 
 # ---------------------------------------------------------------------------
@@ -183,15 +182,13 @@ def compute_base_models(
     factor_sector_types: dict,
     security_sector_types: dict,
 ) -> int:
-    """Score each base model as a coverage-renormalised weighted sum of
-    direction-adjusted factor z-scores.
+    """Score each base model as a weighted sum of direction-adjusted factor z-scores.
 
     For each security only the factors that apply to its sector contribute to the
-    denominator (`applicable_weight`); the score is divided by
-    max(valid_weight, MIN_COVERAGE × applicable_weight). This keeps a well-covered
-    name at full conviction, shrinks a sparsely-covered name toward neutral, and
-    stops whole sectors (financials/REITs, which are structurally gated out of many
-    factors) from being systematically muted.
+    denominator (`applicable_weight`). Missing but applicable factors contribute
+    neutral zero, and the resulting score is multiplied by valid/applicable
+    coverage as a confidence shrink. Factors that are structurally inapplicable
+    to a sector are excluded entirely.
     """
     rows = []
     for data_date, securities in factors_data.items():
@@ -221,8 +218,9 @@ def compute_base_models(
                         score        += z * weight * direction
                         valid_weight += weight
                 if applicable_weight > 0 and valid_weight > 0:
-                    denom = max(valid_weight, MIN_COVERAGE * applicable_weight)
-                    rows.append((data_date, model_id, security_id, score / denom, is_composite))
+                    coverage = valid_weight / applicable_weight
+                    rows.append((data_date, model_id, security_id,
+                                 (score / applicable_weight) * coverage, is_composite))
 
     conn.executemany(
         "INSERT OR REPLACE INTO models "
@@ -240,7 +238,12 @@ def compute_alpha_models(
     alpha_models: dict,
     factors_data: dict,
 ) -> int:
-    """Score composite models as a weighted sum of base model scores."""
+    """Score composite models as a weighted sum of base model scores.
+
+    Missing base models are neutral rather than renormalised away, then the score
+    is shrunk by base-model coverage, matching the base-model treatment of
+    missing but applicable factors.
+    """
     rows = []
     for data_date, securities in factors_data.items():
         base_scores: dict = {}
@@ -267,8 +270,9 @@ def compute_alpha_models(
                         score        += v * weight
                         valid_weight += weight
                 if valid_weight > 0:
-                    denom = max(valid_weight, MIN_COVERAGE * applicable_weight)
-                    rows.append((data_date, model_id, security_id, score / denom, is_composite))
+                    coverage = valid_weight / applicable_weight
+                    rows.append((data_date, model_id, security_id,
+                                 (score / applicable_weight) * coverage, is_composite))
 
     conn.executemany(
         "INSERT OR REPLACE INTO models "

@@ -5,6 +5,8 @@ daily_ecosystem_update.py - Automated ecosystem pipeline update.
 Schedule:
   Daily   — update prices (create_returns.py --update)
   Daily   — FINRA short volume ratio (create_svr.py)
+  Daily   — FINRA consolidated short interest (create_svr.py --short-interest;
+            semi-monthly data, so most days fetch 0 new settlement dates)
   Daily   — EDGAR filing index: process companies that actually filed (10-K + 10-Q)
   Weekly  — on Fridays: rebuild factors, models, risk, Barra, portfolio
              using today's date as the snapshot so everything is aligned
@@ -47,6 +49,7 @@ REPO_DIR = Path(__file__).parent.resolve()
 TIMEOUTS: dict[str, int] = {
     "returns":   3600,   # 1h — yfinance bulk pull
     "svr":       1800,   # 30m — FINRA short volume incremental
+    "short_interest": 900,  # 15m — FINRA consolidated short interest (semi-monthly; daily no-op between settlements)
     "filings":   3600,   # 1h — EDGAR index + per-company fetches
     "macro":      300,   # 5m  — FRED/Yahoo: 8 series, 3 retries each
     "factors":   2700,   # 45m
@@ -213,6 +216,8 @@ def main() -> None:
                         help="Skip price update (downstream runs against existing DB)")
     parser.add_argument("--skip-svr",       action="store_true",
                         help="Skip FINRA SVR update")
+    parser.add_argument("--skip-short-interest", action="store_true", dest="skip_short_interest",
+                        help="Skip FINRA consolidated short interest update")
     parser.add_argument("--skip-filings",   action="store_true",
                         help="Skip EDGAR filings (downstream runs against existing DB)")
     parser.add_argument("--skip-macro",     action="store_true",
@@ -253,6 +258,14 @@ def main() -> None:
         results["svr"] = True
     else:
         step("svr", "create_svr.py", depends_on=("returns",))
+
+    # Consolidated short interest also writes returns.db; runs after svr (steps are
+    # sequential) so the two create_svr.py invocations never hold the lock at once.
+    if args.skip_short_interest:
+        log.info("SKIP    short_interest (--skip-short-interest)")
+        results["short_interest"] = True
+    else:
+        step("short_interest", "create_svr.py", "--short-interest", depends_on=("returns",))
 
     if args.skip_filings:
         log.info("SKIP    filings (--skip-filings; downstream uses existing DB)")

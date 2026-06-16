@@ -1,10 +1,10 @@
-"""Tests for utils.winsorized_zscore and utils.classify_sector."""
+"""Tests for selected utils helpers."""
 
 import numpy as np
 import pandas as pd
 import pytest
 
-from utils import classify_sector, winsorized_zscore
+from utils import apply_weight_cap, classify_sector, winsorized_zscore
 
 
 # ── winsorized_zscore ────────────────────────────────────────────────────────
@@ -78,3 +78,34 @@ def test_winsorized_zscore_handles_nan():
 ])
 def test_classify_sector(sector, industry, expected):
     assert classify_sector(sector, industry) == expected
+
+
+# ── apply_weight_cap ─────────────────────────────────────────────────────────
+
+def test_apply_weight_cap_preserves_sum_when_uncapped_names_hit_cap():
+    weights = {
+        "mega_a": 0.08,
+        "mega_b": 0.07,
+        "large_a": 0.04,
+        "large_b": 0.035,
+        **{f"name_{i}": 0.775 / 20 for i in range(20)},
+    }
+
+    capped = apply_weight_cap(weights, cap=0.05)
+
+    assert abs(sum(capped.values()) - 1.0) < 1e-12
+    assert max(capped.values()) <= 0.05 + 1e-12
+
+
+def test_apply_weight_cap_normalises_percent_inputs():
+    weights = {"a": 8.0, "b": 7.0, **{f"name_{i}": 85.0 / 40 for i in range(40)}}
+
+    capped = apply_weight_cap(weights, cap=0.03)
+
+    assert abs(sum(capped.values()) - 1.0) < 1e-12
+    assert max(capped.values()) <= 0.03 + 1e-12
+
+
+def test_apply_weight_cap_rejects_infeasible_cap():
+    with pytest.raises(ValueError):
+        apply_weight_cap({"a": 0.6, "b": 0.4}, cap=0.49)
