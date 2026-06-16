@@ -1,8 +1,8 @@
 # Systematic Equity Investment Framework
 
-![Python](https://img.shields.io/badge/Python-3.13-3776AB?logo=python&logoColor=white)&nbsp;![Streamlit](https://img.shields.io/badge/Streamlit-dashboard-FF4B4B?logo=streamlit&logoColor=white)&nbsp;![SQLite](https://img.shields.io/badge/7_databases-SQLite-003B57?logo=sqlite&logoColor=white)&nbsp;![Tests](https://img.shields.io/badge/tests-121_passing-2ea44f?logo=pytest&logoColor=white)
+![Python](https://img.shields.io/badge/Python-3.13-3776AB?logo=python&logoColor=white)&nbsp;![Streamlit](https://img.shields.io/badge/Streamlit-dashboard-FF4B4B?logo=streamlit&logoColor=white)&nbsp;![SQLite](https://img.shields.io/badge/7_databases-SQLite-003B57?logo=sqlite&logoColor=white)&nbsp;![Tests](https://img.shields.io/badge/tests-150-2ea44f?logo=pytest&logoColor=white)
 
-A systematic quantitative investing framework covering ~994 US equities from the **iShares Russell 1000 ETF** universe. Includes 30+ factors across 12 models, a Barra-style factor risk model built from first principles, and a CVXPY portfolio optimiser with 9 configurable strategies.
+A systematic quantitative investing framework covering ~994 US equities from the **iShares Russell 1000 ETF** universe. Includes 30+ factors aggregated into research models, a Barra-style factor risk model built from first principles, and a CVXPY portfolio optimiser driven entirely by a config spreadsheet.
 
 > **Note:** This is a public display mirror of a private working repository. It documents the full architecture, but some components are intentionally excluded — all generated data (the `data/` directory and its databases), live brokerage execution tooling, and a few private data-ingestion modules. As a result, certain files referenced below (e.g. `pipeline/update_constituents.py`) are not present here, and the pipeline is not runnable end-to-end from this repo alone. It is shared to illustrate design and methodology.
 
@@ -10,11 +10,11 @@ A systematic quantitative investing framework covering ~994 US equities from the
 
 A fully self-contained investment research system — built from scratch in Python — that takes raw financial data from SEC filings all the way through to optimised portfolio weights. No commercial quant platform; every layer is custom.
 
-- **Data ingestion** — pulls financial statements directly from SEC EDGAR (10-K/10-Q filings), supplemented by SimFin, Yahoo Finance, FINRA short-selling data, and FRED macro indicators
+- **Data ingestion** — pulls financial statements directly from SEC EDGAR (10-K/10-Q filings), plus Yahoo Finance / Tiingo prices, FINRA short-selling data, and FRED macro indicators
 - **Factor construction** — computes 30+ quantitative measures per stock per quarter, strictly point-in-time so no snapshot contains data that wasn't yet published; banks and REITs receive sector-native factors rather than generic ones that don't apply to their business models
-- **Scoring** — aggregates factors into 12 research models (profitability, value, growth, momentum, and more) with coverage-floor logic that prevents thin data from inflating scores
+- **Scoring** — aggregates factors into research models (profitability, value, growth, momentum, and more) with coverage-floor logic that prevents thin data from inflating scores
 - **Risk modelling** — a Barra-style factor risk model built from first principles, decomposing portfolio risk into market, sector, style, and idiosyncratic components
-- **Portfolio optimization** — CVXPY-powered optimizer supporting 9 strategies across three objective types; configurable entirely through a spreadsheet
+- **Portfolio optimization** — CVXPY-powered optimizer supporting three objective types; strategies configured entirely through a spreadsheet
 - **Research & reporting** — Streamlit dashboard for interactive exploration, automated HTML reports for individual stocks and thematic baskets, and a `/model-review` diagnostic tool for auditing individual models
 
 ---
@@ -33,7 +33,7 @@ The pipeline is a strict one-way dependency graph: each stage writes to its own 
 iShares N-PORT-P (EDGAR)
   └─ pipeline/create_universe.py      → universe.db           (company metadata, ISIN-based)
 
-SimFin CSVs (initial load)
+SimFin CSVs (legacy initial seed)
   └─ pipeline/create_databases.py     → constituents.db        (financial time series, PIT)
 
 EDGAR 10-K/10-Q filings (incremental)
@@ -44,7 +44,7 @@ Yahoo / Tiingo + FINRA short volume
 
 constituents.db + returns.db + universe.db
   └─ pipeline/create_factors.py       → factors.db             (30+ factors × N snapshots)
-  └─ pipeline/create_models.py        → models.db              (12 models × N snapshots)
+  └─ pipeline/create_models.py        → models.db              (research models × N snapshots)
   └─ pipeline/create_risk.py          → risk.db                (Ledoit-Wolf covariance)
   └─ pipeline/create_barra.py         → risk.db                (Barra factor risk model)
 
@@ -126,17 +126,17 @@ This is what makes the **Backtester** reliable: each rebalance sees only data th
 
 ### Universal factors (30+)
 
-| Category | Count | Factors |
-|----------|:-----:|---------|
-| Quality | 15 | Gross Margin, Operating Margin, Net Margin, ROE, ROA, ROIC, FCF Margin, Current Ratio, Debt-to-Assets, Interest Coverage, Accruals, Earnings Stability, Altman Z-Score, Asset Turnover, Working Capital Efficiency |
-| Value | 7 | Earnings Yield, Book-to-Price, Sales-to-Price, Cash Yield, FCF Yield, EV/EBITDA, Dividend Yield |
-| Growth | 5 | Revenue, Earnings, Operating Income, Cash Flow, EBITDA Growth |
-| Momentum | 3 | 12M price momentum, 6M price momentum, 52-week high ratio |
-| Reversal | 2 | 36–12M long-term reversal, 1M short-term reversal |
-| Risk | 1 | Realized volatility |
-| Size | 1 | Log Market Cap |
-| Liquidity | 1 | Amihud illiquidity ratio |
-| Short Interest | 3 | FINRA SVR 20-day average, SVR 90-day percentile rank, Days to Cover (consolidated short interest) |
+| Category | Factors |
+|----------|---------|
+| Quality | Gross Margin, Operating Margin, Net Margin, ROE, ROA, ROIC, FCF Margin, Current Ratio, Debt-to-Assets, Interest Coverage, Accruals, Earnings Stability, Altman Z-Score, Asset Turnover, Working Capital Efficiency |
+| Value | Earnings Yield, Book-to-Price, Sales-to-Price, Cash Yield, FCF Yield, EV/EBITDA, Dividend Yield |
+| Growth | Revenue, Earnings, Operating Income, Cash Flow, EBITDA Growth |
+| Momentum | 12M price momentum, 6M price momentum, 52-week high ratio |
+| Reversal | 36–12M long-term reversal, 1M short-term reversal |
+| Risk | Realized volatility |
+| Size | Log Market Cap |
+| Liquidity | Amihud illiquidity ratio |
+| Short Interest | FINRA SVR 20-day average, SVR 90-day percentile rank, Days to Cover (consolidated short interest) |
 
 > **Growth methodology** — each growth factor is the OLS slope of the annual LTM series over the trailing 3–5 fiscal years, scaled by mean absolute level (`slope / mean(|level|)`). This measures *sustained* growth and is robust to depressed base years — a single trough year (e.g. a bank recovering from a one-off loss) no longer produces a spurious multi-hundred-percent reading the way a naïve `(current − prior)/|prior|` ratio does.
 
@@ -161,7 +161,7 @@ Standard financial ratios lose meaning for banks and REITs — a bank's revenue 
 |--------|-----------------|
 | FFO Payout | FFO distributed ÷ FFO generated — distribution coverage; lower payout = more retained earnings |
 
-### Models (12 total)
+### Models
 
 Model scores are coverage-renormalised: a stock only receives full conviction if it has data for ≥ 50% of the factors applicable to its sector. Below that threshold the score is shrunk toward neutral, rather than inflated by a thin data slice.
 
@@ -178,7 +178,7 @@ Model scores are coverage-renormalised: a stock only receives full conviction if
 | Short Interest | SHI001 | FINRA consolidated short interest — Days to Cover (shares short ÷ average daily volume); backtestable to 2021, whereas FINRA short-volume (SVR) only retains ~13 months |
 | Long-term Reversal | LTR001 | 36–12M risk-adjusted reversal — standalone signal, not in Alpha |
 | Short-term Reversal | STR001 | 1M risk-adjusted reversal — standalone signal, not in Alpha |
-| **Alpha (composite)** | **ALP001** | **0.26 × Profitability + 0.26 × Value + 0.21 × Growth + 0.21 × Momentum + 0.06 × Size** |
+| **Alpha (composite)** | **ALP001** | **Conviction-weighted blend of the base models — led by Profitability and Value, then Momentum and Growth, with smaller Size, Balance Sheet Quality and Short Interest tilts; weights live in `models_reference.csv`. The reversal, low-volatility and liquidity models stay standalone.** |
 
 Direction is applied only at model score time (`z × weight × direction`); `factor_value_z` is always stored unsigned.
 
@@ -194,7 +194,7 @@ The risk model answers *why* the portfolio carries the risk it does — is it a 
 
 | Symbol | Description |
 |--------|-------------|
-| X (N×K) | Factor exposure matrix — market intercept, GICS sector dummies, style z-scores, beta, fundamental factors |
+| X (N×K) | Factor exposure matrix — market intercept, GICS sector dummies, beta, and the base research-model z-scores |
 | F (K×K) | Factor covariance — two-half-life EWMA. Variances: hl=90d + Newey-West (5 lags). Correlations: hl=240d. Reassembled `F = D^½ R D^½`, annualised (×252). |
 | Δ (N×N) | Diagonal idiosyncratic variance — EWMA (hl=60d), Bayesian-shrunk, annualised |
 
@@ -204,9 +204,10 @@ The risk model answers *why* the portfolio carries the risk it does — is it a 
 |-------|:-----:|-------------|
 | Market | 1 | Intercept (all 1s) — captures the universe-wide return premium; keeps sector factors as pure deviations |
 | Sector | 11 | GICS sectors with cap-weighted sum-to-zero constraint, resolving rank deficiency vs the market factor |
-| Style | 5 | Log Market Cap, 12M momentum, 6M momentum, realized vol, 52-week high ratio |
-| Beta | 1 | beta_60d vs equal-weight universe |
-| Fundamental | 12 | Selected quality, value, growth, and leverage factors |
+| Beta | 1 | Rolling 60-day market beta vs the point-in-time Russell 1000 proxy |
+| Model factors | one per base model | Each base research model (Profitability, Value, Growth, Momentum, Size, Balance Sheet Quality, Low Vol, Liquidity, Short Interest, LT/ST Reversal) enters as its own factor. Its exposure is the model's cross-sectional z-score, orthogonalised per `barra_ortho_against` (e.g. Liquidity ⊥ Size, Short Interest ⊥ Liquidity). |
+
+The factor set, order and orthogonalisation rules come from `models_reference.csv` via `get_barra_layout()` — the single source of truth shared with the risk pages, so adding or retiring a model reshapes the risk model with no code change.
 
 ### Regression
 
@@ -225,29 +226,27 @@ Healthy range: 0.8–1.2. Persistent values > 1 indicate the model is under-pred
 ### Optimizer integration
 
 Stacked-L form: `L_barra = vstack([L_F.T @ X.T, diag(√δ)]).T` so that `‖L_barra.T w‖² = w′(XFX′+Δ)w`.  
-Set `use_barra_risk = FALSE` in the Strategies sheet of `strategy_params.xlsx` to fall back to Ledoit-Wolf for a specific strategy.
+Barra is the default; setting `use_barra_risk = FALSE` for a strategy falls back to the Ledoit-Wolf covariance instead.
 
 ---
 
 ## Portfolio optimiser
 
-### Strategies (9 active)
+### Strategies (3 active)
 
-| Strategy | Objective | Alpha signal | Notes |
-|----------|-----------|-------------|-------|
-| Core Active | maximize_alpha | ALP001 | Benchmark-relative |
-| Core Active (Strict) | maximize_alpha | ALP001 | Benchmark-relative, 2% TE cap |
-| Absolute Return | maximize_alpha | ALP001 | Full universe; 17% vol cap + 20% cash buffer |
-| Minimum Variance | minimize_variance | — | Full universe; ignores alpha |
-| Quality Compounder | maximize_sharpe | PROF001 | Excl. Energy / Materials |
-| Defensive Income | maximize_sharpe | PROF001 + LVOL001 | Full universe |
-| Value Hunt | maximize_alpha | VAL001 | Benchmark-relative, 6% TE cap |
-| Momentum | maximize_sharpe | MOM001 | Full universe |
-| All-Weather GARP | maximize_sharpe | PROF001 + GRO001 + VAL001 | Full universe |
+| Strategy | Objective | Alpha signal | Benchmark / universe | Notes |
+|----------|-----------|--------------|----------------------|-------|
+| Core Active | maximize_alpha | ALP001 | S&P 500 | Live-sized — 55–60 names, whole-share sizing, 5% tracking-error cap |
+| Core Active (Strict) | maximize_alpha | ALP001 | S&P 500 3% Capped | Tighter risk budget — 2% TE, ±1% active bands, 4% issuer cap |
+| Absolute Return | maximize_alpha | ALP001 | S&P 500 universe | 35–45 names, benchmark-relative sector/industry bands, cap-bucket diversification, 12% active-risk cap |
 
-> **Absolute Return note** — the 17% vol cap acts as a circuit breaker in stressed markets: when the risk model forecasts portfolio volatility approaching that level, the optimizer de-risks by holding cash (up to 20%) rather than distorting the portfolio toward lower-conviction names. In normal conditions the cap doesn't bind and the portfolio is fully invested.
+> **Capped benchmark** — Core Active (Strict) is measured against an *S&P 500 3% Capped* index, which caps any single constituent at 3%. That keeps the benchmark itself diversified, so the strategy isn't forced to chase mega-cap concentration to control tracking error.
+
+All three active strategies currently blend a single composite signal (ALP001); the `Alpha_Weights` sheet lets any strategy mix multiple models with arbitrary weights.
 
 ### Objectives
+
+The active strategies all use `maximize_alpha`; the other two objectives are fully implemented and selectable per strategy in the config sheet.
 
 - **`maximize_alpha`** — maximises `α·w` subject to active-weight constraints vs benchmark. Optional `risk_aversion` parameter (default 0) adds a mean-variance penalty: `max α·w − ½·λ·(w−b)′Σ(w−b)`.
 - **`maximize_sharpe`** — Charnes-Cooper transform: solves for `y = w/σ_p`, recovers `w = y/∑y`.
@@ -264,7 +263,7 @@ All strategy settings live in `data/strategy_params.xlsx`:
 
 | Sheet | Contents |
 |-------|---------|
-| **Strategies** | strategy_id, objective, risk_aversion, benchmark, alpha/risk dates, solver, universe, use_barra_risk |
+| **Strategies** | strategy_id, name, active flag, objective, benchmark + universe index, solver, risk_aversion |
 | **Constraints** | Per-strategy rows — toggle `enabled` TRUE/FALSE without deleting |
 | **Alpha_Weights** | Model blend per strategy; multiple model_id rows, weights normalised automatically |
 | **Reference** | Read-only guide to all available models, objectives, and constraint keys |
@@ -360,15 +359,15 @@ flowchart LR
 ├── universe_loader.py              # Point-in-time / live universe loading and ISIN remapping
 ├── portfolio_analytics.py          # Live-portfolio analytics backend
 ├── utils.py                        # Shared: get_db, classify_sector, winsorized_zscore, apply_weight_cap, get_logger
-├── optimize_portfolio.py           # CVXPY optimiser — 3 objectives, 9 strategies
+├── optimize_portfolio.py           # CVXPY optimiser — 3 objective types, config-driven strategies
 ├── pipeline/
 │   ├── create_universe.py          # universe.db — company metadata, PIT Russell 1000 snapshots
-│   ├── create_databases.py         # constituents.db — initial SimFin load
+│   ├── create_databases.py         # constituents.db — legacy SimFin seed (EDGAR is the live source)
 │   ├── update_constituents.py      # Incremental EDGAR 10-Q/10-K fetcher
 │   ├── create_returns.py           # returns.db — daily prices, splits, synthetic benchmarks
 │   ├── create_svr.py               # FINRA short volume ratio
 │   ├── create_factors.py           # factors.db — 30+ factors × N snapshots
-│   ├── create_models.py            # models.db — 12 model scores × N snapshots
+│   ├── create_models.py            # models.db — research model scores × N snapshots
 │   ├── create_risk.py              # risk.db — Ledoit-Wolf covariance
 │   ├── create_barra.py             # risk.db — Barra factor risk model
 │   ├── create_macro_signals.py     # macro.db — FRED macro signals
@@ -405,7 +404,7 @@ flowchart LR
 
 ## Tests
 
-121 tests covering the layers where correctness is subtle — financial-statement parsing, factor math, the optimiser, and pipeline orchestration.
+150 tests covering the layers where correctness is subtle — financial-statement parsing, factor math, the optimiser, and pipeline orchestration. The 121-test core suite runs entirely offline; the remaining 29 EDGAR-parsing tests exercise live SEC fixtures and are skipped by the `--ignore` flag below.
 
 ```bash
 pytest tests/ -q                                          # full suite
