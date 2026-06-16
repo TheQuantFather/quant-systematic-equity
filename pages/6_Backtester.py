@@ -1,10 +1,14 @@
 """
-6_Backtester.py — Factor backtest and walk-forward optimised backtest.
+6_Backtester.py — signal backtest, optimised backtest, and signal diagnostics.
 
-Tab 1 — Factor Backtest  : rank stocks by model z-score, hold equal-weight top-N.
-Tab 2 — Optimised Backtest: CVXPY walk-forward with quarterly rebalancing,
+Tab 1 — Signal Backtest   : rank stocks by model z-score, hold equal-weight top-N.
+Tab 2 — Optimised Backtest : CVXPY walk-forward with quarterly rebalancing,
          two-way turnover constraint, Barra risk model, configurable universe,
          and per-trade EUR transaction costs.
+Tab 3 — Signal Diagnostics : holistic predictive-power view across all signals —
+         cumulative long-short curves, IC scorecard, IC decay, signal overlap.
+
+All controls live in-page per tab (no sidebar).
 """
 
 import io
@@ -18,16 +22,25 @@ import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 import db
-from config import MODELS_DB, PARAMS_FILE, RETURNS_DB, RISK_DB, UNIVERSE_DB
+from config import (
+    FACTORS_DB,
+    FACTORS_REF,
+    MODELS_DB,
+    PARAMS_FILE,
+    RETURNS_DB,
+    RISK_DB,
+    UNIVERSE_DB,
+)
 from utils import get_db, inject_css
 
 st.set_page_config(page_title="Backtester", layout="wide")
 inject_css()
-st.title("Factor Backtester")
+st.title("Backtester")
 
 RISK_FREE   = 0.04  # annualised, used for Sharpe
 N_QUINTILES = 5
 TC_EUR      = 2.0   # €2 per trade (DeGiro US stocks)
+SIGNAL_BACKTEST_START = "2021-05-31"
 
 
 # ---------------------------------------------------------------------------
@@ -42,6 +55,41 @@ def load_all_model_scores() -> pd.DataFrame:
         )
     df["model_value_z"] = pd.to_numeric(df["model_value_z"], errors="coerce")
     return df
+
+
+@st.cache_data
+def load_all_factor_scores() -> pd.DataFrame:
+    """Individual-factor z-scores, shaped exactly like model scores.
+
+    factors.db stores unsigned ``factor_value_z``; direction (±1) lives only in
+    factors_reference.csv. We apply it here so a higher score is always "better",
+    then rename ``factor_id`` → ``model_id`` so the whole backtest/diagnostics
+    machinery (which only reads ``model_value_z``) works unchanged.
+    """
+    ref     = pd.read_csv(FACTORS_REF)
+    dir_map = dict(zip(ref["factor_id"], pd.to_numeric(ref["direction"], errors="coerce")))
+    with get_db(FACTORS_DB) as conn:
+        df = pd.read_sql(
+            "SELECT data_date, factor_id, security_id, factor_value_z FROM factors", conn
+        )
+    z = pd.to_numeric(df["factor_value_z"], errors="coerce")
+    df["model_value_z"] = z * df["factor_id"].map(dir_map)
+    df = df.rename(columns={"factor_id": "model_id"})
+    return df[["data_date", "model_id", "security_id", "model_value_z"]].dropna(
+        subset=["model_value_z"]
+    )
+
+
+def _load_scores(source: str) -> pd.DataFrame:
+    """Score frame for the selected signal source ('model' or 'factor')."""
+    return load_all_factor_scores() if source == "factor" else load_all_model_scores()
+
+
+@st.cache_data
+def factor_label_map() -> dict[str, str]:
+    """factor_id → 'Factor Name (CATEGORY)' for the factor selectbox/diagnostics."""
+    ref = pd.read_csv(FACTORS_REF)
+    return {r["factor_id"]: f"{r['factor_name']}" for _, r in ref.iterrows()}
 
 
 @st.cache_data
@@ -64,7 +112,7 @@ def load_returns_matrix(min_isin_coverage: int = 200) -> pd.DataFrame:
 # Performance metrics
 # ---------------------------------------------------------------------------
 
-def perf_metrics(ret: pd.Series) -> dict:
+def perf_metrics(ret: pd.Series, subtract_risk_free: bool = True) -> dict:
     ret = ret.dropna()
     if len(ret) < 10:
         return {}
@@ -72,20 +120,34 @@ def perf_metrics(ret: pd.Series) -> dict:
     n_years = len(ret) / 252
     ann_ret = (1 + total) ** (1 / max(n_years, 1e-6)) - 1
     ann_vol = ret.std() * 252 ** 0.5
-    sharpe  = (ann_ret - RISK_FREE) / ann_vol if ann_vol > 0 else np.nan
+    sharpe  = (ann_ret - (RISK_FREE if subtract_risk_free else 0.0)) / ann_vol if ann_vol > 0 else np.nan
     cum     = (1 + ret).cumprod()
     max_dd  = (cum / cum.cummax() - 1).min()
+    downside = ret[ret < 0].std() * 252 ** 0.5
+    sortino = (ann_ret - (RISK_FREE if subtract_risk_free else 0.0)) / downside if downside > 0 else np.nan
+    calmar = ann_ret / abs(max_dd) if max_dd < 0 else np.nan
+    monthly = ret.resample("ME").apply(lambda x: (1 + x).prod() - 1)
     return {
         "Total return":    f"{total:+.1%}",
         "Ann. return":     f"{ann_ret:+.1%}",
         "Ann. volatility": f"{ann_vol:.1%}",
         "Sharpe ratio":    f"{sharpe:.2f}",
+        "Sortino ratio":   f"{sortino:.2f}" if pd.notna(sortino) else "—",
+        "Calmar ratio":    f"{calmar:.2f}" if pd.notna(calmar) else "—",
         "Max drawdown":    f"{max_dd:.1%}",
         "Daily win rate":  f"{(ret > 0).mean():.1%}",
+        "Positive months": f"{(monthly > 0).mean():.1%}" if len(monthly) else "—",
+        "Best month":      f"{monthly.max():+.1%}" if len(monthly) else "—",
+        "Worst month":     f"{monthly.min():+.1%}" if len(monthly) else "—",
     }
 
 
-def active_metrics(ret: pd.Series, bench: pd.Series, turnover_pct: float | None) -> dict:
+def active_metrics(
+    ret: pd.Series,
+    bench: pd.Series,
+    turnover_pct: float | None,
+    turnover_label: str = "Avg rebal. turnover (2-way)",
+) -> dict:
     common = ret.index.intersection(bench.index)
     if len(common) < 63:
         return {}
@@ -103,8 +165,49 @@ def active_metrics(ret: pd.Series, bench: pd.Series, turnover_pct: float | None)
         "Beta (vs benchmark)":  f"{beta:.2f}" if pd.notna(beta) else "—",
     }
     if turnover_pct is not None:
-        out["Avg rebal. turnover (2-way)"] = f"{turnover_pct:.0f}%"
+        out[turnover_label] = f"{turnover_pct:.0f}%"
     return out
+
+
+def _cumulative_spread_series(long_ret: pd.Series, short_ret: pd.Series) -> pd.Series:
+    common = long_ret.index.intersection(short_ret.index)
+    long_cum = (1 + long_ret.loc[common]).cumprod() - 1
+    short_cum = (1 + short_ret.loc[common]).cumprod() - 1
+    return long_cum - short_cum
+
+
+def spread_metrics(long_ret: pd.Series, short_ret: pd.Series, spread_daily: pd.Series) -> dict:
+    spread_cum = _cumulative_spread_series(long_ret, short_ret).dropna()
+    spread_daily = spread_daily.dropna()
+    if len(spread_cum) < 10 or len(spread_daily) < 10:
+        return {}
+    total = spread_cum.iloc[-1]
+    n_years = len(spread_daily) / 252
+    ann_ret = (1 + total) ** (1 / max(n_years, 1e-6)) - 1
+    ann_vol = spread_daily.std() * 252 ** 0.5
+    sharpe = ann_ret / ann_vol if ann_vol > 0 else np.nan
+    wealth = 1 + spread_cum
+    max_dd = (wealth / wealth.cummax() - 1).min()
+    downside = spread_daily[spread_daily < 0].std() * 252 ** 0.5
+    sortino = ann_ret / downside if downside > 0 else np.nan
+    calmar = ann_ret / abs(max_dd) if max_dd < 0 else np.nan
+    monthly = (
+        long_ret.resample("ME").apply(lambda x: (1 + x).prod() - 1)
+        - short_ret.resample("ME").apply(lambda x: (1 + x).prod() - 1)
+    ).dropna()
+    return {
+        "Total return":    f"{total:+.1%}",
+        "Ann. return":     f"{ann_ret:+.1%}",
+        "Ann. volatility": f"{ann_vol:.1%}",
+        "Sharpe ratio":    f"{sharpe:.2f}",
+        "Sortino ratio":   f"{sortino:.2f}" if pd.notna(sortino) else "—",
+        "Calmar ratio":    f"{calmar:.2f}" if pd.notna(calmar) else "—",
+        "Max drawdown":    f"{max_dd:.1%}",
+        "Daily win rate":  f"{(spread_daily > 0).mean():.1%}",
+        "Positive months": f"{(monthly > 0).mean():.1%}" if len(monthly) else "—",
+        "Best month":      f"{monthly.max():+.1%}" if len(monthly) else "—",
+        "Worst month":     f"{monthly.min():+.1%}" if len(monthly) else "—",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -118,16 +221,17 @@ def _cum_return_chart(
     cumulative_excess_series: pd.Series | None = None,
 ) -> go.Figure:
     """
-    Build a cumulative-return line chart. Every line is a cumulative total
-    return in %, starting at 0 — i.e. ((1 + r).cumprod() − 1) × 100.
-    Each trace dict: {series (raw returns), name, color, width=2, dash="solid"}.
+    Build a cumulative-return line chart. By default each line is a cumulative
+    total return in %, starting at 0 — i.e. ((1 + r).cumprod() − 1) × 100.
+    For precomputed cumulative-return series, set trace["cumulative"] = True.
+    Each trace dict: {series, name, color, width=2, dash="solid"}.
     Optional cumulative_excess_series is cumulative portfolio return minus
     cumulative benchmark return (a fraction); it is the gap between those two
     lines and is plotted as % on the SAME axis.
     """
     fig = go.Figure()
     for t in traces:
-        cum = ((1 + t["series"]).cumprod() - 1) * 100
+        cum = t["series"] * 100 if t.get("cumulative") else ((1 + t["series"]).cumprod() - 1) * 100
         fig.add_trace(go.Scatter(
             x=cum.index, y=cum.values, name=t["name"],
             line=dict(color=t["color"], width=t.get("width", 2), dash=t.get("dash", "solid")),
@@ -158,7 +262,7 @@ def _drawdown_chart(
     """
     fig = go.Figure()
     for t in traces:
-        cum  = (1 + t["series"]).cumprod()
+        cum  = 1 + t["series"] if t.get("cumulative") else (1 + t["series"]).cumprod()
         dd   = cum / cum.cummax() - 1
         kw: dict = {}
         if t.get("fill_color"):
@@ -337,8 +441,124 @@ def _annual_bar_chart(
 def _metrics_table(metrics: dict) -> None:
     st.dataframe(
         pd.DataFrame(metrics.items(), columns=["Metric", "Value"]),
-        hide_index=True, use_container_width=True,
+        hide_index=True, width="stretch",
     )
+
+
+def _metrics_comparison_table(metric_sets: dict[str, dict]) -> None:
+    preferred_order = [
+        "Total return",
+        "Ann. return",
+        "Ann. volatility",
+        "Sharpe ratio",
+        "Sortino ratio",
+        "Calmar ratio",
+        "Max drawdown",
+        "Daily win rate",
+        "Positive months",
+        "Best month",
+        "Worst month",
+        "Active return (ann.)",
+        "Tracking error",
+        "Information ratio",
+        "Beta (vs benchmark)",
+        "Avg rebal. turnover (2-way)",
+        "Avg turnover (2-way)",
+        "Avg monthly turnover (2-way)",
+    ]
+    metrics = []
+    seen = set()
+    for metric in preferred_order:
+        if any(metric in values for values in metric_sets.values()):
+            metrics.append(metric)
+            seen.add(metric)
+    for values in metric_sets.values():
+        for metric in values:
+            if metric not in seen:
+                metrics.append(metric)
+                seen.add(metric)
+
+    rows = []
+    for metric in metrics:
+        row = {"Metric": metric}
+        for label, values in metric_sets.items():
+            row[label] = values.get(metric, "")
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
+    value_cols = [c for c in df.columns if c != "Metric"]
+    lower_is_better = {
+        "Ann. volatility",
+        "Max drawdown",
+        "Tracking error",
+        "Avg rebal. turnover (2-way)",
+        "Avg turnover (2-way)",
+        "Avg monthly turnover (2-way)",
+        "Worst month",
+    }
+    higher_is_better = {
+        "Total return",
+        "Ann. return",
+        "Sharpe ratio",
+        "Sortino ratio",
+        "Calmar ratio",
+        "Daily win rate",
+        "Positive months",
+        "Best month",
+        "Active return (ann.)",
+        "Information ratio",
+    }
+
+    def _metric_value(v: object) -> float:
+        if v is None:
+            return np.nan
+        text = str(v).strip()
+        if not text or text == "—":
+            return np.nan
+        is_pct = text.endswith("%")
+        text = text.replace("%", "").replace("+", "").replace(",", "")
+        try:
+            val = float(text)
+        except ValueError:
+            return np.nan
+        return val / 100 if is_pct else val
+
+    def _style_row(row: pd.Series) -> list[str]:
+        metric = row["Metric"]
+        styles = ["font-weight: 600; background-color: rgba(15,23,42,0.04)"]
+        vals = pd.Series({_c: _metric_value(row[_c]) for _c in value_cols}).dropna()
+        if metric in lower_is_better and len(vals) > 1:
+            score = (vals.max() - vals) / (vals.max() - vals.min()) if vals.max() != vals.min() else vals * 0 + 0.5
+        elif metric in higher_is_better and len(vals) > 1:
+            score = (vals - vals.min()) / (vals.max() - vals.min()) if vals.max() != vals.min() else vals * 0 + 0.5
+        else:
+            return styles + ["" for _ in value_cols]
+        for col in value_cols:
+            if col not in score:
+                styles.append("")
+                continue
+            s = float(score[col])
+            if s >= 0.5:
+                alpha = 0.06 + (s - 0.5) * 0.32
+                styles.append(f"background-color: rgba(34,197,94,{alpha:.3f}); font-weight: {600 if s >= 0.85 else 400}")
+            else:
+                alpha = 0.06 + (0.5 - s) * 0.28
+                styles.append(f"background-color: rgba(239,68,68,{alpha:.3f})")
+        return styles
+
+    st.dataframe(df.style.apply(_style_row, axis=1), hide_index=True, width="stretch")
+
+
+def _align_benchmark_for_eval(
+    port: pd.Series,
+    bench: pd.Series,
+) -> tuple[pd.Series, pd.Series, float]:
+    if port.empty or bench.empty:
+        return port.iloc[0:0], bench.iloc[0:0], 0.0
+    bench_aligned = bench.reindex(port.index)
+    valid_idx = bench_aligned.dropna().index
+    coverage = len(valid_idx) / len(port) if len(port) else 0.0
+    return port.loc[valid_idx], bench_aligned.loc[valid_idx], coverage
 
 
 def _sector_chart(df: pd.DataFrame, title: str, color: str) -> go.Figure:
@@ -365,14 +585,28 @@ def _sector_chart(df: pd.DataFrame, title: str, color: str) -> go.Figure:
 # ---------------------------------------------------------------------------
 
 def run_backtest(
-    model_id, n_long, include_short, n_short, sel_sectors
-) -> tuple[pd.Series | None, pd.Series | None, pd.Series | None, list, str | None]:
+    model_id: str,
+    portfolio_mode: str,
+    bucket_pct: int,
+    universe_name: str,
+    sel_sectors: list,
+    source: str = "model",
+) -> tuple[
+    pd.Series | None,
+    pd.Series | None,
+    pd.Series | None,
+    pd.Series | None,
+    list,
+    str | None,
+]:
     if not RETURNS_DB.exists():
-        return None, None, None, [], "returns.db not found — run `create_returns.py --update`."
-    if not MODELS_DB.exists():
-        return None, None, None, [], "models.db not found — run `create_models.py`."
+        return None, None, None, None, [], "returns.db not found — run `create_returns.py --update`."
+    if source == "model" and not MODELS_DB.exists():
+        return None, None, None, None, [], "models.db not found — run `create_models.py`."
+    if source == "factor" and not FACTORS_DB.exists():
+        return None, None, None, None, [], "factors.db not found — run `create_factors.py`."
 
-    scores     = load_all_model_scores()
+    scores     = _load_scores(source)
     ret_matrix = load_returns_matrix()
     ticker_map = db.get_ticker_map()
 
@@ -382,13 +616,28 @@ def run_backtest(
     name_map   = dict(zip(uni["security_id"], uni["company_name"]))
 
     model_df = scores[scores["model_id"] == model_id].copy().dropna(subset=["model_value_z"])
+    sector_isins = None
     if sel_sectors:
-        valid = set(uni[uni["sector"].isin(sel_sectors)]["security_id"])
-        model_df = model_df[model_df["security_id"].isin(valid)]
+        sector_isins = set(uni[uni["sector"].isin(sel_sectors)]["security_id"])
+        model_df = model_df[model_df["security_id"].isin(sector_isins)]
 
-    snapshot_dates = sorted(model_df["data_date"].unique())
+    with get_db(UNIVERSE_DB) as conn:
+        universe_dates = sorted(r[0] for r in conn.execute(
+            "SELECT DISTINCT snapshot_date FROM universe_snapshots WHERE index_name = ?",
+            (universe_name,),
+        ).fetchall())
+    if not universe_dates:
+        return None, None, None, None, [], f"No universe snapshots found for '{universe_name}'."
+
+    snapshot_dates = [
+        d for d in sorted(model_df["data_date"].unique())
+        if d >= SIGNAL_BACKTEST_START
+    ]
     if len(snapshot_dates) < 2:
-        return None, None, None, [], "Need at least 2 snapshot dates for a backtest."
+        return None, None, None, None, [], (
+            f"Need at least 2 snapshot dates on or after {SIGNAL_BACKTEST_START} "
+            "for a backtest."
+        )
 
     trading_index = ret_matrix.index
 
@@ -406,7 +655,8 @@ def run_backtest(
             "Price data": "✓" if isin in price_cols else "—",
         } for rank, isin in enumerate(isins, 1)])
 
-    long_parts, bench_parts, short_parts, holdings_log = [], [], [], []
+    include_short = portfolio_mode == "Long-short"
+    long_parts, bench_parts, short_parts, strategy_parts, holdings_log = [], [], [], [], []
 
     for i, snap in enumerate(snapshot_dates):
         next_snap = (
@@ -418,11 +668,27 @@ def run_backtest(
         if t_start is None or t_end is None or t_start >= t_end:
             continue
 
-        snap_df     = model_df[model_df["data_date"] == snap].dropna(subset=["model_value_z"])
+        uni_snap = _find_nearest_before(snap, universe_dates)
+        if uni_snap is None:
+            continue
+        universe_isins = set(db.get_universe_isins_at_date(universe_name, uni_snap))
+        benchmark_isins = (
+            universe_isins if sector_isins is None else universe_isins & sector_isins
+        )
+        snap_df = (
+            model_df[model_df["data_date"] == snap]
+            .dropna(subset=["model_value_z"])
+        )
+        snap_df = snap_df[snap_df["security_id"].isin(universe_isins)]
+        if snap_df.empty:
+            continue
+        bucket_n = max(1, int(np.ceil(len(snap_df) * bucket_pct / 100.0)))
+        if include_short:
+            bucket_n = min(bucket_n, max(1, len(snap_df) // 2))
         score_lkp   = dict(zip(snap_df["security_id"], snap_df["model_value_z"]))
-        long_isins  = snap_df.nlargest(n_long, "model_value_z")["security_id"].tolist()
+        long_isins  = snap_df.nlargest(bucket_n, "model_value_z")["security_id"].tolist()
         short_isins = (
-            snap_df.nsmallest(n_short, "model_value_z")["security_id"].tolist()
+            snap_df.nsmallest(bucket_n, "model_value_z")["security_id"].tolist()
             if include_short else []
         )
         period     = ret_matrix.loc[(ret_matrix.index >= t_start) & (ret_matrix.index < t_end)]
@@ -432,25 +698,36 @@ def run_backtest(
             cols = [s for s in isins if s in price_cols]
             return period[cols].mean(axis=1) if cols else pd.Series(0.0, index=period.index)
 
-        long_parts.append(ew(long_isins))
-        bench_parts.append(ew(snap_df["security_id"].tolist()))
+        long_ret = ew(long_isins)
+        long_parts.append(long_ret)
+        bench_parts.append(ew(sorted(benchmark_isins)))
         if include_short:
-            short_parts.append(ew(short_isins))
+            short_ret = ew(short_isins)
+            short_parts.append(short_ret)
+            strategy_parts.append(long_ret - short_ret)
+        else:
+            strategy_parts.append(long_ret)
 
         holdings_log.append({
             "label":       f"{snap[:10]}  →  {next_snap[:10]}",
+            "snap_date":   snap[:10],
+            "universe":    universe_name,
+            "universe_snapshot": uni_snap,
             "long":        holdings_df(long_isins,  score_lkp, price_cols),
             "short":       holdings_df(short_isins, score_lkp, price_cols) if include_short else None,
             "long_isins":  long_isins,
             "short_isins": short_isins,
+            "bench_isins": sorted(benchmark_isins),
+            "bucket_pct":  bucket_pct,
         })
 
     if not long_parts:
-        return None, None, None, [], "No overlapping price data found for this model and date range."
+        return None, None, None, None, [], "No overlapping price data found for this model and date range."
 
     return (
         pd.concat(long_parts).sort_index(),
         pd.concat(short_parts).sort_index() if include_short and short_parts else None,
+        pd.concat(strategy_parts).sort_index(),
         pd.concat(bench_parts).sort_index(),
         holdings_log,
         None,
@@ -461,8 +738,10 @@ def run_backtest(
 # Quintile analysis
 # ---------------------------------------------------------------------------
 
-def run_quintile_analysis(model_id: str, sel_sectors: list) -> list[pd.Series]:
-    scores     = load_all_model_scores()
+def run_quintile_analysis(
+    model_id: str, universe_name: str, sel_sectors: list, source: str = "model"
+) -> list[pd.Series]:
+    scores     = _load_scores(source)
     ret_matrix = load_returns_matrix()
     model_df   = scores[scores["model_id"] == model_id].dropna(subset=["model_value_z"]).copy()
 
@@ -471,6 +750,14 @@ def run_quintile_analysis(model_id: str, sel_sectors: list) -> list[pd.Series]:
         uni["security_id"] = uni["security_id"].astype(str)
         valid    = set(uni[uni["sector"].isin(sel_sectors)]["security_id"])
         model_df = model_df[model_df["security_id"].isin(valid)]
+
+    with get_db(UNIVERSE_DB) as conn:
+        universe_dates = sorted(r[0] for r in conn.execute(
+            "SELECT DISTINCT snapshot_date FROM universe_snapshots WHERE index_name = ?",
+            (universe_name,),
+        ).fetchall())
+    if not universe_dates:
+        return [pd.Series(dtype=float) for _ in range(N_QUINTILES)]
 
     snapshot_dates = sorted(model_df["data_date"].unique())
     trading_index  = ret_matrix.index
@@ -493,7 +780,14 @@ def run_quintile_analysis(model_id: str, sel_sectors: list) -> list[pd.Series]:
         snap_df = model_df[model_df["data_date"] == snap].sort_values(
             "model_value_z", ascending=False
         ).reset_index(drop=True)
+        uni_snap = _find_nearest_before(snap, universe_dates)
+        if uni_snap is None:
+            continue
+        universe_isins = set(db.get_universe_isins_at_date(universe_name, uni_snap))
+        snap_df = snap_df[snap_df["security_id"].isin(universe_isins)].reset_index(drop=True)
         n      = len(snap_df)
+        if n < N_QUINTILES:
+            continue
         period = ret_matrix.loc[(ret_matrix.index >= t_start) & (ret_matrix.index < t_end)]
         for q in range(N_QUINTILES):
             isins = snap_df.iloc[int(q * n / N_QUINTILES):int((q + 1) * n / N_QUINTILES)]["security_id"].tolist()
@@ -509,16 +803,334 @@ def run_quintile_analysis(model_id: str, sel_sectors: list) -> list[pd.Series]:
 # Factor backtest helpers
 # ---------------------------------------------------------------------------
 
-def _compute_turnover(holdings_log: list) -> list[dict]:
-    rows, prev = [], set()
+def _filter_holdings_log(holdings_log: list, start: pd.Timestamp, end: pd.Timestamp) -> list[dict]:
+    rows = [
+        p for p in holdings_log
+        if start <= pd.Timestamp(p.get("snap_date", p["label"].split("→")[0].strip())) <= end
+    ]
+    return rows or holdings_log
+
+
+def _equal_weight_dict(isins: list[str], gross: float = 1.0) -> dict[str, float]:
+    if not isins:
+        return {}
+    w = gross / len(isins)
+    return {isin: w for isin in isins}
+
+
+def _two_way_turnover(curr: dict[str, float], prev: dict[str, float]) -> float:
+    names = set(curr) | set(prev)
+    return 0.5 * sum(abs(curr.get(isin, 0.0) - prev.get(isin, 0.0)) for isin in names)
+
+
+def _compute_turnover(holdings_log: list, include_short: bool = False) -> list[dict]:
+    rows = []
+    prev_strategy: dict[str, float] | None = None
+    prev_benchmark: dict[str, float] | None = None
+    prev_date: pd.Timestamp | None = None
     for p in holdings_log:
-        curr = set(p.get("long_isins", []))
-        if not curr:
+        snap_date = pd.Timestamp(p.get("snap_date", p["label"].split("→")[0].strip()))
+        strategy_gross = 2.0 if include_short else 1.0
+        long_w = _equal_weight_dict(p.get("long_isins", []), 1.0 / strategy_gross)
+        if include_short:
+            short_w = _equal_weight_dict(p.get("short_isins", []), -1.0 / strategy_gross)
+            curr_strategy = {**long_w, **short_w}
+        else:
+            curr_strategy = long_w
+        curr_benchmark = _equal_weight_dict(p.get("bench_isins", []), 1.0)
+        if not curr_strategy:
             continue
-        to = len(curr - prev) / len(curr) * 100 if prev else 100.0
-        rows.append({"Period": p["label"].split("→")[0].strip(), "Turnover (%)": round(to, 1)})
-        prev = curr
+        if prev_strategy is not None and prev_date is not None:
+            months = max((snap_date - prev_date).days / (365.25 / 12), 1e-6)
+            strategy_period_turnover = _two_way_turnover(curr_strategy, prev_strategy) * 100
+            benchmark_period_turnover = (
+                _two_way_turnover(curr_benchmark, prev_benchmark) * 100
+                if prev_benchmark is not None else np.nan
+            )
+            rows.append({
+                "Period": p["label"].split("→")[0].strip(),
+                "Months": round(months, 2),
+                "Strategy monthly turnover (%)": round(strategy_period_turnover / months, 1),
+                "Benchmark monthly turnover (%)": round(benchmark_period_turnover / months, 1)
+                if pd.notna(benchmark_period_turnover) else np.nan,
+                "Strategy period turnover (%)": round(strategy_period_turnover, 1),
+                "Benchmark period turnover (%)": round(benchmark_period_turnover, 1)
+                if pd.notna(benchmark_period_turnover) else np.nan,
+            })
+        prev_strategy = curr_strategy
+        prev_benchmark = curr_benchmark
+        prev_date = snap_date
     return rows
+
+
+def _aggregate_monthly_turnover(turnover_rows: list[dict]) -> list[dict]:
+    if not turnover_rows:
+        return []
+    df = pd.DataFrame(turnover_rows).copy()
+    df["Month"] = pd.to_datetime(df["Period"]) + pd.offsets.MonthEnd(0)
+    grouped = (
+        df.groupby("Month", as_index=False)
+        .agg({
+            "Strategy period turnover (%)": "sum",
+            "Benchmark period turnover (%)": "sum",
+            "Period": "count",
+        })
+        .rename(columns={"Period": "Rebalances"})
+    )
+    grouped["Period"] = grouped["Month"].dt.strftime("%Y-%m-%d")
+    grouped["Strategy monthly turnover (%)"] = grouped["Strategy period turnover (%)"].round(1)
+    grouped["Benchmark monthly turnover (%)"] = grouped["Benchmark period turnover (%)"].round(1)
+    return grouped[[
+        "Period",
+        "Rebalances",
+        "Strategy monthly turnover (%)",
+        "Benchmark monthly turnover (%)",
+    ]].to_dict("records")
+
+
+# ---------------------------------------------------------------------------
+# Signal diagnostics helpers (Tab 3)
+#
+# Holistic, all-signals-at-once predictive-power analysis: how well does each
+# model's z-score forecast forward returns, BEFORE any optimizer/constraints.
+# Cross-sectional rank IC is the workhorse; everything reuses the model-score
+# and returns matrices already loaded for the backtests.
+# ---------------------------------------------------------------------------
+
+DECAY_HORIZONS = (1, 3, 6, 12)   # forward horizons, in snapshots
+_MIN_XS = 30                     # min cross-section size to score a date
+
+
+def _periods_per_year(snaps: list[str]) -> float:
+    """Annualisation factor from the median spacing of snapshot dates."""
+    ts = pd.to_datetime(snaps)
+    gaps = np.diff(ts.values).astype("timedelta64[D]").astype(float)
+    med = np.median(gaps) if len(gaps) else 30.0
+    return 365.25 / med if med > 0 else 12.0
+
+
+def _forward_returns(ret: pd.DataFrame, snap_ts: list, snaps: list[str], k: int) -> dict:
+    """{data_date: Series(isin -> compounded total return from snap[i] to snap[i+k])}."""
+    out = {}
+    for i in range(len(snaps) - k):
+        sl = ret.loc[(ret.index > snap_ts[i]) & (ret.index <= snap_ts[i + k])]
+        if not sl.empty:
+            out[snaps[i]] = (1.0 + sl).prod(min_count=1) - 1.0
+    return out
+
+
+def _ic_series(score_wide: pd.DataFrame, fwd: dict, sec_map: dict | None) -> pd.Series:
+    """Per-date cross-sectional rank IC of a signal vs forward return.
+
+    score_wide: index=data_date, columns=isin, values=directional z-score.
+    sec_map: if given, demean signal & forward return within GICS sector first
+             (sector-neutral IC), isolating stock selection from sector tilt.
+    """
+    ics = {}
+    for d, fr in fwd.items():
+        if d not in score_wide.index:
+            continue
+        s = score_wide.loc[d]
+        df = pd.concat([s.rename("sig"), fr.rename("fwd")], axis=1).dropna()
+        if len(df) < _MIN_XS:
+            continue
+        if sec_map is not None:
+            df["sec"] = df.index.map(sec_map)
+            df = df.dropna(subset=["sec"])
+            df["sig"] = df["sig"] - df.groupby("sec")["sig"].transform("mean")
+            df["fwd"] = df["fwd"] - df.groupby("sec")["fwd"].transform("mean")
+            if len(df) < _MIN_XS:
+                continue
+        ic = df["sig"].corr(df["fwd"], method="spearman")
+        if pd.notna(ic):
+            ics[d] = ic
+    return pd.Series(ics).sort_index()
+
+
+def _decile_panel(score_wide: pd.DataFrame, fwd: dict) -> tuple[pd.Series, pd.Series]:
+    """Per-date (top-minus-bottom-decile forward return, monotonicity ρ).
+
+    The spread series IS a long-short decile portfolio return per period: compound it
+    for the cumulative signal curve, average it for the headline D10-D1 stat.
+    """
+    spreads, monos = {}, {}
+    for d, fr in fwd.items():
+        if d not in score_wide.index:
+            continue
+        df = pd.concat([score_wide.loc[d].rename("sig"), fr.rename("fwd")], axis=1).dropna()
+        if len(df) < _MIN_XS:
+            continue
+        try:
+            df["dec"] = pd.qcut(df["sig"].rank(method="first"), 10, labels=False)
+        except ValueError:
+            continue
+        m = df.groupby("dec")["fwd"].mean()
+        if len(m) < 10:
+            continue
+        spreads[d] = m.iloc[-1] - m.iloc[0]
+        monos[d] = pd.Series(m.values).corr(pd.Series(range(10)), method="spearman")
+    return pd.Series(spreads).sort_index(), pd.Series(monos)
+
+
+def _persistence(score_wide: pd.DataFrame) -> float:
+    """Mean rank autocorrelation of the signal across consecutive snapshots (1 = no turnover)."""
+    idx = list(score_wide.index)
+    acs = [score_wide.loc[a].corr(score_wide.loc[b], method="spearman")
+           for a, b in zip(idx[:-1], idx[1:])]
+    acs = [a for a in acs if pd.notna(a)]
+    return float(np.mean(acs)) if acs else np.nan
+
+
+def _window_control(snaps: list[str], prefix: str) -> tuple[str, str]:
+    """A date-range control: quick presets + a slider snapped to real snapshot dates.
+
+    Replaces the old sidebar date_input. `prefix` namespaces the widget keys so the
+    same control can appear on more than one tab without colliding. Returns (lo, hi).
+    """
+    legacy_key = f"{prefix}_window"
+    state_key = f"{prefix}_window_value"
+    version_key = f"{prefix}_window_version"
+    default_window = (snaps[0], snaps[-1])
+    current_window = st.session_state.get(
+        state_key,
+        st.session_state.get(legacy_key, default_window),
+    )
+    if (
+        not isinstance(current_window, (list, tuple))
+        or len(current_window) != 2
+        or current_window[0] not in snaps
+        or current_window[1] not in snaps
+    ):
+        current_window = default_window
+    st.session_state[state_key] = tuple(current_window)
+    if version_key not in st.session_state:
+        st.session_state[version_key] = 0
+
+    def _on_or_after(cutoff: pd.Timestamp) -> str:
+        for s in snaps:
+            if pd.Timestamp(s) >= cutoff:
+                return s
+        return snaps[-1]
+
+    last = pd.Timestamp(snaps[-1])
+    presets = [
+        ("All", snaps[0]),
+        ("5Y",  _on_or_after(last - pd.DateOffset(years=5))),
+        ("3Y",  _on_or_after(last - pd.DateOffset(years=3))),
+        ("1Y",  _on_or_after(last - pd.DateOffset(years=1))),
+        ("YTD", _on_or_after(last.replace(month=1, day=1))),
+    ]
+    cols = st.columns([1, 1, 1, 1, 1, 5])
+    for col, (lbl, lo) in zip(cols, presets):
+        if col.button(lbl, width="stretch", key=f"{prefix}_{lbl}"):
+            st.session_state[state_key] = (lo, snaps[-1])
+            st.session_state[version_key] += 1
+    selected = st.select_slider(
+        "Analysis window",
+        options=snaps,
+        value=st.session_state[state_key],
+        key=f"{prefix}_window_slider_{st.session_state[version_key]}",
+        format_func=lambda d: pd.Timestamp(d).strftime("%b %Y"),
+    )
+    if not isinstance(selected, (list, tuple)) or len(selected) != 2:
+        st.session_state[state_key] = default_window
+        return default_window
+    st.session_state[state_key] = (selected[0], selected[1])
+    return selected[0], selected[1]
+
+
+@st.cache_data(show_spinner="Computing signal diagnostics …")
+def compute_signal_diagnostics(
+    date_lo: str, date_hi: str, sectors: tuple, source: str = "model"
+) -> dict:
+    """All-signal predictive-power diagnostics over the selected window/sectors.
+
+    Returns dict of: summary (DataFrame), decay (DataFrame: signal × horizon),
+    ic_series (DataFrame: date × signal, horizon-1 IC), ppy (float), n_snaps (int).
+    Works for either composed models (source='model') or raw factors
+    (source='factor'), since both expose a directional ``model_value_z``.
+    """
+    if source == "factor":
+        labels  = factor_label_map()
+        ordered = list(labels.keys())
+    else:
+        meta    = db.get_model_metadata()
+        labels  = dict(zip(meta["ModelID"], meta["Model"]))
+        ordered = (["ALP001"] +
+                   [m for m in meta.sort_values("ModelID")["ModelID"] if m != "ALP001"])
+
+    scores = _load_scores(source)
+    scores = scores[(scores["data_date"] >= date_lo) & (scores["data_date"] <= date_hi)]
+    ret    = load_returns_matrix()
+
+    uni = db.get_universe()[["security_id", "gics_sector"]].dropna()
+    sec_map = dict(zip(uni["security_id"], uni["gics_sector"]))
+    if sectors:
+        keep = set(uni[uni["gics_sector"].isin(sectors)]["security_id"])
+        scores = scores[scores["security_id"].isin(keep)]
+
+    snaps = sorted(scores["data_date"].unique())
+    if len(snaps) < 6:
+        return {"summary": pd.DataFrame(), "decay": pd.DataFrame(),
+                "ic_series": pd.DataFrame(), "ls_curves": pd.DataFrame(),
+                "ppy": np.nan, "n_snaps": len(snaps)}
+    snap_ts = [pd.Timestamp(s) for s in snaps]
+    ppy = _periods_per_year(snaps)
+
+    fwd_by_h = {h: _forward_returns(ret, snap_ts, snaps, h) for h in DECAY_HORIZONS}
+
+    # one wide z-score frame (date × isin) per model, computed once and reused
+    wides = {mid: g.pivot_table(index="data_date", columns="security_id",
+                                values="model_value_z")
+             for mid, g in scores.groupby("model_id")}
+
+    summary_rows, decay_rows, ic_h1, ls_curves = [], [], {}, {}
+    for mid in ordered:
+        sw = wides.get(mid)
+        if sw is None or sw.empty:
+            continue
+        s_raw = _ic_series(sw, fwd_by_h[1], None)
+        if s_raw.empty:
+            continue
+        label = f"{labels.get(mid, mid)} ({mid})"
+        ic_h1[mid] = s_raw
+        s_neu = _ic_series(sw, fwd_by_h[1], sec_map)
+        sd = s_raw.std()
+        spread_s, mono_s = _decile_panel(sw, fwd_by_h[1])
+        if not spread_s.empty:
+            # cumulative long-short decile P&L, indexed at the close of each period
+            ls_curves[label] = (1.0 + spread_s).cumprod()
+        summary_rows.append({
+            "Signal": label,
+            "n": len(s_raw),
+            "IC": round(s_raw.mean(), 4),
+            "IC-IR": round(s_raw.mean() / sd * np.sqrt(ppy), 2) if sd else np.nan,
+            "t-stat": round(s_raw.mean() / sd * np.sqrt(len(s_raw)), 2) if sd else np.nan,
+            "hit %": round(100 * (s_raw > 0).mean(), 0),
+            "neutral IC": round(s_neu.mean(), 4) if not s_neu.empty else np.nan,
+            "D10-D1": round(spread_s.mean(), 4) if not spread_s.empty else np.nan,
+            "monotonic": round(float(mono_s.mean()), 2) if not mono_s.empty else np.nan,
+            "persist": round(_persistence(sw), 2),
+        })
+        drow = {"Signal": label}
+        for h in DECAY_HORIZONS:
+            si = _ic_series(sw, fwd_by_h[h], None)
+            drow[f"h={h}"] = round(si.mean(), 4) if not si.empty else np.nan
+        decay_rows.append(drow)
+
+    ls_df = pd.DataFrame(ls_curves)
+    if not ls_df.empty:
+        ls_df.index = pd.to_datetime(ls_df.index)
+        ls_df = ls_df.sort_index()
+
+    return {
+        "summary":   pd.DataFrame(summary_rows),
+        "decay":     pd.DataFrame(decay_rows),
+        "ic_series": pd.DataFrame(ic_h1),
+        "ls_curves": ls_df,
+        "ppy":       ppy,
+        "n_snaps":   len(snaps),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -720,11 +1332,11 @@ def _run_optimised_backtest(
                 break
 
         if opt_result is None:
+            if prev_weights is None:
+                warnings.append(f"{snap_date}: optimization failed before any portfolio was built — skipped.")
+                continue
             warnings.append(f"{snap_date}: optimization failed — carrying forward previous weights.")
-            new_weights: dict[str, float] = (
-                prev_weights if prev_weights is not None
-                else {isin: 1.0 / min(100, len(uni_isins)) for isin in uni_isins[:100]}
-            )
+            new_weights: dict[str, float] = prev_weights
             opt_metrics: dict = {}
         else:
             new_weights, opt_metrics = opt_result
@@ -972,64 +1584,262 @@ def _build_backtest_workbook(
 
 
 # ---------------------------------------------------------------------------
-# Sidebar
+# Shared metadata (controls now live in-page, per tab — no sidebar)
 # ---------------------------------------------------------------------------
 
-with st.sidebar:
-    st.header("Strategy settings")
-
-    model_meta    = db.get_model_metadata()
-    model_options = {f"{r['Model']} ({r['ModelID']})": r["ModelID"]
-                     for _, r in model_meta.iterrows()}
-    sel_model_label = st.selectbox("Model", list(model_options.keys()))
-    sel_model_id    = model_options[sel_model_label]
-
-    n_long = st.slider("Long portfolio size (top N)", 10, 200, 50, step=10)
-
-    include_short = st.toggle("Add short leg", value=False)
-    n_short = st.slider("Short portfolio size (bottom N)", 10, 200, 50, step=10) if include_short else 0
-
-    st.divider()
-
-    all_sectors = sorted(db.get_universe()["sector"].dropna().unique())
-    sel_sectors = st.multiselect("Sector filter", all_sectors, placeholder="All sectors")
-
-    st.divider()
-
-    date_range = st.date_input(
-        "Date range",
-        value=(pd.Timestamp("2021-04-01").date(), pd.Timestamp.today().date()),
-        min_value=pd.Timestamp("2020-01-01").date(),
-        max_value=pd.Timestamp.today().date(),
-    )
-
-    st.divider()
-    st.caption(
-        "Equal-weight within each leg.  \n"
-        "Rebalances at each quarterly factor snapshot."
-    )
+model_meta    = db.get_model_metadata()
+model_options = {f"{r['Model']} ({r['ModelID']})": r["ModelID"]
+                 for _, r in model_meta.iterrows()}
+all_sectors   = sorted(db.get_universe()["sector"].dropna().unique())
 
 
 # ---------------------------------------------------------------------------
 # Tabs
 # ---------------------------------------------------------------------------
 
-tab1, tab2 = st.tabs(["Factor Backtest", "Optimised Backtest"])
+tab1, tab2, tab3 = st.tabs(["Signal Backtest", "Optimised Backtest", "Signal Diagnostics"])
 
 
 # ===========================================================================
-# Tab 1 — Factor Backtest
+# Tab 3 — Signal Diagnostics (holistic, all signals at once)
+# ===========================================================================
+
+with tab3:
+    st.caption(
+        "Predictive power of every signal's z-score vs realised forward returns — "
+        "**before** the optimizer and its constraints. This isolates *does the signal "
+        "forecast* from *does the optimized book make money*. Cross-sectional rank IC "
+        "(Spearman), direction-adjusted, over the window and sectors selected below."
+    )
+
+    diag_source_label = st.segmented_control(
+        "Signal type", ["Models", "Factors"], default="Models", key="diag_source",
+        help="Models = composed alpha signals (models.db). Factors = the individual raw "
+             "factors (factors.db) that feed them, direction-adjusted — use this to see "
+             "which factors carry the IC and where models can improve.",
+    )
+    diag_source = "factor" if diag_source_label == "Factors" else "model"
+
+    sel_sectors_diag = st.multiselect("Sector filter", all_sectors,
+                                      placeholder="All sectors", key="diag_sectors")
+    all_snaps = sorted(_load_scores(diag_source)["data_date"].unique())
+    _lo, _hi = _window_control(all_snaps, "diag")
+
+    diag = compute_signal_diagnostics(
+        _lo, _hi, tuple(sorted(sel_sectors_diag)), source=diag_source
+    )
+
+    if diag["summary"].empty:
+        st.warning("Not enough snapshots in the selected window/sectors to compute IC.")
+    else:
+        ppy = diag["ppy"]
+        st.markdown(
+            f"**{diag['n_snaps']} snapshots** · {_lo} → {_hi} · median spacing ≈ "
+            f"{365.25 / ppy:.0f} days (annualisation ≈ ×{ppy:.0f})"
+        )
+
+        # ---- 0. Cumulative long-short performance (headline) -------------
+        ls = diag["ls_curves"]
+        if not ls.empty:
+            st.subheader("Cumulative signal performance")
+            st.caption(
+                "Each line compounds a **long top-decile / short bottom-decile** portfolio "
+                "for that signal, rebalanced every snapshot — the economic payoff behind the "
+                "IC. Gross of costs and constraints (raw signal, not the optimized book), "
+                "re-based to 1.0 at the window start."
+            )
+            fig_ls = go.Figure()
+            for sig in ls.columns:
+                s = ls[sig].dropna()
+                if s.empty:
+                    continue
+                s = s / s.iloc[0]
+                emph = sig.endswith("(ALP001)")
+                fig_ls.add_trace(go.Scatter(
+                    x=s.index, y=s.values, name=sig.split(" (")[0], mode="lines",
+                    line=dict(width=3 if emph else 1.2,
+                              color="#111827" if emph else None),
+                ))
+            fig_ls.add_hline(y=1.0, line_dash="dot", line_color="#9ca3af")
+            fig_ls.update_layout(
+                height=460, yaxis_title="growth of 1.0 (long-short)",
+                hovermode="x unified", margin=dict(l=0, r=0, t=10, b=0),
+                legend=dict(font=dict(size=10)),
+            )
+            st.plotly_chart(fig_ls, width="stretch")
+
+        # ---- 1. Cross-signal IC scorecard --------------------------------
+        st.subheader("Signal scorecard")
+        st.caption(
+            "One row per signal at the 1-snapshot horizon. **IC** = mean rank correlation "
+            "(0.02–0.05 is a strong equity factor; **t-stat > 2** ≈ reliable). "
+            "**neutral IC** strips the GICS-sector tilt — a big drop means the signal is "
+            "mostly a sector bet the optimizer neutralises away. **D10-D1** = top-minus-"
+            "bottom decile forward return; **monotonic** (−1…1) checks the deciles line up. "
+            "**persist** = rank autocorrelation (low = high turnover)."
+        )
+        summ = diag["summary"]
+
+        def _hl_ic(v):
+            try:
+                v = float(v)
+            except (TypeError, ValueError):
+                return ""
+            if v >= 0.03:
+                return "background-color: rgba(34,197,94,0.18)"
+            if v <= 0:
+                return "background-color: rgba(239,68,68,0.18)"
+            return ""
+
+        def _hl_t(v):
+            try:
+                return "font-weight: 700" if abs(float(v)) >= 2 else ""
+            except (TypeError, ValueError):
+                return ""
+
+        styled = (summ.style
+                  .map(_hl_ic, subset=["IC", "neutral IC"])
+                  .map(_hl_t, subset=["t-stat"])
+                  .format({"IC": "{:.4f}", "neutral IC": "{:.4f}", "IC-IR": "{:.2f}",
+                           "t-stat": "{:.2f}", "hit %": "{:.0f}", "D10-D1": "{:.4f}",
+                           "monotonic": "{:.2f}", "persist": "{:.2f}"}))
+        st.dataframe(styled, width="stretch", hide_index=True)
+
+        c1, c2 = st.columns(2)
+
+        # ---- 2. IC decay across horizons ---------------------------------
+        with c1:
+            st.subheader("IC decay")
+            st.caption(
+                "Mean IC as the forecast horizon lengthens. Lines that **rise** = slow, "
+                "long-horizon signals (hold them; monthly churn wastes them); lines that "
+                "**fade** = fast signals. Overlapping windows inflate the far-right points, "
+                "so read the shape, not the absolute level."
+            )
+            decay = diag["decay"].set_index("Signal")
+            fig_d = go.Figure()
+            for sig in decay.index:
+                emph = sig.endswith("(ALP001)")
+                fig_d.add_trace(go.Scatter(
+                    x=[h.replace("h=", "") for h in decay.columns],
+                    y=decay.loc[sig].values, name=sig.split(" (")[0],
+                    mode="lines+markers",
+                    line=dict(width=3 if emph else 1.3,
+                              color="#111827" if emph else None),
+                ))
+            fig_d.update_layout(
+                height=420, xaxis_title="forward horizon (snapshots)", yaxis_title="mean IC",
+                margin=dict(l=0, r=0, t=10, b=0), legend=dict(font=dict(size=10)),
+            )
+            fig_d.add_hline(y=0, line_dash="dot", line_color="#9ca3af")
+            st.plotly_chart(fig_d, width="stretch")
+
+        # ---- 3. Cross-signal IC correlation ------------------------------
+        with c2:
+            st.subheader("Signal overlap")
+            st.caption(
+                "Correlation of the per-date IC series across signals. **High positive** = "
+                "two signals make the same forecast, so blending them adds no breadth "
+                "(IR = IC·√breadth). Look for low/negative pairs — those are the real "
+                "diversifiers worth weighting up."
+            )
+            ics = diag["ic_series"].drop(columns=["ALP001"], errors="ignore").dropna()
+            if len(ics) >= 6:
+                corr = ics.corr(method="spearman")
+                if diag_source == "factor":
+                    _fl   = factor_label_map()
+                    short = {c: str(_fl.get(c, c))[:11] for c in corr.columns}
+                else:
+                    _mm   = db.get_model_metadata().set_index("ModelID")
+                    short = {c: str(_mm.loc[c, "Model"])[:11] for c in corr.columns}
+                corr = corr.rename(index=short, columns=short)
+                fig_c = go.Figure(go.Heatmap(
+                    z=corr.values, x=list(corr.columns), y=list(corr.index),
+                    zmin=-1, zmax=1, colorscale="RdBu", reversescale=True,
+                    text=corr.round(2).values, texttemplate="%{text}",
+                    textfont=dict(size=9), colorbar=dict(title="ρ"),
+                ))
+                fig_c.update_layout(height=420, margin=dict(l=0, r=0, t=10, b=0),
+                                    yaxis=dict(autorange="reversed"))
+                st.plotly_chart(fig_c, width="stretch")
+            else:
+                st.info(f"Too few overlapping dates ({len(ics)}) for a stable correlation matrix.")
+
+
+
+# ===========================================================================
+# Tab 1 — Signal Backtest
 # ===========================================================================
 
 with tab1:
     st.caption(
-        "Quarterly rebalancing: rank stocks by model score at each snapshot, hold equal-weight "
-        "top N. Pre-computed daily total returns; no transaction costs."
+        "Rank stocks by model score at each snapshot and hold equal-weight percentile buckets. "
+        "Long-only holds the top bucket; long-short holds top bucket minus bottom bucket. "
+        "Universe membership is carried forward from the latest available index snapshot. "
+        "Pre-computed daily total returns; no transaction costs."
     )
 
+    # ── In-page controls (replaces the old sidebar) ───────────────────────────
+    signal_universes = [
+        u for u in ("russell_1000", "sp500")
+        if u in db.get_available_universe_indices()
+    ]
+    if not signal_universes:
+        signal_universes = db.get_available_universe_indices()
+    if not signal_universes:
+        st.warning("No universe snapshots found. Run the universe snapshot pipeline first.")
+        st.stop()
+
+    bt_source_label = st.segmented_control(
+        "Signal type", ["Models", "Factors"], default="Models", key="bt_source",
+        help="Models = composed alpha signals (models.db). Factors = individual raw "
+             "factors (factors.db), direction-adjusted. Factor coverage is sparser and "
+             "some factors are sector-gated (banks/REITs), so buckets will be smaller.",
+    )
+    bt_source = "factor" if bt_source_label == "Factors" else "model"
+    if bt_source == "factor":
+        _flabels    = factor_label_map()
+        bt_options  = {f"{name} ({fid})": fid for fid, name in _flabels.items()}
+    else:
+        bt_options  = model_options
+
+    cc = st.columns([2.6, 1.5, 1.4, 1.4, 2.2])
+    with cc[0]:
+        sel_model_label = st.selectbox(
+            "Factor" if bt_source == "factor" else "Model",
+            list(bt_options.keys()), key=f"bt_signal_{bt_source}",
+        )
+        sel_model_id    = bt_options[sel_model_label]
+    with cc[1]:
+        default_signal_uni = "russell_1000" if "russell_1000" in signal_universes else signal_universes[0]
+        sel_signal_universe = st.selectbox(
+            "Universe",
+            signal_universes,
+            index=signal_universes.index(default_signal_uni),
+            format_func=lambda u: u.replace("_", " ").title(),
+            key="bt_universe",
+        )
+    with cc[2]:
+        portfolio_mode = st.segmented_control(
+            "Portfolio", ["Long-only", "Long-short"], default="Long-only", key="bt_mode"
+        )
+    with cc[3]:
+        bucket_pct = st.slider("Bucket percentile", 5, 40, 20, step=5, key="bt_bucket_pct")
+    with cc[4]:
+        sel_sectors = st.multiselect("Sector filter", all_sectors,
+                                     placeholder="All sectors", key="bt_sectors")
+
+    signal_window_snaps = [
+        d for d in sorted(_load_scores(bt_source)["data_date"].unique())
+        if d >= SIGNAL_BACKTEST_START
+    ]
+    date_range = _window_control(signal_window_snaps, "bt")
+    st.divider()
+
     with st.spinner("Running backtest…"):
-        long_s, short_s, benchmark, holdings_log, err = run_backtest(
-            sel_model_id, n_long, include_short, n_short, sel_sectors
+        long_s, short_s, strategy_s, benchmark, holdings_log, err = run_backtest(
+            sel_model_id, portfolio_mode, bucket_pct, sel_signal_universe, sel_sectors,
+            source=bt_source,
         )
 
     if err:
@@ -1040,59 +1850,93 @@ with tab1:
         d_start   = pd.Timestamp(date_range[0])
         d_end     = pd.Timestamp(date_range[1])
         long_s    = long_s.loc[d_start:d_end]
+        strategy_s = strategy_s.loc[d_start:d_end]
         benchmark = benchmark.loc[d_start:d_end]
         if short_s is not None:
             short_s = short_s.loc[d_start:d_end]
+        holdings_log = _filter_holdings_log(holdings_log, d_start, d_end)
     else:
         d_start = long_s.index[0]
         d_end   = long_s.index[-1]
 
-    long_label  = f"Long (top {n_long}) — {sel_model_label.split(' (')[0]}"
-    short_label = f"Short basket (bottom {n_short})"
+    universe_label = sel_signal_universe.replace("_", " ").title()
+    model_short_name = sel_model_label.split(" (")[0]
+    strategy_label = (
+        f"Top {bucket_pct}% — {model_short_name} ({universe_label})"
+        if portfolio_mode == "Long-only"
+        else f"Top {bucket_pct}% - bottom {bucket_pct}% — {model_short_name} ({universe_label})"
+    )
+    long_label  = f"Top {bucket_pct}% basket"
+    short_label = f"Bottom {bucket_pct}% basket (held long)"
+    benchmark_label = f"EW {universe_label}"
     cum_bench   = (1 + benchmark).cumprod()   # reused in quintile chart
 
-    turnover_rows = _compute_turnover(holdings_log)
+    include_short = portfolio_mode == "Long-short"
+    strategy_cum_s = (
+        _cumulative_spread_series(long_s, short_s)
+        if include_short and short_s is not None else None
+    )
+    turnover_rows = _compute_turnover(holdings_log, include_short)
+    turnover_rows_display = _aggregate_monthly_turnover(turnover_rows)[1:]
     avg_turnover  = (
-        np.mean([r["Turnover (%)"] for r in turnover_rows[1:]])
-        if len(turnover_rows) > 1 else None
+        np.mean([r["Strategy monthly turnover (%)"] for r in turnover_rows_display])
+        if turnover_rows_display else None
     )
 
     # Cumulative return chart
-    cum_traces = [{"series": long_s, "name": long_label, "color": "#2563EB"}]
+    cum_traces = [{
+        "series": strategy_cum_s if strategy_cum_s is not None else strategy_s,
+        "name": strategy_label,
+        "color": "#2563EB",
+        "cumulative": strategy_cum_s is not None,
+    }]
     if short_s is not None:
+        cum_traces.append({"series": long_s, "name": long_label,
+                           "color": "#16A34A", "width": 1.3, "dash": "dot"})
         cum_traces.append({"series": short_s, "name": short_label,
                            "color": "#DC2626", "dash": "dash"})
-    cum_traces.append({"series": benchmark, "name": "EW universe",
+    cum_traces.append({"series": benchmark, "name": benchmark_label,
                        "color": "#94A3B8", "width": 1.5, "dash": "dot"})
-    st.plotly_chart(_cum_return_chart(cum_traces), use_container_width=True)
+    st.plotly_chart(_cum_return_chart(cum_traces), width="stretch")
 
     # Drawdown chart
     dd_traces = [
-        {"series": long_s,  "name": long_label, "color": "#2563EB",
+        {"series": strategy_cum_s if strategy_cum_s is not None else strategy_s,
+         "name": strategy_label, "color": "#2563EB",
+         "cumulative": strategy_cum_s is not None,
          "fill_color": "rgba(37,99,235,0.08)"},
     ]
-    if short_s is not None:
-        dd_traces.append({"series": short_s, "name": short_label, "color": "#DC2626",
-                          "dash": "dash", "fill_color": "rgba(220,38,38,0.05)"})
-    dd_traces.append({"series": benchmark, "name": "EW universe",
-                      "color": "#94A3B8", "width": 1, "dash": "dot"})
-    st.plotly_chart(_drawdown_chart(dd_traces), use_container_width=True)
+    if strategy_cum_s is None:
+        dd_traces.append({"series": benchmark, "name": benchmark_label,
+                          "color": "#94A3B8", "width": 1, "dash": "dot"})
+    st.plotly_chart(_drawdown_chart(dd_traces), width="stretch")
 
     # Metrics
     st.divider()
-    n_cols = 3 if short_s is not None else 2
-    cols   = st.columns(n_cols)
-    with cols[0]:
-        st.subheader("Long basket")
-        _metrics_table({**perf_metrics(long_s), **active_metrics(long_s, benchmark, avg_turnover)})
+    st.subheader("Performance summary")
+    strategy_metrics = (
+        spread_metrics(long_s, short_s, strategy_s)
+        if strategy_cum_s is not None else perf_metrics(strategy_s)
+    )
+    if portfolio_mode == "Long-only":
+        strategy_metrics = {
+            **strategy_metrics,
+            **active_metrics(
+                strategy_s,
+                benchmark,
+                avg_turnover,
+                turnover_label="Avg monthly turnover (2-way)",
+            ),
+        }
+    elif avg_turnover is not None:
+        strategy_metrics["Avg monthly turnover (2-way)"] = f"{avg_turnover:.0f}%"
+
+    metric_sets = {"Strategy": strategy_metrics}
     if short_s is not None:
-        with cols[1]:
-            st.subheader("Short basket (held long)")
-            st.caption("↑ outperformance here = headwind for short position")
-            _metrics_table(perf_metrics(short_s))
-    with cols[-1]:
-        st.subheader("EW benchmark")
-        _metrics_table(perf_metrics(benchmark))
+        metric_sets[f"Top {bucket_pct}%"] = perf_metrics(long_s)
+        metric_sets[f"Bottom {bucket_pct}% (held long)"] = perf_metrics(short_s)
+    metric_sets[benchmark_label] = perf_metrics(benchmark)
+    _metrics_comparison_table(metric_sets)
 
     # Returns chart
     st.divider()
@@ -1102,15 +1946,51 @@ with tab1:
     )
 
     if ret_view == "Annual":
-        annual_traces = [{"series": long_s, "name": "Long basket", "color": "#2563EB"}]
-        if short_s is not None:
-            annual_traces.append({"series": short_s, "name": "Short basket", "color": "#DC2626"})
-        annual_traces.append({"series": benchmark, "name": "EW universe", "color": "#94A3B8"})
-        st.plotly_chart(_annual_bar_chart(annual_traces), use_container_width=True)
+        if strategy_cum_s is not None:
+            annual_spread = (
+                long_s.resample("YE").apply(lambda x: (1 + x).prod() - 1)
+                - short_s.resample("YE").apply(lambda x: (1 + x).prod() - 1)
+            )
+            fig_ann = go.Figure()
+            fig_ann.add_trace(go.Bar(
+                x=annual_spread.index.year.astype(str),
+                y=annual_spread.values,
+                name="Strategy",
+                marker_color="#2563EB",
+                text=[f"{v:+.1%}" if pd.notna(v) else "" for v in annual_spread.values],
+                textposition="outside",
+            ))
+            for t in [
+                {"series": long_s, "name": "Top bucket", "color": "#16A34A"},
+                {"series": short_s, "name": "Bottom bucket held long", "color": "#DC2626"},
+                {"series": benchmark, "name": benchmark_label, "color": "#94A3B8"},
+            ]:
+                ann = t["series"].resample("YE").apply(lambda x: (1 + x).prod() - 1)
+                fig_ann.add_trace(go.Bar(
+                    x=ann.index.year.astype(str), y=ann.values,
+                    name=t["name"], marker_color=t["color"],
+                    text=[f"{v:+.1%}" if pd.notna(v) else "" for v in ann.values],
+                    textposition="outside",
+                ))
+            fig_ann.update_layout(
+                barmode="group", height=320, yaxis_tickformat=".0%",
+                margin=dict(l=0, r=0, t=20, b=20),
+            )
+            st.plotly_chart(fig_ann, width="stretch")
+        else:
+            annual_traces = [{"series": strategy_s, "name": "Strategy", "color": "#2563EB"}]
+            annual_traces.append({"series": benchmark, "name": benchmark_label, "color": "#94A3B8"})
+            st.plotly_chart(_annual_bar_chart(annual_traces), width="stretch")
     else:
         MONTH_ORDER = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
                        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-        monthly = long_s.resample("ME").apply(lambda x: (1 + x).prod() - 1)
+        if strategy_cum_s is not None:
+            monthly = (
+                long_s.resample("ME").apply(lambda x: (1 + x).prod() - 1)
+                - short_s.resample("ME").apply(lambda x: (1 + x).prod() - 1)
+            )
+        else:
+            monthly = strategy_s.resample("ME").apply(lambda x: (1 + x).prod() - 1)
         mdf = monthly.reset_index()
         mdf.columns = ["date", "ret"]
         mdf["Year"]  = mdf["date"].dt.year.astype(str)
@@ -1130,38 +2010,43 @@ with tab1:
             yaxis=dict(autorange="reversed"),
             xaxis_title="", yaxis_title="",
         )
-        st.plotly_chart(fig_heat, use_container_width=True)
-        st.caption("Long basket monthly returns. Green = positive, red = negative.")
+        st.plotly_chart(fig_heat, width="stretch")
+        st.caption("Selected strategy monthly returns. Green = positive, red = negative.")
 
     # Rolling metrics
     st.divider()
     st.subheader("Rolling metrics")
+    roll_options = ["Rolling Sharpe (1Y)"]
+    if portfolio_mode == "Long-only":
+        roll_options.append("Rolling Information Ratio (1Y)")
     roll_choice = st.selectbox(
         "Metric",
-        ["Rolling Sharpe (1Y)", "Rolling Information Ratio (1Y)", "Turnover by period"],
-        key="roll_choice",
+        roll_options,
+        key=f"roll_choice_{portfolio_mode}",
     )
     ROLL_WINDOW = 252
 
     if roll_choice == "Rolling Sharpe (1Y)":
         def _rolling_sharpe(s):
-            return (s.rolling(ROLL_WINDOW).mean() * ROLL_WINDOW - RISK_FREE) / \
+            hurdle = RISK_FREE if portfolio_mode == "Long-only" else 0.0
+            return (s.rolling(ROLL_WINDOW).mean() * ROLL_WINDOW - hurdle) / \
                    (s.rolling(ROLL_WINDOW).std() * ROLL_WINDOW ** 0.5)
         fig_roll = go.Figure()
-        fig_roll.add_trace(go.Scatter(x=(rs := _rolling_sharpe(long_s).dropna()).index,
-                                      y=rs.values, name=long_label,
+        fig_roll.add_trace(go.Scatter(x=(rs := _rolling_sharpe(strategy_s).dropna()).index,
+                                      y=rs.values, name=strategy_label,
                                       line=dict(color="#2563EB", width=2)))
-        fig_roll.add_trace(go.Scatter(x=(rb := _rolling_sharpe(benchmark).dropna()).index,
-                                      y=rb.values, name="EW universe",
-                                      line=dict(color="#94A3B8", width=1.5, dash="dot")))
+        if portfolio_mode == "Long-only":
+            fig_roll.add_trace(go.Scatter(x=(rb := _rolling_sharpe(benchmark).dropna()).index,
+                                          y=rb.values, name=benchmark_label,
+                                          line=dict(color="#94A3B8", width=1.5, dash="dot")))
         fig_roll.add_hline(y=0, line_dash="dot", line_color="#64748B", line_width=1)
         fig_roll.update_layout(height=300, yaxis_title="Sharpe ratio (1Y rolling)",
                                hovermode="x unified", legend=dict(orientation="h", y=-0.2),
                                margin=dict(l=0, r=0, t=10, b=10))
-        st.plotly_chart(fig_roll, use_container_width=True)
+        st.plotly_chart(fig_roll, width="stretch")
 
     elif roll_choice == "Rolling Information Ratio (1Y)":
-        active  = long_s.subtract(benchmark.reindex(long_s.index, fill_value=0))
+        active  = strategy_s.subtract(benchmark.reindex(strategy_s.index, fill_value=0))
         roll_ir = (
             (active.rolling(ROLL_WINDOW).mean() * ROLL_WINDOW)
             / (active.rolling(ROLL_WINDOW).std() * ROLL_WINDOW ** 0.5)
@@ -1178,31 +2063,58 @@ with tab1:
                                annotation_position="right")
         fig_roll.update_layout(height=300, yaxis_title="Information ratio (1Y rolling)",
                                hovermode="x unified", margin=dict(l=0, r=0, t=10, b=10))
-        st.plotly_chart(fig_roll, use_container_width=True)
+        st.plotly_chart(fig_roll, width="stretch")
         st.caption(
             "IR > 0.5 (green) = consistently adding active return. "
-            "Below zero = model underperformed EW universe on a risk-adjusted basis."
+            f"Below zero = model underperformed {benchmark_label} on a risk-adjusted basis."
         )
 
+    st.divider()
+    st.subheader("Monthly two-way turnover")
+    if not turnover_rows_display:
+        st.info("Need at least 2 calendar months to show turnover after excluding the first month.")
     else:
-        if not turnover_rows:
-            st.info("Need at least 2 rebalance periods to compute turnover.")
-        else:
-            to_df  = pd.DataFrame(turnover_rows)
-            fig_to = go.Figure(go.Bar(
-                x=to_df["Period"], y=to_df["Turnover (%)"],
-                marker_color="#2563EB",
-                text=[f"{v:.0f}%" for v in to_df["Turnover (%)"]],
-                textposition="outside",
-            ))
-            fig_to.update_layout(height=300, yaxis_title="Two-way turnover (%)",
-                                 yaxis_range=[0, 110],
-                                 margin=dict(l=0, r=0, t=10, b=10))
-            st.plotly_chart(fig_to, use_container_width=True)
-            st.caption(
-                "Two-way = buys + sells as % of portfolio. First period = 100% (built from scratch). "
-                f"Average (ex-first): **{avg_turnover:.0f}%**."
-            )
+        to_df  = pd.DataFrame(turnover_rows_display)
+        fig_to = go.Figure()
+        fig_to.add_trace(go.Bar(
+            x=to_df["Period"], y=to_df["Strategy monthly turnover (%)"],
+            name="Strategy", marker_color="#2563EB",
+            text=[f"{v:.0f}%" for v in to_df["Strategy monthly turnover (%)"]],
+            textposition="outside",
+            customdata=to_df["Rebalances"],
+            hovertemplate=(
+                "%{x}<br>Monthly turnover: %{y:.1f}%"
+                "<br>Rebalances in month: %{customdata}<extra></extra>"
+            ),
+        ))
+        fig_to.add_trace(go.Bar(
+            x=to_df["Period"], y=to_df["Benchmark monthly turnover (%)"],
+            name=benchmark_label, marker_color="#94A3B8",
+            text=[f"{v:.0f}%" if pd.notna(v) else "" for v in to_df["Benchmark monthly turnover (%)"]],
+            textposition="outside",
+            customdata=to_df["Rebalances"],
+            hovertemplate=(
+                "%{x}<br>Monthly turnover: %{y:.1f}%"
+                "<br>Rebalances in month: %{customdata}<extra></extra>"
+            ),
+        ))
+        y_max = max(
+            to_df["Strategy monthly turnover (%)"].max(),
+            to_df["Benchmark monthly turnover (%)"].max(skipna=True),
+        )
+        fig_to.update_layout(barmode="group", height=320, yaxis_title="Monthly two-way turnover (%)",
+                             yaxis_range=[0, max(20, y_max * 1.2)],
+                             margin=dict(l=0, r=0, t=10, b=10))
+        st.plotly_chart(fig_to, width="stretch")
+        avg_bench_turnover = to_df["Benchmark monthly turnover (%)"].mean()
+        avg_text = f"Average strategy: **{avg_turnover:.0f}%**."
+        bench_text = f" Average benchmark: **{avg_bench_turnover:.0f}%**." if pd.notna(avg_bench_turnover) else ""
+        st.caption(
+            "Monthly two-way turnover sums 0.5 × total absolute weight change across all rebalances in each calendar month. "
+            "A fully replaced book is 100%, not 200%. "
+            "The first calendar month is excluded. "
+            f"{avg_text}{bench_text}"
+        )
 
     # Quintile analysis
     st.divider()
@@ -1212,7 +2124,9 @@ with tab1:
         "Q1 = highest-scored stocks, Q5 = lowest. A working factor shows Q1 > Q2 > … > Q5."
     )
     with st.spinner("Computing quintiles…"):
-        q_series = run_quintile_analysis(sel_model_id, sel_sectors)
+        q_series = run_quintile_analysis(
+            sel_model_id, sel_signal_universe, sel_sectors, source=bt_source
+        )
     q_series = [s.loc[d_start:d_end] if not s.empty else s for s in q_series]
 
     Q_COLORS = ["#1D4ED8", "#60A5FA", "#94A3B8", "#F97316", "#DC2626"]
@@ -1239,12 +2153,12 @@ with tab1:
                 ))
             bench_ann = (1 + benchmark).prod() ** (252 / max(len(benchmark), 1)) - 1
             fig_qa.add_hline(y=bench_ann, line_dash="dot", line_color="#94A3B8", line_width=1.5,
-                             annotation_text=f"EW universe {bench_ann:+.1%}",
+                             annotation_text=f"{benchmark_label} {bench_ann:+.1%}",
                              annotation_position="right")
             fig_qa.update_layout(height=340, yaxis_tickformat=".0%",
                                  yaxis_title="Annualised return",
                                  margin=dict(l=0, r=80, t=20, b=10))
-            st.plotly_chart(fig_qa, use_container_width=True)
+            st.plotly_chart(fig_qa, width="stretch")
 
     with q_tab2:
         fig_qc = go.Figure()
@@ -1253,12 +2167,12 @@ with tab1:
                 cum = (1 + s).cumprod()
                 fig_qc.add_trace(go.Scatter(x=cum.index, y=cum.values, name=Q_LABELS[i],
                                             line=dict(color=Q_COLORS[i], width=2)))
-        fig_qc.add_trace(go.Scatter(x=cum_bench.index, y=cum_bench.values, name="EW universe",
+        fig_qc.add_trace(go.Scatter(x=cum_bench.index, y=cum_bench.values, name=benchmark_label,
                                     line=dict(color="#94A3B8", width=1.5, dash="dot")))
         fig_qc.update_layout(height=380, yaxis_title="Portfolio value (base = 1.0)",
                              hovermode="x unified", legend=dict(orientation="h", y=-0.15),
                              margin=dict(l=0, r=0, t=20, b=10))
-        st.plotly_chart(fig_qc, use_container_width=True)
+        st.plotly_chart(fig_qc, width="stretch")
 
     # Holdings explorer
     st.divider()
@@ -1272,30 +2186,30 @@ with tab1:
     lcol, rcol = st.columns([3, 2])
     with lcol:
         long_df = sel_period["long"]
-        st.markdown(f"**Long basket — {len(long_df)} stocks**")
-        st.dataframe(long_df, hide_index=True, use_container_width=True, column_config={
+        st.markdown(f"**Top {bucket_pct}% bucket — {len(long_df)} stocks**")
+        st.dataframe(long_df, hide_index=True, width="stretch", column_config={
             "Rank":       st.column_config.NumberColumn(width="small"),
             "Score":      st.column_config.NumberColumn(format="%.3f", width="small"),
             "Price data": st.column_config.TextColumn(width="small"),
         })
     with rcol:
-        st.plotly_chart(_sector_chart(sel_period["long"], "Sector breakdown — long", "#2563EB"),
-                        use_container_width=True)
+        st.plotly_chart(_sector_chart(sel_period["long"], "Sector breakdown — top bucket", "#2563EB"),
+                        width="stretch")
 
     short_df = sel_period.get("short")
     if short_df is not None and not short_df.empty:
         st.markdown("---")
         slcol, srcol = st.columns([3, 2])
         with slcol:
-            st.markdown(f"**Short basket — {len(short_df)} stocks**")
-            st.dataframe(short_df, hide_index=True, use_container_width=True, column_config={
+            st.markdown(f"**Bottom {bucket_pct}% bucket — {len(short_df)} stocks**")
+            st.dataframe(short_df, hide_index=True, width="stretch", column_config={
                 "Rank":       st.column_config.NumberColumn(width="small"),
                 "Score":      st.column_config.NumberColumn(format="%.3f", width="small"),
                 "Price data": st.column_config.TextColumn(width="small"),
             })
         with srcol:
-            st.plotly_chart(_sector_chart(short_df, "Sector breakdown — short", "#DC2626"),
-                            use_container_width=True)
+            st.plotly_chart(_sector_chart(short_df, "Sector breakdown — bottom bucket", "#DC2626"),
+                            width="stretch")
 
 
 # ===========================================================================
@@ -1436,8 +2350,19 @@ with tab2:
     if bench_series.empty:
         st.warning(f"No benchmark returns found for '{sel_bench}'.")
         bench_series = pd.Series(0.0, index=port_series.index, name=sel_bench)
-    bench_series = bench_series.reindex(port_series.index).fillna(0.0)
     bench_label  = sel_bench.replace("_", " ").title()
+    eval_port_series, eval_bench_series, bench_coverage = _align_benchmark_for_eval(
+        port_series, bench_series
+    )
+    if eval_bench_series.empty:
+        st.warning(f"No overlapping benchmark returns found for '{bench_label}' in this backtest window.")
+        eval_port_series = port_series
+        eval_bench_series = pd.Series(0.0, index=port_series.index, name=sel_bench)
+    elif bench_coverage < 0.95:
+        st.warning(
+            f"Benchmark coverage for '{bench_label}' is {bench_coverage:.0%}; "
+            "performance and active-risk metrics use overlapping dates only."
+        )
 
     # Summary metrics row
     avg_to_pct_actual  = np.mean([p["turnover"] for p in period_log[1:]]) * 100 if len(period_log) > 1 else 100.0
@@ -1464,8 +2389,9 @@ with tab2:
     # the workbook isn't re-assembled on every widget interaction / rerun.
     export_key = f"{result_key}__xlsx"
     if export_key not in st.session_state:
+        export_result = {**result, "port_series": eval_port_series}
         st.session_state[export_key] = _build_backtest_workbook(
-            result, bench_series, bench_label, portfolio_eur
+            export_result, eval_bench_series, bench_label, portfolio_eur
         )
     st.download_button(
         "⬇ Download backtest data (Excel)",
@@ -1484,43 +2410,43 @@ with tab2:
     with pt1:
         # Cumulative excess return = cumulative portfolio return − cumulative
         # benchmark return. Both start at 0, so the excess starts at 0.
-        bench_aligned = bench_series.reindex(port_series.index, fill_value=0.0)
-        port_cum  = (1 + port_series).cumprod()
-        bench_cum = (1 + bench_aligned).cumprod()
+        port_cum  = (1 + eval_port_series).cumprod()
+        bench_cum = (1 + eval_bench_series).cumprod()
         cumulative_excess_series = (port_cum - 1) - (bench_cum - 1)
 
         # Always show both major US large-cap indices for context; add the
         # selected benchmark separately only when it is neither of them (so the
         # excess line's reference is always visible on the chart).
-        perf_traces = [{"series": port_series, "name": result["strategy_name"], "color": "#2563EB"}]
+        perf_traces = [{"series": eval_port_series, "name": result["strategy_name"], "color": "#2563EB"}]
         ref_benches = [("sp500", "S&P 500", "#94A3B8"), ("russell_1000", "Russell 1000", "#F59E0B"),
                        ("sp500_equal_weight", "S&P 500 Equal Weight", "#10B981")]
         for ref_name, ref_label, ref_color in ref_benches:
             ref_s = db.get_benchmark_returns(ref_name)
+            ref_s = ref_s.reindex(eval_port_series.index).dropna()
             if ref_s.empty:
                 continue
             perf_traces.append({
-                "series": ref_s.reindex(port_series.index).fillna(0.0),
+                "series": ref_s,
                 "name": ref_label, "color": ref_color, "width": 1.5, "dash": "dot",
             })
         if sel_bench not in {r[0] for r in ref_benches}:
             perf_traces.append({
-                "series": bench_series, "name": bench_label, "color": "#7C3AED",
+                "series": eval_bench_series, "name": bench_label, "color": "#7C3AED",
                 "width": 1.5, "dash": "dash",
             })
 
         st.plotly_chart(
             _cum_return_chart(perf_traces, cumulative_excess_series=cumulative_excess_series),
-            use_container_width=True,
+            width="stretch",
         )
         st.caption(f"Cumulative excess return is the strategy minus the selected benchmark (**{bench_label}**).")
 
         st.plotly_chart(_drawdown_chart([
-            {"series": port_series,  "name": result["strategy_name"], "color": "#2563EB",
+            {"series": eval_port_series,  "name": result["strategy_name"], "color": "#2563EB",
              "fill_color": "rgba(37,99,235,0.08)"},
-            {"series": bench_series, "name": bench_label, "color": "#94A3B8",
+            {"series": eval_bench_series, "name": bench_label, "color": "#94A3B8",
              "width": 1, "dash": "dot"},
-        ]), use_container_width=True)
+        ]), width="stretch")
 
         st.divider()
         st.subheader("Rolling risk")
@@ -1529,9 +2455,9 @@ with tab2:
             "axis (directly comparable); beta (~1) is on the right axis. "
             "63-day rolling window."
         )
-        fig_rr = _rolling_risk_chart(port_series, bench_series, window=63)
+        fig_rr = _rolling_risk_chart(eval_port_series, eval_bench_series, window=63)
         if fig_rr is not None:
-            st.plotly_chart(fig_rr, use_container_width=True)
+            st.plotly_chart(fig_rr, width="stretch")
         else:
             st.info("Not enough history for rolling risk metrics (need > 68 daily observations).")
 
@@ -1540,19 +2466,19 @@ with tab2:
         with mc1:
             st.subheader(result["strategy_name"])
             _metrics_table({
-                **perf_metrics(port_series),
-                **active_metrics(port_series, bench_series, avg_to_pct_actual),
+                **perf_metrics(eval_port_series),
+                **active_metrics(eval_port_series, eval_bench_series, avg_to_pct_actual),
             })
         with mc2:
             st.subheader(bench_label)
-            _metrics_table(perf_metrics(bench_series))
+            _metrics_table(perf_metrics(eval_bench_series))
 
     with pt2:
         st.subheader("Annual returns")
         st.plotly_chart(_annual_bar_chart([
-            {"series": port_series,  "name": result["strategy_name"], "color": "#2563EB"},
-            {"series": bench_series, "name": bench_label, "color": "#94A3B8"},
-        ], height=340), use_container_width=True)
+            {"series": eval_port_series,  "name": result["strategy_name"], "color": "#2563EB"},
+            {"series": eval_bench_series, "name": bench_label, "color": "#94A3B8"},
+        ], height=340), width="stretch")
 
         st.divider()
         st.subheader("Turnover per period")
@@ -1574,7 +2500,7 @@ with tab2:
         fig_to.update_layout(height=300, yaxis_title="Two-way turnover (%)",
                              yaxis_range=[0, max(max_to_pct * 1.5, max_to_shown)],
                              margin=dict(l=0, r=100, t=10, b=10))
-        st.plotly_chart(fig_to, use_container_width=True)
+        st.plotly_chart(fig_to, width="stretch")
         n_relaxed = sum(1 for r in to_rows if r["relaxed"])
         relaxed_note = f"  🟡 = {n_relaxed} period(s) where turnover limit was auto-relaxed to find a feasible solution." if n_relaxed else ""
         st.caption(
@@ -1593,7 +2519,7 @@ with tab2:
             ))
             fig_pos.update_layout(height=240, yaxis_title="# positions",
                                   hovermode="x unified", margin=dict(l=0, r=20, t=10, b=10))
-            st.plotly_chart(fig_pos, use_container_width=True)
+            st.plotly_chart(fig_pos, width="stretch")
         with pt2c2:
             st.subheader("Transaction costs")
             tc_rows = [{"Period": p["snap_date"][:10], "TC (€)": round(p["tc_pct"] * portfolio_eur, 0),
@@ -1607,7 +2533,7 @@ with tab2:
             ))
             fig_tc.update_layout(height=240, yaxis_title="TC (€)",
                                  margin=dict(l=0, r=20, t=10, b=10))
-            st.plotly_chart(fig_tc, use_container_width=True)
+            st.plotly_chart(fig_tc, width="stretch")
 
         st.divider()
         st.subheader("Sector weights over time")
@@ -1637,7 +2563,7 @@ with tab2:
                                  yaxis_tickformat=".0%", yaxis_title="Portfolio weight",
                                  legend=dict(orientation="h", y=-0.3),
                                  margin=dict(l=0, r=0, t=10, b=10))
-            st.plotly_chart(fig_sw, use_container_width=True)
+            st.plotly_chart(fig_sw, width="stretch")
 
         st.divider()
         fe_h1, fe_h2 = st.columns([3, 1])
@@ -1655,7 +2581,7 @@ with tab2:
         )
         fig_fe = _factor_exposure_chart(period_log, active=(fe_view != "Absolute"))
         if fig_fe is not None:
-            st.plotly_chart(fig_fe, use_container_width=True)
+            st.plotly_chart(fig_fe, width="stretch")
         elif fe_view == "Active":
             st.info("Active factor exposure needs Barra snapshots and benchmark weights "
                     "(maximize_alpha strategies). Try the Absolute view.")
@@ -1690,7 +2616,7 @@ with tab2:
         with hc1:
             st.markdown(f"**{len(h_df)} positions** — {sel_snap}")
             max_w = h_df["Weight %"].max() if not h_df.empty else 5.0
-            st.dataframe(h_df, hide_index=True, use_container_width=True, column_config={
+            st.dataframe(h_df, hide_index=True, width="stretch", column_config={
                 "Weight %": st.column_config.ProgressColumn(
                     "Weight %", format="%.2f%%", min_value=0, max_value=max_w
                 ),
@@ -1726,7 +2652,7 @@ with tab2:
                                       height=max(200, len(sec_items) * 30 + 60),
                                       xaxis_tickformat=".0%",
                                       margin=dict(l=0, r=60, t=40, b=10))
-            st.plotly_chart(fig_sec, use_container_width=True)
+            st.plotly_chart(fig_sec, width="stretch")
 
             m = sel_entry["metrics"]
             if m:
@@ -1788,4 +2714,4 @@ with tab2:
                                   height=max(300, len(ind_items) * 22 + 60),
                                   xaxis_tickformat=".0%",
                                   margin=dict(l=0, r=60, t=40, b=10))
-        st.plotly_chart(fig_ind, use_container_width=True)
+        st.plotly_chart(fig_ind, width="stretch")

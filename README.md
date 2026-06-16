@@ -1,6 +1,6 @@
 # Systematic Equity Investment Framework
 
-![Python](https://img.shields.io/badge/Python-3.13-3776AB?logo=python&logoColor=white)&nbsp;![Streamlit](https://img.shields.io/badge/Streamlit-dashboard-FF4B4B?logo=streamlit&logoColor=white)&nbsp;![SQLite](https://img.shields.io/badge/7_databases-SQLite-003B57?logo=sqlite&logoColor=white)&nbsp;![Tests](https://img.shields.io/badge/tests-113_passing-2ea44f?logo=pytest&logoColor=white)
+![Python](https://img.shields.io/badge/Python-3.13-3776AB?logo=python&logoColor=white)&nbsp;![Streamlit](https://img.shields.io/badge/Streamlit-dashboard-FF4B4B?logo=streamlit&logoColor=white)&nbsp;![SQLite](https://img.shields.io/badge/7_databases-SQLite-003B57?logo=sqlite&logoColor=white)&nbsp;![Tests](https://img.shields.io/badge/tests-121_passing-2ea44f?logo=pytest&logoColor=white)
 
 A systematic quantitative investing framework covering ~994 US equities from the **iShares Russell 1000 ETF** universe. Includes 30+ factors across 12 models, a Barra-style factor risk model built from first principles, and a CVXPY portfolio optimiser with 9 configurable strategies.
 
@@ -136,7 +136,7 @@ This is what makes the **Backtester** reliable: each rebalance sees only data th
 | Risk | 1 | Realized volatility |
 | Size | 1 | Log Market Cap |
 | Liquidity | 1 | Amihud illiquidity ratio |
-| Short Interest | 2 | FINRA SVR 20-day average, SVR 90-day percentile rank |
+| Short Interest | 3 | FINRA SVR 20-day average, SVR 90-day percentile rank, Days to Cover (consolidated short interest) |
 
 > **Growth methodology** — each growth factor is the OLS slope of the annual LTM series over the trailing 3–5 fiscal years, scaled by mean absolute level (`slope / mean(|level|)`). This measures *sustained* growth and is robust to depressed base years — a single trough year (e.g. a bank recovering from a one-off loss) no longer produces a spurious multi-hundred-percent reading the way a naïve `(current − prior)/|prior|` ratio does.
 
@@ -175,7 +175,7 @@ Model scores are coverage-renormalised: a stock only receives full conviction if
 | Size | SIZ001 | Log Market Cap (positive = larger firms) |
 | Low Volatility | LVOL001 | Realized volatility (lower = better) |
 | Liquidity | LIQ001 | Amihud illiquidity ratio (lower = more liquid) |
-| Short Interest | SHI001 | FINRA SVR 20-day average (70%) + 90-day percentile rank (30%) |
+| Short Interest | SHI001 | FINRA consolidated short interest — Days to Cover (shares short ÷ average daily volume); backtestable to 2021, whereas FINRA short-volume (SVR) only retains ~13 months |
 | Long-term Reversal | LTR001 | 36–12M risk-adjusted reversal — standalone signal, not in Alpha |
 | Short-term Reversal | STR001 | 1M risk-adjusted reversal — standalone signal, not in Alpha |
 | **Alpha (composite)** | **ALP001** | **0.26 × Profitability + 0.26 × Value + 0.21 × Growth + 0.21 × Momentum + 0.06 × Size** |
@@ -277,7 +277,7 @@ All strategy settings live in `data/strategy_params.xlsx`:
 |------|--------------|
 | Home | Universe overview — factor/model coverage, data freshness |
 | Deep Dive | Single-stock deep dive — factor scores, model attribution, fundamentals, peer comparison |
-| Backtester | Point-in-time strategy simulation with no look-ahead bias — rebalances, returns, risk attribution |
+| Backtester | Point-in-time strategy simulation with no look-ahead bias — rebalances, returns, risk attribution; plus single-factor signal backtesting and diagnostics |
 | Database | Raw database explorer — any table, read-only SQL query interface |
 | Portfolio Optimiser | Strategy weights, sector/industry tilts, factor exposures, risk attribution |
 | Risk Explorer | Barra / Ledoit-Wolf drill-down — factor correlations, vols, per-stock variance decomposition |
@@ -405,7 +405,7 @@ flowchart LR
 
 ## Tests
 
-113 tests covering the layers where correctness is subtle — financial-statement parsing, factor math, the optimiser, and pipeline orchestration.
+121 tests covering the layers where correctness is subtle — financial-statement parsing, factor math, the optimiser, and pipeline orchestration.
 
 ```bash
 pytest tests/ -q                                          # full suite

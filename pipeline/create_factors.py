@@ -22,7 +22,7 @@ Run order:
 
 import argparse
 import sqlite3
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -172,9 +172,14 @@ def _dedup_constituent_rows(df: pd.DataFrame) -> pd.DataFrame:
     Keep one row per mapped PIT constituent key.
 
     Native ISIN rows are preferred over legacy rows mapped from SimFin IDs; within
-    the same source priority, the latest publish_date wins.
+    the same source priority, the EARLIEST publish_date wins — the original filing
+    date when a figure first became public. A 10-Q/10-K reprints prior-period
+    figures as comparative columns (e.g. Q2-2020 reappears in the Q2-2021 10-Q,
+    stamped a year later); keeping the latest date would wrongly defer that figure's
+    PIT availability by a year. We do not track restatements, so original-as-reported
+    is exactly the point-in-time value we want.
     """
-    return (df.sort_values(['source_priority', 'publish_date'])
+    return (df.sort_values(['source_priority', 'publish_date'], ascending=[True, False])
               .groupby(['security_id', 'constituent_id', 'fiscal_year', 'fiscal_period'],
                        as_index=False)
               .last())
@@ -571,6 +576,38 @@ def load_svr_data() -> dict:
         grp = grp.sort_values("date")
         result[isin] = (grp["date"].values, grp["svr"].values.astype(np.float64))
     log.info("Loaded SVR data for %s ISINs", f"{len(result):,}")
+    return result
+
+
+def load_short_interest_data() -> dict:
+    """
+    Returns {isin: (settlement_dates_np, days_to_cover_np)} from the semi-monthly
+    short_interest table in returns.db. Both arrays sorted ascending by date.
+    Distinct from load_svr_data: this is settlement-date short *interest* (shares
+    short / ADV), not daily short *volume*. Empty dict if table/DB absent.
+    """
+    if not RETURNS_DB.exists():
+        return {}
+    with get_db(RETURNS_DB) as conn:
+        tables = [r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='short_interest'"
+        ).fetchall()]
+        if not tables:
+            return {}
+        df = pd.read_sql_query(
+            "SELECT isin, settlement_date, days_to_cover FROM short_interest "
+            "WHERE days_to_cover IS NOT NULL ORDER BY isin, settlement_date",
+            conn,
+        )
+    if df.empty:
+        return {}
+    df["settlement_date"] = pd.to_datetime(df["settlement_date"])
+    result: dict = {}
+    for isin, grp in df.groupby("isin", sort=False):
+        grp = grp.sort_values("settlement_date")
+        result[isin] = (grp["settlement_date"].values,
+                        grp["days_to_cover"].values.astype(np.float64))
+    log.info("Loaded short-interest data for %s ISINs", f"{len(result):,}")
     return result
 
 
@@ -1400,6 +1437,39 @@ def compute_svr_factors(
     return f
 
 
+def compute_short_interest_factor(
+    isin: str, si_data: dict, ref_date: date = None, pub_lag_days: int = 14
+) -> dict:
+    """
+    Days to Cover — FINRA consolidated short interest ratio (shares short / ADV)
+    as of the latest settlement date disseminated on/before the snapshot.
+
+    Direction=-1: higher days-to-cover = more short pressure = worse signal.
+    `pub_lag_days` (14 calendar days) guards against look-ahead — FINRA publishes
+    ~8 business days after each settlement date, so a snapshot can only "know" a
+    settlement date that is at least ~2 weeks old. Value is left unsigned (the
+    factor is log-transformed and z-scored downstream).
+    """
+    entry = si_data.get(isin)
+    if entry is None:
+        return {}
+    sdates, dtc = entry
+
+    cutoff = (ref_date - timedelta(days=pub_lag_days)) if ref_date is not None else None
+    if cutoff is None:
+        idx = len(sdates) - 1
+    else:
+        cutoff_np = np.datetime64(cutoff, "D").astype("datetime64[ns]")
+        idx = int(np.searchsorted(sdates, cutoff_np, side="right")) - 1
+    if idx < 0:
+        return {}
+
+    val = float(dtc[idx])
+    if not np.isfinite(val) or val < 0:
+        return {}
+    return {"Days to Cover": val}
+
+
 def compute_reit_factors(
     cdata: dict, growth_series: dict, isin: str, prices: dict, ref_date: date = None
 ) -> dict:
@@ -1569,6 +1639,7 @@ def run_for_date(
     prices: dict,
     splits: dict,
     svr_data: dict,
+    si_data: dict,
     factor_name_to_id: dict,
     factor_sector_types: dict,
     log_transform_ids: set[str],
@@ -1617,6 +1688,7 @@ def run_for_date(
         factors.update(compute_low_vol_factors(isin, prices, ref_date=snapshot))
         factors.update(compute_liquidity_factors(isin, prices, ref_date=snapshot))
         factors.update(compute_svr_factors(isin, svr_data, ref_date=snapshot))
+        factors.update(compute_short_interest_factor(isin, si_data, ref_date=snapshot))
         if sector_type == 'reit':
             factors.update(compute_reit_factors(cdata, growth_series, isin, prices, ref_date=snapshot))
         if sector_type == 'bank':
@@ -1731,6 +1803,7 @@ def main():
     prices   = load_price_data()
     splits   = load_splits()
     svr_data = load_svr_data()
+    si_data  = load_short_interest_data()
 
     with get_db(FACTORS_DB) as conn:
         setup_factors_db(conn, clean=args.clean)
@@ -1740,7 +1813,7 @@ def main():
         for snapshot in dates_to_run:
             total_rows += run_for_date(
                 snapshot, universe, ticker_map,
-                constituent_data, kind_map, prices, splits, svr_data,
+                constituent_data, kind_map, prices, splits, svr_data, si_data,
                 factor_name_to_id, factor_sector_types, log_transform_ids, conn,
             )
             conn.execute(

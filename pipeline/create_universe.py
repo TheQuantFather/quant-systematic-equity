@@ -2200,8 +2200,9 @@ def _backfill_capped_index_snapshots(
 ) -> int:
     """Fill universe_snapshots for a capped index for all base-index dates not already covered.
 
-    Dates already present (real N-PORT rows fetched by rebuild_snapshots) are skipped
-    via INSERT OR IGNORE. Returns the number of synthetic rows inserted.
+    Real N-PORT rows fetched by rebuild_snapshots are preserved. Synthetic dates
+    are rebuilt in place so improvements to the cap algorithm repair old rows.
+    Returns the number of synthetic rows inserted.
     """
     from utils import apply_weight_cap
 
@@ -2210,15 +2211,15 @@ def _backfill_capped_index_snapshots(
             "SELECT DISTINCT snapshot_date FROM universe_snapshots WHERE index_name=? ORDER BY snapshot_date",
             (base_index,),
         ).fetchall()]
-        existing = {r[0] for r in conn.execute(
-            "SELECT DISTINCT snapshot_date FROM universe_snapshots WHERE index_name=?",
+
+        real_dates = {r[0] for r in conn.execute(
+            "SELECT DISTINCT snapshot_date FROM nport_accessions WHERE index_name=?",
             (index_name,),
         ).fetchall()}
+        synthetic_dates = [d for d in base_dates if d not in real_dates]
 
         rows: list[tuple[str, str, str, float, None]] = []
-        for snap_date in base_dates:
-            if snap_date in existing:
-                continue
+        for snap_date in synthetic_dates:
             base_rows = conn.execute(
                 "SELECT isin, weight FROM universe_snapshots WHERE index_name=? AND snapshot_date=?",
                 (base_index, snap_date),
@@ -2230,13 +2231,21 @@ def _backfill_capped_index_snapshots(
             for isin, w in capped.items():
                 rows.append((snap_date, isin, index_name, w, None))
 
+        if synthetic_dates:
+            ph = ",".join("?" * len(synthetic_dates))
+            conn.execute(
+                f"DELETE FROM universe_snapshots "
+                f"WHERE index_name=? AND snapshot_date IN ({ph})",
+                [index_name] + synthetic_dates,
+            )
+
         if rows:
             conn.executemany(
-                "INSERT OR IGNORE INTO universe_snapshots "
+                "INSERT INTO universe_snapshots "
                 "(snapshot_date, isin, index_name, weight, market_value) VALUES (?, ?, ?, ?, ?)",
                 rows,
             )
-            conn.commit()
+        conn.commit()
 
     return len(rows)
 
