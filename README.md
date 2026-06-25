@@ -284,7 +284,6 @@ All strategy settings live in `data/strategy_params.xlsx`:
 | Risk Explorer | Barra / Ledoit-Wolf drill-down — factor correlations, vols, per-stock variance decomposition |
 | Data Quality | Pipeline health — factor coverage rates, constituent fill, DB sync status, anomaly flags |
 | Macro | 14 US macro signals — yields, credit spreads, commodities, economic indicators (FRED) |
-| Portfolio Analytics | Live position tracking and realised P&L attribution |
 
 ---
 
@@ -354,7 +353,6 @@ flowchart LR
 ```
 ├── app.py                          # Streamlit entry point
 ├── daily_ecosystem_update.py       # Pipeline orchestrator
-├── daily_position_update.py        # Live position refresh (scheduled)
 ├── config.py                       # All paths, dates, and hyperparameters — single source of truth
 ├── db.py                           # Cached data-access layer (Streamlit @st.cache_data wrappers)
 ├── macro_db.py                     # Macro signal queries
@@ -381,8 +379,7 @@ flowchart LR
 │   ├── 8_Portfolio_Optimiser.py
 │   ├── 9_Risk_Explorer.py
 │   ├── 10_Data_Quality.py
-│   ├── 11_Macro.py
-│   └── 12_Portfolio_Analytics.py
+│   └── 11_Macro.py
 ├── scripts/
 │   ├── backtest_engine.py          # Headless walk-forward backtest engine (shared with the page)
 │   ├── backtest_report.py          # Strategy backtest → standalone HTML showcase
