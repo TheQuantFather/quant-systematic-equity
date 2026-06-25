@@ -11,6 +11,17 @@ import sqlite3
 
 import pytest
 
+from config import STANDARD_CONCEPTS_REF
+
+# update_constituents reads standard_concepts_reference.csv at import time.
+# That file is intentionally untracked in git, so it is absent in CI.
+# Skip this module when the reference data is unavailable — it runs locally.
+if not STANDARD_CONCEPTS_REF.exists():
+    pytest.skip(
+        "requires local reference data (data/standard_concepts_reference.csv)",
+        allow_module_level=True,
+    )
+
 from pipeline.update_constituents import (
     _derive_working_capital_change,
     _effective_fye_year_and_month,
@@ -206,11 +217,19 @@ def test_quarter_from_period_unparseable_input():
     assert _quarter_from_period("2024-XX-31", fye_month=12) is None
 
 
-def test_quarter_from_period_unrecognised_month():
-    # February has no quarter end for a December FYE; must return None.
-    assert _quarter_from_period("2024-02-28", fye_month=12) is None
-    # ditto August
-    assert _quarter_from_period("2024-08-15", fye_month=12) is None
+def test_quarter_from_period_skips_fye_quarter_and_spillover():
+    # The 10-K covers the FYE quarter, so the FYE month (Dec) and its 1-month
+    # spillover (Jan) must return None — never mapped to a 10-Q quarter.
+    assert _quarter_from_period("2024-12-15", fye_month=12) is None
+    assert _quarter_from_period("2024-01-15", fye_month=12) is None
+
+
+def test_quarter_from_period_wobble_resolves_neighbouring_fye():
+    # 52/53-week wobble: a nominal December FYE tries ±1 month, so a period
+    # ending in February resolves to Q1 (of a November-FYE neighbour) rather
+    # than dropping the quarter. Previously returned None under strict matching.
+    assert _quarter_from_period("2024-02-28", fye_month=12) == ("Q1", 2024)
+    assert _quarter_from_period("2024-08-15", fye_month=12) == ("Q3", 2024)
 
 
 def test_effective_fye_treats_first_week_january_as_december_spillover():
