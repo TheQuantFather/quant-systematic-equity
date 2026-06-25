@@ -1,6 +1,6 @@
 # Systematic Equity Investment Framework
 
-![Python](https://img.shields.io/badge/Python-3.13-3776AB?logo=python&logoColor=white)&nbsp;![Streamlit](https://img.shields.io/badge/Streamlit-dashboard-FF4B4B?logo=streamlit&logoColor=white)&nbsp;![SQLite](https://img.shields.io/badge/7_databases-SQLite-003B57?logo=sqlite&logoColor=white)&nbsp;![Tests](https://img.shields.io/badge/tests-150-2ea44f?logo=pytest&logoColor=white)
+[![CI](https://github.com/TheQuantFather/quant-systematic-equity/actions/workflows/ci.yml/badge.svg)](https://github.com/TheQuantFather/quant-systematic-equity/actions/workflows/ci.yml)&nbsp;![Python](https://img.shields.io/badge/Python-3.13-3776AB?logo=python&logoColor=white)&nbsp;![Streamlit](https://img.shields.io/badge/Streamlit-dashboard-FF4B4B?logo=streamlit&logoColor=white)&nbsp;![SQLite](https://img.shields.io/badge/7_databases-SQLite-003B57?logo=sqlite&logoColor=white)&nbsp;![Tests](https://img.shields.io/badge/tests-106-2ea44f?logo=pytest&logoColor=white)
 
 A systematic quantitative investing framework covering ~994 US equities from the **iShares Russell 1000 ETF** universe. Includes 30+ factors aggregated into research models, a Barra-style factor risk model built from first principles, and a CVXPY portfolio optimiser driven entirely by a config spreadsheet.
 
