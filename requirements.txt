@@ -1,0 +1,33 @@
+# Runtime dependencies — pinned to the `quant` conda env (Python 3.13.5).
+# Regenerate pins from the active env, e.g.:
+#   python -m pip freeze | grep -iE '^(pandas|numpy|...)=='
+# These are the direct third-party imports used across pipeline/, pages/,
+# brokers/ and the root entry points. Transitive deps resolve automatically.
+
+# Core numerics / data
+numpy==2.3.1
+pandas==2.3.1
+scipy==1.17.1
+scikit-learn==1.8.0
+python-dateutil==2.9.0.post0
+
+# Optimization
+cvxpy==1.8.2
+clarabel==0.11.1
+
+# Dashboard / plotting
+streamlit==1.57.0
+plotly==6.7.0
+openpyxl==3.1.5
+
+# Data sources / IO
+edgartools==5.30.2
+yfinance==0.2.40
+requests==2.34.0
+httpx==0.28.1
+
+# MCP sqlite server (scripts/mcp_sqlite_server.py)
+mcp==1.27.2
+
+# Test runner
+pytest==9.0.3
