@@ -64,12 +64,13 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config import (
     RETURNS_DB, FACTORS_DB, MODELS_DB, UNIVERSE_DB, RISK_DB,
     HL_FACTOR_VAR, HL_FACTOR_CORR, HL_IDIO, NW_LAGS, VRA_WINDOW,
     SHRINK_IDIO, EIGENFLOOR, VRA_MIN, VRA_MAX, MIN_STOCKS,
+    BARRA_RETURN_CLIP,
     BARRA_SECTORS as SECTORS,
 )
 from utils import (
@@ -180,6 +181,9 @@ def _load_returns_wide() -> pd.DataFrame:
             "SELECT date, isin, total_return FROM returns WHERE total_return IS NOT NULL",
             conn, parse_dates=["date"],
         )
+    df["total_return"] = pd.to_numeric(df["total_return"], errors="coerce")
+    if BARRA_RETURN_CLIP is not None and BARRA_RETURN_CLIP > 0:
+        df["total_return"] = df["total_return"].clip(-BARRA_RETURN_CLIP, BARRA_RETURN_CLIP)
     return df.pivot(index="date", columns="isin", values="total_return").sort_index()
 
 
@@ -713,6 +717,11 @@ def _build_and_save_snapshot(
     """Compute full Barra model for one snapshot date and write to risk.db."""
     snap_ts = pd.Timestamp(snap_date_str)
 
+    def _clear_snapshot() -> None:
+        conn.execute("DELETE FROM factor_covariance WHERE snapshot_date=?", (snap_date_str,))
+        conn.execute("DELETE FROM idiosyncratic_vars WHERE snapshot_date=?", (snap_date_str,))
+        conn.execute("DELETE FROM factor_exposures WHERE snapshot_date=?", (snap_date_str,))
+
     # Strict point-in-time: all time-series data must precede snap_ts so that
     # the same-day returns are never used in the covariance estimate (look-ahead
     # bias). Historical --backfill runs respect this too, so all snapshots are
@@ -723,6 +732,8 @@ def _build_and_save_snapshot(
     betas_pit       = betas_wide[betas_wide.index  < snap_ts]
 
     if len(f_df_pit) < 60:
+        _clear_snapshot()
+        conn.commit()
         log.warning("Insufficient history for %s — skipping.", snap_date_str)
         return
 
@@ -761,6 +772,18 @@ def _build_and_save_snapshot(
         log.info("VRA: B²_factor=%.3f  B²_specific=%.3f", B2_factor, B2_specific)
     F_cov = B2_factor * F_cov
     delta = {isin: B2_specific * v for isin, v in delta.items()}
+    if delta:
+        finite_delta = [float(v) for v in delta.values() if np.isfinite(v)]
+        delta_default = float(np.median(finite_delta)) if finite_delta else 0.04
+        missing_delta = [isin for isin in isins_snap if isin not in delta]
+        if missing_delta:
+            for isin in missing_delta:
+                delta[isin] = delta_default
+            log.warning(
+                "Assigned median idiosyncratic variance %.6f to %d exposed names "
+                "without residual history.",
+                delta_default, len(missing_delta),
+            )
 
     # ── Spectral floor ───────────────────────────────────────────────────────
     F_cov = _spectral_floor(F_cov)

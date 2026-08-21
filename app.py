@@ -3,10 +3,12 @@ app.py — Home page for the Systematic Equity Investment Framework.
 Run with: streamlit run app.py
 """
 
+import datetime as _dt
+
 import streamlit as st
 import pandas as pd
 import db
-from config import FACTORS_DB
+from config import FACTORS_DB, RETURNS_DB
 from utils import get_db, inject_css
 
 st.set_page_config(
@@ -18,6 +20,32 @@ inject_css()
 
 st.title("Systematic Equity Investment Framework")
 st.markdown("End-to-end quantitative equity pipeline: factor research, risk modelling, and portfolio optimisation.")
+
+# ---------------------------------------------------------------------------
+# Data-freshness banner — catches a silently-dead daily_ecosystem_update.
+# `last_yahoo_update` is stamped by create_returns.py on every price refresh;
+# if it lags by more than a few trading days the scheduled job has stopped.
+# ---------------------------------------------------------------------------
+
+with get_db(RETURNS_DB) as conn:
+    _last = conn.execute(
+        "SELECT value FROM metadata WHERE key = 'last_yahoo_update'"
+    ).fetchone()
+
+if _last and _last[0]:
+    _last_date = _dt.date.fromisoformat(_last[0])
+    # Trading days elapsed since the last successful price update.
+    _stale_bd = len(pd.bdate_range(_last_date + _dt.timedelta(days=1), _dt.date.today()))
+    if _stale_bd >= 3:
+        st.error(
+            f"⚠️ Prices last updated **{_last_date}** — {_stale_bd} trading days stale. "
+            "The daily ecosystem update has likely stopped; run "
+            "`python daily_ecosystem_update.py` and check the launchd job."
+        )
+    elif _stale_bd >= 1:
+        st.warning(
+            f"Prices last updated **{_last_date}** ({_stale_bd} trading day(s) ago)."
+        )
 
 # ---------------------------------------------------------------------------
 # Summary stats

@@ -227,10 +227,19 @@ def _rows_from_data(
     return rows
 
 
-# Number of calendar days to look back when doing an incremental update.
-# Covers weekends, public holidays, and FRED's typical 1-business-day
-# publishing lag, without re-fetching more history than necessary.
-_INCREMENTAL_LOOKBACK_DAYS = 5
+# Calendar days to look back on an incremental update, by signal frequency.
+# Daily market series only need a few days (weekends/holidays/1-day publish lag).
+# Monthly economic series (CPI, payroll, unemployment) publish one observation
+# per month with a multi-week lag — a 5-day window never contains a fresh point,
+# so they would freeze between full backfills. A wide window guarantees the latest
+# monthly observation is caught; INSERT OR REPLACE makes the overlap harmless.
+_LOOKBACK_DAYS_BY_FREQUENCY = {
+    "Daily":     5,
+    "Weekly":    14,
+    "Monthly":   400,
+    "Quarterly": 400,
+}
+_DEFAULT_LOOKBACK_DAYS = 5
 
 
 def process_date(date_str: str) -> None:
@@ -248,15 +257,17 @@ def process_date(date_str: str) -> None:
         return
 
     end_dt   = datetime.fromisoformat(date_str).date()
-    start_dt = end_dt - timedelta(days=_INCREMENTAL_LOOKBACK_DAYS)
-    start_str = start_dt.isoformat()
-
     update_ts = datetime.now().isoformat()
     rows: list[tuple] = []
 
     for signal_id, meta in signals_ref.items():
         if meta.get("source") not in ("FRED", "Yahoo", "CBOE"):
             continue
+        # Frequency-aware lookback so monthly series pick up freshly-published
+        # observations instead of freezing between full backfills.
+        lookback = _LOOKBACK_DAYS_BY_FREQUENCY.get(
+            meta.get("frequency", ""), _DEFAULT_LOOKBACK_DAYS)
+        start_str = (end_dt - timedelta(days=lookback)).isoformat()
         try:
             data = fetch_signal(signal_id, meta, start_str, date_str)
             rows.extend(_rows_from_data(data, signal_id, update_ts))

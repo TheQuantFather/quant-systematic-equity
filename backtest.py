@@ -1,4 +1,4 @@
-"""backtest_engine.py — headless walk-forward optimised backtest.
+"""backtest — headless walk-forward optimised backtest.
 
 Single source of truth for the CVXPY walk-forward backtest. Both the Streamlit
 Backtester page (pages/6_Backtester.py) and the standalone HTML report generator
@@ -12,18 +12,13 @@ and report_utils.py).
 from __future__ import annotations
 
 import sqlite3
-import sys
-from pathlib import Path
 from typing import Callable
 
 import numpy as np
 import pandas as pd
 
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
-
-from config import MODELS_DB, PARAMS_FILE, RETURNS_DB, RISK_DB, UNIVERSE_DB  # noqa: E402
-from utils import get_db, get_snapshot_schedule  # noqa: E402
+from config import MODELS_DB, PARAMS_FILE, RETURNS_DB, RISK_DB, UNIVERSE_DB
+from utils import get_db, get_snapshot_schedule
 
 ProgressCB = Callable[[int, int, str], None]
 
@@ -153,7 +148,8 @@ def run_optimised_backtest(
     if not model_dates or not universe_dates:
         return {"error": f"Need at least 1 model date and 1 '{universe_name}' universe snapshot."}
 
-    # Available Barra and LW risk dates
+    # Available Barra risk dates. Ledoit-Wolf remains in risk.db for analysis
+    # pages, but it is not an optimizer fallback.
     barra_dates: list[str] = []
     try:
         with get_db(RISK_DB) as conn:
@@ -162,52 +158,15 @@ def run_optimised_backtest(
             ).fetchall())
     except Exception:
         barra_dates = []
-    with get_db(RISK_DB) as conn:
-        risk_dates = sorted(r[0] for r in conn.execute(
-            "SELECT data_date FROM covariance_matrix"
-        ).fetchall())
-    if not risk_dates:
-        return {"error": "No Ledoit-Wolf covariance matrices found. Run create_risk.py first."}
 
     pre_warnings: list[str] = []
-    scheduled_dates: set[str] = set(model_dates)
-    if rebal_freq == "monthly":
-        try:
-            with get_db(UNIVERSE_DB) as conn:
-                scheduled_dates = {
-                    r[0] for r in conn.execute(
-                        """
-                        SELECT data_date
-                        FROM snapshot_schedule
-                        WHERE cadence IN ('monthly', 'weekly')
-                          AND factors_computed_at IS NOT NULL
-                        """
-                    ).fetchall()
-                }
-        except Exception as exc:
-            pre_warnings.append(
-                f"Could not read snapshot_schedule ({exc}) - monthly backtest used all model dates."
-            )
-            scheduled_dates = set(model_dates)
 
-    alpha_lookup_dates = (
-        [d for d in model_dates if d in scheduled_dates]
-        if rebal_freq == "monthly" else model_dates
-    )
-    barra_lookup_dates = (
-        [d for d in barra_dates if d in scheduled_dates]
-        if rebal_freq == "monthly" else barra_dates
-    )
-    risk_lookup_dates = (
-        [d for d in risk_dates if d in scheduled_dates]
-        if rebal_freq == "monthly" else risk_dates
-    )
-    if rebal_freq == "monthly" and not alpha_lookup_dates:
-        return {"error": "No scheduled monthly/weekly alpha snapshots found for monthly backtest."}
-    if rebal_freq == "monthly" and not barra_lookup_dates:
-        return {"error": "No scheduled monthly/weekly Barra snapshots found for monthly backtest."}
-    if rebal_freq == "monthly" and not risk_lookup_dates:
-        return {"error": "No scheduled monthly/weekly LW risk snapshots found for monthly backtest."}
+    # Signal/risk carry-forward pools = every computed snapshot. Monthly mode
+    # rebalances on the last snapshot of each calendar month, landing directly on
+    # snapshot dates (including recent weekly/ad-hoc ones), so there is no staleness
+    # and no dependence on cadence tags.
+    alpha_lookup_dates = model_dates
+    barra_lookup_dates = barra_dates
 
     ret_matrix    = load_returns_matrix()
     trading_index = ret_matrix.index
@@ -222,29 +181,26 @@ def run_optimised_backtest(
     if first_barra is None:
         return {"error": "No Barra snapshots found. Run create_barra.py --backfill first."}
 
-    if rebal_freq == "monthly":
-        # Monthly calendar dates -> nearest trading day on or after each. The
-        # signal/risk snapshots are then carried forward from the latest scheduled
-        # monthly/weekly snapshot, excluding ad-hoc research dates.
-        first_alpha = pd.Timestamp(first_barra)
-        last_td     = trading_index[-1]
-        anchors     = pd.date_range(start=first_alpha, end=last_td, freq="MS")
-        rebal_dates: list[str] = []
-        for anchor in anchors:
-            pos = trading_index.searchsorted(anchor)
-            if pos < len(trading_index):
-                rebal_dates.append(trading_index[pos].strftime("%Y-%m-%d"))
-        rebal_dates = sorted(set(rebal_dates))
-    else:
-        # Quarterly: model snapshot dates from first Barra date onwards.
-        rebal_dates = [d for d in model_dates if d >= first_barra]
+    # Snapshot dates that carry BOTH an alpha model and a Barra risk snapshot,
+    # from the first Barra date onward — the only dates we can actually rebalance on.
+    usable_snaps = [d for d in sorted(set(model_dates) & set(barra_dates)) if d >= first_barra]
 
-    # Restrict rebalances to specific snapshot cadences (canonical schedule). E.g.
-    # rebalance only on month-end 'monthly' snapshots and ignore the recent 'weekly'
-    # and 'adhoc' snapshots, so a weekly snapshot run never forces a weekly rebalance.
-    if rebalance_cadences:
-        allowed = set(get_snapshot_schedule(cadence=tuple(rebalance_cadences), computed_only=True))
-        rebal_dates = [d for d in rebal_dates if d in allowed]
+    if rebal_freq == "monthly":
+        # One rebalance per calendar month: the last usable snapshot in each month.
+        # Follows whatever cadence the pipeline actually produced (month-ends
+        # historically, weekly recently) without reading cadence tags, so the book is
+        # rebalanced every month through the latest month and never held stale.
+        by_month: dict[str, str] = {}
+        for d in usable_snaps:
+            by_month[d[:7]] = d
+        rebal_dates = sorted(by_month.values())
+    else:
+        # Quarterly: every usable snapshot date, optionally restricted to specific
+        # snapshot cadences (canonical schedule) so a weekly run never forces a rebalance.
+        rebal_dates = list(usable_snaps)
+        if rebalance_cadences:
+            allowed = set(get_snapshot_schedule(cadence=tuple(rebalance_cadences), computed_only=True))
+            rebal_dates = [d for d in rebal_dates if d in allowed]
 
     if len(rebal_dates) < 2:
         return {"error": "Not enough rebalancing dates in the backtest window."}
@@ -285,13 +241,13 @@ def run_optimised_backtest(
         uni_snap     = find_nearest_before(snap_date, universe_dates)
         bm_snap      = find_nearest_before(snap_date, benchmark_dates)
         barra_date   = find_nearest_before(snap_date, barra_lookup_dates)
-        risk_date    = find_nearest_before(snap_date, risk_lookup_dates)
+        risk_date    = barra_date
 
         if alpha_date is None or uni_snap is None:
             warnings.append(f"{snap_date}: no alpha or universe snapshot available — skipped.")
             continue
-        if risk_date is None:
-            warnings.append(f"{snap_date}: no LW risk date available — skipped.")
+        if barra_date is None:
+            warnings.append(f"{snap_date}: no Barra risk date available — skipped.")
             continue
 
         uni_isins = isins_at_date(universe_name, uni_snap)

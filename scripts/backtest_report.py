@@ -1,6 +1,6 @@
 """backtest_report.py — standalone HTML showcase of a strategy's walk-forward backtest.
 
-Runs the shared CVXPY walk-forward engine (scripts.backtest_engine) for one active
+Runs the shared CVXPY walk-forward engine (backtest) for one active
 strategy and renders a self-contained HTML report: cumulative growth vs benchmarks,
 drawdown, rolling tracking error, calendar-year returns, active sector tilts, turnover,
 a headline metrics table, latest holdings, and a methodology narrative.
@@ -29,11 +29,11 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))             # repo root: config, optimize_portfolio
-sys.path.insert(0, str(ROOT / "scripts")) # scripts: report_utils, backtest_engine
+sys.path.insert(0, str(ROOT))             # repo root: config, optimize_portfolio, backtest
+sys.path.append(str(ROOT / "scripts"))    # scripts: report_utils only
 
 from config import RETURNS_DB, RISK_DB                     # noqa: E402
-from backtest_engine import run_optimised_backtest         # noqa: E402
+from backtest import run_optimised_backtest                # noqa: E402
 from optimize_portfolio import load_strategy_params        # noqa: E402
 from report_utils import CSS, fmt_pct, kpi                 # noqa: E402
 

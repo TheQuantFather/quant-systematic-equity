@@ -10,12 +10,16 @@ don't depend on MOSEK being licensed.
 
 import numpy as np
 import pytest
+import sqlite3
+import zlib
 
+import optimize_portfolio as optimizer_module
 # Importing optimize_portfolio runs the MOSEK symlink shim — harmless.
 from optimize_portfolio import (
     _optimize_alpha,
     _optimize_min_variance,
     _optimize_sharpe,
+    load_barra_L,
 )
 
 
@@ -56,6 +60,42 @@ def _basic_strategy(objective, **constraint_overrides):
     }
 
 
+def _write_barra_fixture(db_path, exposures, idio_rows, factor_var=0.01):
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript("""
+            CREATE TABLE factor_covariance (
+                snapshot_date TEXT PRIMARY KEY,
+                factor_names TEXT NOT NULL,
+                cov_blob BLOB NOT NULL
+            );
+            CREATE TABLE factor_exposures (
+                snapshot_date TEXT NOT NULL,
+                security_id TEXT NOT NULL,
+                factor_id TEXT NOT NULL,
+                exposure REAL NOT NULL
+            );
+            CREATE TABLE idiosyncratic_vars (
+                snapshot_date TEXT NOT NULL,
+                security_id TEXT NOT NULL,
+                idio_var REAL NOT NULL
+            );
+        """)
+        F = np.array([[factor_var]], dtype=np.float32)
+        conn.execute(
+            "INSERT INTO factor_covariance VALUES (?,?,?)",
+            ("2026-01-01", '["market"]', zlib.compress(F.tobytes())),
+        )
+        conn.executemany(
+            "INSERT INTO factor_exposures VALUES (?,?,?,?)",
+            [("2026-01-01", sid, "market", exp) for sid, exp in exposures],
+        )
+        conn.executemany(
+            "INSERT INTO idiosyncratic_vars VALUES (?,?,?)",
+            [("2026-01-01", sid, var) for sid, var in idio_rows],
+        )
+        conn.commit()
+
+
 # ── Sanity properties (apply to every objective) ────────────────────────────
 
 def _assert_valid_simplex(weights, max_position):
@@ -63,6 +103,37 @@ def _assert_valid_simplex(weights, max_position):
     assert np.all(weights >= -1e-7), f"negative weight: {weights}"
     assert weights.sum() == pytest.approx(1.0, abs=1e-5)
     assert weights.max() <= max_position + 1e-5
+
+
+# ── Barra loader guardrails ─────────────────────────────────────────────────
+
+def test_load_barra_l_rejects_missing_factor_exposures(tmp_path, monkeypatch):
+    db_path = tmp_path / "risk.db"
+    _write_barra_fixture(
+        db_path,
+        exposures=[("A", 1.0)],
+        idio_rows=[("A", 0.04), ("B", 0.09)],
+    )
+    monkeypatch.setattr(optimizer_module, "RISK_DB", db_path)
+
+    assert load_barra_L("2026-01-01", ["A", "B"]) is None
+
+
+def test_load_barra_l_uses_snapshot_median_for_missing_idio(tmp_path, monkeypatch):
+    db_path = tmp_path / "risk.db"
+    _write_barra_fixture(
+        db_path,
+        exposures=[("A", 1.0), ("B", 1.0)],
+        idio_rows=[("A", 0.04), ("C", 0.16)],
+        factor_var=0.01,
+    )
+    monkeypatch.setattr(optimizer_module, "RISK_DB", db_path)
+
+    L = load_barra_L("2026-01-01", ["A", "B"])
+    assert L is not None
+    variances = np.sum(L ** 2, axis=1)
+    assert variances[0] == pytest.approx(0.05, abs=1e-8)
+    assert variances[1] == pytest.approx(0.11, abs=1e-8)
 
 
 # ── maximize_alpha ──────────────────────────────────────────────────────────

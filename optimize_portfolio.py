@@ -20,8 +20,9 @@ maximize_sharpe     Absolute return: maximize Sharpe via Charnes-Cooper transfor
 minimize_variance   Pure risk minimisation: no alpha signal, just minimize w'Σw.
                     Good for capital preservation / low-vol mandates.
 
-Risk model today:  Ledoit-Wolf sample covariance (risk.db)
-Risk model future: swap load_covariance() for Barra BFB'+D — optimizer unchanged
+Risk model: Barra factor model (risk.db factor_covariance / factor_exposures /
+            idiosyncratic_vars). Ledoit-Wolf remains available for analysis,
+            but is not an optimizer fallback.
 """
 
 import argparse
@@ -111,21 +112,16 @@ def _latest_risk_date(use_barra: bool) -> str:
     with get_db(RISK_DB) as conn:
         if use_barra:
             row = conn.execute(
-                """
-                SELECT c.data_date
-                FROM covariance_matrix c
-                JOIN factor_covariance f ON f.snapshot_date = c.data_date
-                ORDER BY c.data_date DESC
-                LIMIT 1
-                """
+                "SELECT MAX(snapshot_date) FROM factor_covariance"
             ).fetchone()
         else:
-            row = conn.execute(
-                "SELECT MAX(data_date) FROM covariance_matrix"
-            ).fetchone()
+            raise ValueError(
+                "Ledoit-Wolf is disabled for optimizer risk. "
+                "Use Barra factor_covariance snapshots instead."
+            )
 
     if row is None or not row[0]:
-        model = "Ledoit-Wolf + Barra" if use_barra else "Ledoit-Wolf"
+        model = "Barra" if use_barra else "Ledoit-Wolf"
         raise ValueError(f"No {model} risk snapshot found.")
     return str(row[0])
 
@@ -188,6 +184,11 @@ def load_strategy_params(strategy_id: str | None = None) -> list[dict]:
             risk_aversion = 0.0
         use_barra_raw   = _param_str(row, "use_barra_risk", "TRUE").upper()
         use_barra      = use_barra_raw != "FALSE"   # default True unless explicitly FALSE
+        if not use_barra:
+            raise ValueError(
+                f"Strategy {sid!r} has use_barra_risk=FALSE, but Ledoit-Wolf is "
+                "disabled for optimizer risk."
+            )
         alpha_date_raw = row.get("alpha_date", "")
         risk_date_raw  = row.get("risk_date", "")
         alpha_date     = _latest_alpha_date(list(alpha_weights)) if _date_is_latest(alpha_date_raw) else str(alpha_date_raw).strip()
@@ -248,6 +249,11 @@ def load_index_benchmark(index_name: str, snapshot_date: str) -> tuple[pd.DataFr
         "benchmark_source_snapshot_date": result.source_snapshot_date,
         "benchmark_tradable": int(len(members)),
         "benchmark_blocked": int((~result.members["is_tradable"]).sum()),
+        "identity_aliases": {
+            str(row["isin"]): str(row["mapped_from_isin"])
+            for _, row in members.iterrows()
+            if str(row.get("mapped_from_isin") or "").strip()
+        },
     }
     return df, meta
 
@@ -410,6 +416,27 @@ def _latest_barra_date() -> str | None:
         return None
 
 
+def load_barra_universe(barra_date: str) -> list[str]:
+    """Return security_ids with Barra factor exposure coverage for a snapshot."""
+    with get_db(RISK_DB) as conn:
+        row = conn.execute(
+            "SELECT factor_names FROM factor_covariance WHERE snapshot_date=?",
+            (barra_date,),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"No Barra factor covariance for {barra_date}. Run create_barra.py first.")
+        factor_names = json.loads(row[0])
+        factor_id = "market" if "market" in factor_names else factor_names[0]
+        rows = conn.execute(
+            "SELECT security_id FROM factor_exposures "
+            "WHERE snapshot_date=? AND factor_id=? ORDER BY security_id",
+            (barra_date, factor_id),
+        ).fetchall()
+    if not rows:
+        raise ValueError(f"No Barra factor exposures for {barra_date}. Run create_barra.py first.")
+    return [r[0] for r in rows]
+
+
 def load_barra_L(
     barra_date: str,
     investable: list[str],
@@ -474,15 +501,40 @@ def load_barra_L(
                     i = isin_idx[target]
                     if not filled[i, j]:
                         X[i, j] = float(exp_val)
+                        filled[i, j] = True
 
-            # Idiosyncratic variances (annualised); default ≈ 20% annual vol if missing
-            delta  = np.full(N, 0.04)
+            market_col = factor_idx.get("market")
+            if market_col is not None:
+                has_exposure = filled[:, market_col]
+            else:
+                has_exposure = filled.any(axis=1)
+            missing_x = [isin for isin, i in isin_idx.items() if not has_exposure[i]]
+            if missing_x:
+                sample = ", ".join(missing_x[:10])
+                more = "" if len(missing_x) <= 10 else f", ... +{len(missing_x) - 10}"
+                log.warning(
+                    "Barra snapshot %s is missing factor exposures for %d/%d investable names "
+                    "after aliases (%s%s); Barra risk unavailable.",
+                    barra_date, len(missing_x), N, sample, more,
+                )
+                return None
+
+            # Idiosyncratic variances (annualised). Missing names receive the
+            # snapshot median instead of a hardcoded 20% annual vol so coverage
+            # holes do not look artificially low-risk.
             filled_delta = np.zeros(N, dtype=bool)
             rows_d = conn.execute(
                 f"SELECT security_id, idio_var FROM idiosyncratic_vars "
                 f"WHERE snapshot_date=? AND security_id IN ({ph})",
                 [barra_date] + query_isins,
             ).fetchall()
+            all_d = conn.execute(
+                "SELECT idio_var FROM idiosyncratic_vars WHERE snapshot_date=?",
+                (barra_date,),
+            ).fetchall()
+            snapshot_delta = [float(r[0]) for r in all_d if r[0] is not None and np.isfinite(float(r[0]))]
+            delta_default = float(np.median(snapshot_delta)) if snapshot_delta else 0.04
+            delta  = np.full(N, delta_default)
             for sec_id, idio_var in rows_d:
                 if sec_id in isin_idx:
                     i = isin_idx[sec_id]
@@ -493,6 +545,16 @@ def load_barra_L(
                     i = isin_idx[target]
                     if not filled_delta[i]:
                         delta[i] = float(idio_var)
+                        filled_delta[i] = True
+            missing_delta = [isin for isin, i in isin_idx.items() if not filled_delta[i]]
+            if missing_delta:
+                sample = ", ".join(missing_delta[:10])
+                more = "" if len(missing_delta) <= 10 else f", ... +{len(missing_delta) - 10}"
+                log.warning(
+                    "Barra snapshot %s is missing idiosyncratic variance for %d/%d names "
+                    "after aliases (%s%s); using snapshot median %.6f.",
+                    barra_date, len(missing_delta), N, sample, more, delta_default,
+                )
 
         # Cholesky of factor covariance (apply spectral floor if needed)
         try:
@@ -507,7 +569,7 @@ def load_barra_L(
         return np.vstack([A, B]).T                   # (N, K+N)
 
     except Exception as exc:
-        log.warning("Barra load failed (%s); falling back to Ledoit-Wolf.", exc)
+        log.warning("Barra load failed (%s).", exc)
         return None
 
 
@@ -551,11 +613,23 @@ def _load_clean_investable(index_name: str, snapshot_date: str) -> tuple[list[st
     return sorted(set(tradable["isin"].dropna().astype(str))), meta
 
 
-def _build_investable(strategy, bm_df, risk_isins, risk_isin_idx, universe_isins=None):
+def _build_investable(
+    strategy,
+    bm_df,
+    risk_isins,
+    risk_isin_idx,
+    universe_isins=None,
+    identity_aliases: dict[str, str] | None = None,
+):
+    identity_aliases = identity_aliases or {}
+    def _has_risk(isin: str) -> bool:
+        alias = identity_aliases.get(isin)
+        return isin in risk_isin_idx or (alias is not None and alias in risk_isin_idx)
+
     if strategy["investable_universe"] == "benchmark_only":
-        investable = sorted({i for i in bm_df["isin"] if i in risk_isin_idx})
+        investable = sorted({i for i in bm_df["isin"] if _has_risk(i)})
     elif universe_isins is not None:
-        investable = sorted({i for i in universe_isins if i in risk_isin_idx})
+        investable = sorted({i for i in universe_isins if _has_risk(i)})
     else:
         investable = sorted(set(risk_isins))
 
@@ -1285,8 +1359,8 @@ def optimize_for_backtest(
     objective     : "maximize_alpha" | "maximize_sharpe" | "minimize_variance"
     constraints   : dict of constraint name → value (from Constraints sheet)
     alpha_date    : model snapshot date used to load alpha scores
-    barra_date    : Barra snapshot to use (None → Ledoit-Wolf only)
-    risk_date     : Ledoit-Wolf snapshot date (fallback / universe alignment)
+    barra_date    : Barra snapshot to use (required)
+    risk_date     : retained for logging compatibility; Barra supplies risk
     sp500_isins   : candidate universe for this period
     bm_weights    : {isin: weight} for benchmark vector (maximize_alpha only);
                     pass {} for equal-weight fallback
@@ -1305,11 +1379,10 @@ def optimize_for_backtest(
     import io as _io
 
     try:
-        # Ledoit-Wolf covariance used for dimension alignment and fallback risk
-        risk_cov, risk_isins = load_covariance(risk_date)
-        risk_isin_idx = {isin: i for i, isin in enumerate(risk_isins)}
+        if barra_date is None:
+            raise ValueError("Barra snapshot is required; Ledoit-Wolf optimizer fallback is disabled.")
 
-        # Investable = S&P 500 ∩ LW risk model; require at least 50 stocks
+        risk_isins = load_barra_universe(barra_date)
         investable = sorted(set(sp500_isins) & set(risk_isins))
         if len(investable) < 50:
             return None
@@ -1322,17 +1395,13 @@ def optimize_for_backtest(
         meta_df = load_universe_metadata()
         gics_df = meta_df.set_index("isin")
 
-        # Risk model: Barra (preferred) → Ledoit-Wolf
-        Sigma, L = _covariance_submatrix(risk_cov, risk_isin_idx, investable)
-        used_barra = False
-        if barra_date is not None:
-            buf = _io.StringIO()
-            with contextlib.redirect_stdout(buf):
-                L_barra = load_barra_L(barra_date, investable)
-            if L_barra is not None:
-                L          = L_barra
-                Sigma      = None
-                used_barra = True
+        buf = _io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            L = load_barra_L(barra_date, investable)
+        if L is None:
+            raise RuntimeError(f"Barra risk model unavailable for {barra_date}.")
+        Sigma = None
+        used_barra = True
 
         N = len(investable)
 
@@ -1412,12 +1481,12 @@ def optimize_for_backtest(
                     raw_sub   = prev_w_arr[lp_arr]
                     sub_total = raw_sub.sum()
                     prev_w_arr = raw_sub / sub_total if sub_total > 1e-10 else None
-                Sigma, L = _covariance_submatrix(risk_cov, risk_isin_idx, investable)
-                if used_barra and barra_date is not None:
-                    L_b2 = load_barra_L(barra_date, investable)
-                    if L_b2 is not None:
-                        L     = L_b2
-                        Sigma = None
+                L = load_barra_L(barra_date, investable)
+                if L is None:
+                    raise RuntimeError(
+                        f"Barra risk model unavailable for pre-screened universe on {barra_date}."
+                    )
+                Sigma = None
                 sectors, industries, B_sector, B_ind, _sector_fn, _industry_fn = \
                     _sector_industry_matrices(investable, gics_df)
                 issuers, B_issuer, _issuer_fn = _issuer_matrices(investable, gics_df)
@@ -1506,10 +1575,14 @@ def run_optimization(strategy: dict) -> tuple[pd.DataFrame, dict]:
 
     objective = strategy["objective"]
 
-    log.info("Loading covariance ...")
-    risk_cov, risk_isins = load_covariance(strategy["risk_date"])
+    if not strategy.get("use_barra_risk", True):
+        raise ValueError("Ledoit-Wolf is disabled for optimizer risk; use Barra.")
+
+    log.info("Loading Barra risk coverage ...")
+    used_barra_date = strategy["risk_date"]
+    risk_isins = load_barra_universe(used_barra_date)
     risk_isin_idx = {isin: i for i, isin in enumerate(risk_isins)}
-    log.info("  %d stocks in risk model", len(risk_isins))
+    log.info("  %d stocks in Barra risk model (%s)", len(risk_isins), used_barra_date)
 
     universe_isins: list[str] | None = None
     universe_meta: dict = {}
@@ -1533,6 +1606,7 @@ def run_optimization(strategy: dict) -> tuple[pd.DataFrame, dict]:
     if benchmark_index:
         log.info("Loading clean benchmark: %s ...", benchmark_index)
         bm_df, bm_meta = load_index_benchmark(benchmark_index, strategy["risk_date"])
+        identity_aliases.update(bm_meta.get("identity_aliases", {}))
         log.info(
             "  %d benchmark stocks from %s (%d blocked)",
             bm_meta["benchmark_tradable"],
@@ -1561,7 +1635,9 @@ def run_optimization(strategy: dict) -> tuple[pd.DataFrame, dict]:
     meta_df = load_universe_metadata()
     gics_df = meta_df.set_index("isin")
 
-    investable  = _build_investable(strategy, bm_df, risk_isins, risk_isin_idx, universe_isins)
+    investable  = _build_investable(
+        strategy, bm_df, risk_isins, risk_isin_idx, universe_isins, identity_aliases
+    )
     alpha_arr   = np.array([
         alpha_lookup.get(isin, alpha_lookup.get(identity_aliases.get(isin, ""), 0.0))
         for isin in investable
@@ -1573,38 +1649,14 @@ def run_optimization(strategy: dict) -> tuple[pd.DataFrame, dict]:
     isin_to_pos = {isin: i for i, isin in enumerate(investable)}
     log.info("Investable universe: %d stocks", N)
 
-    # ── Risk model: Barra (default) or Ledoit-Wolf fallback ──────────────────
-    Sigma, L = _covariance_submatrix(risk_cov, risk_isin_idx, investable)
-
-    use_barra  = strategy.get("use_barra_risk", True)
-    used_barra_date: str | None = None
-    if use_barra:
-        # Align Barra with the strategy's configured risk_date so the factor and
-        # Ledoit-Wolf risk models reference the same snapshot. Only fall back to the
-        # latest Barra snapshot when that exact date is missing — and log loudly,
-        # because a date mismatch silently mixes risk models from different days.
-        risk_date  = strategy["risk_date"]
-        L_barra    = load_barra_L(risk_date, investable, identity_aliases)
-        barra_date = risk_date
-        if L_barra is None:
-            fallback = _latest_barra_date()
-            if fallback and fallback != risk_date:
-                log.warning(
-                    "Barra has no snapshot for risk_date %s — falling back to latest %s. "
-                    "Risk-model date now differs from alpha/Ledoit-Wolf (%s).",
-                    risk_date, fallback, risk_date,
-                )
-                L_barra    = load_barra_L(fallback, investable, identity_aliases)
-                barra_date = fallback
-        if L_barra is not None:
-            L     = L_barra
-            Sigma = None   # not needed — _variance() uses ||L.T @ w||² instead
-            used_barra_date = barra_date
-            log.info("Risk model: Barra (%s)  [%d factors+stocks]", barra_date, L.shape[1])
-        else:
-            log.info("Risk model: Ledoit-Wolf (Barra unavailable)")
-    else:
-        log.info("Risk model: Ledoit-Wolf")
+    # ── Risk model: Barra only ───────────────────────────────────────────────
+    L = load_barra_L(used_barra_date, investable, identity_aliases)
+    if L is None:
+        raise RuntimeError(
+            f"Barra risk model unavailable for {used_barra_date}; optimizer aborted."
+        )
+    Sigma = None   # _variance() uses ||L.T @ w||² for Barra.
+    log.info("Risk model: Barra (%s)  [%d factors+stocks]", used_barra_date, L.shape[1])
 
     alpha    = alpha_arr
 
@@ -1665,12 +1717,12 @@ def run_optimization(strategy: dict) -> tuple[pd.DataFrame, dict]:
             alpha       = alpha[lp_arr]
             b           = b[lp_arr]
             bm_display  = bm_display[lp_arr]
-            Sigma, L    = _covariance_submatrix(risk_cov, risk_isin_idx, investable)
-            if used_barra_date:
-                L_barra = load_barra_L(used_barra_date, investable, identity_aliases)
-                if L_barra is not None:
-                    L = L_barra
-                    Sigma = None
+            L = load_barra_L(used_barra_date, investable, identity_aliases)
+            if L is None:
+                raise RuntimeError(
+                    f"Barra risk model unavailable for pre-screened universe on {used_barra_date}."
+                )
+            Sigma = None
             sectors, industries, B_sector, B_ind, _sector_fn, _industry_fn = \
                 _sector_industry_matrices(investable, gics_df)
             issuers, B_issuer, _issuer_fn = _issuer_matrices(investable, gics_df)
@@ -1719,12 +1771,12 @@ def run_optimization(strategy: dict) -> tuple[pd.DataFrame, dict]:
             alpha       = alpha[top_arr]
             b           = b[top_arr]
             bm_display  = bm_display[top_arr]
-            Sigma, L    = _covariance_submatrix(risk_cov, risk_isin_idx, investable)
-            if used_barra_date:
-                L_barra = load_barra_L(used_barra_date, investable, identity_aliases)
-                if L_barra is not None:
-                    L = L_barra
-                    Sigma = None
+            L = load_barra_L(used_barra_date, investable, identity_aliases)
+            if L is None:
+                raise RuntimeError(
+                    f"Barra risk model unavailable for pre-screened universe on {used_barra_date}."
+                )
+            Sigma = None
             sectors, industries, B_sector, B_ind, _sector_fn, _industry_fn = \
                 _sector_industry_matrices(investable, gics_df)
             issuers, B_issuer, _issuer_fn = _issuer_matrices(investable, gics_df)

@@ -110,6 +110,7 @@ EIGENFLOOR     = 1e-6    # spectral floor for factor covariance (ensures PSD)
 VRA_MIN        = 0.50    # lower clip for VRA bias statistic B² (factor & specific)
 VRA_MAX        = 2.00    # upper clip for B²
 MIN_STOCKS     = 50      # minimum stocks per day to run cross-sectional regression
+BARRA_RETURN_CLIP = LW_WINSOR_CLIP  # clip risk-estimation returns, matching Ledoit-Wolf
 
 # ---------------------------------------------------------------------------
 # Barra sector definitions — order determines column indices 0-10 in X matrix.

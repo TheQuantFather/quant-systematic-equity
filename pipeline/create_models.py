@@ -18,11 +18,14 @@ import argparse
 import csv
 import math
 import sqlite3
+import sys
 from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config import (
     FACTORS_DB, MODELS_DB, UNIVERSE_DB,
@@ -336,6 +339,10 @@ def main() -> None:
 
     with get_db(MODELS_DB) as conn:
         setup_models_db(conn, clean=args.clean)
+        if dates and not args.clean:
+            placeholders = ",".join("?" * len(dates))
+            conn.execute(f"DELETE FROM models WHERE data_date IN ({placeholders})", dates)
+            log.info("Cleared existing model rows for %d date(s)", len(dates))
 
         log.info("=== Stage 1: Base models from factor z-scores ===")
         n1 = compute_base_models(conn, base_models, factors_data, factor_directions,

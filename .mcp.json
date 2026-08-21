@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "quant-sqlite": {
+      "command": "/Users/shivam/opt/anaconda3/envs/quant/bin/python3.13",
+      "args": ["/Users/shivam/Desktop/Programming/Quant/scripts/mcp_sqlite_server.py"]
+    }
+  }
+}

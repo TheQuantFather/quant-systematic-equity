@@ -31,7 +31,7 @@ from config import (
     RISK_DB,
     UNIVERSE_DB,
 )
-from scripts.backtest_engine import (
+from backtest import (
     find_nearest_before as _find_nearest_before,
     load_returns_matrix as _load_returns_matrix_impl,
     run_optimised_backtest as _run_optimised_backtest_impl,
@@ -1144,7 +1144,7 @@ def _run_optimised_backtest(
     max_positions_override: int | None = None,
     solver: str = "CLARABEL",
 ) -> dict:
-    """Streamlit-cached wrapper over scripts.backtest_engine.run_optimised_backtest.
+    """Streamlit-cached wrapper over backtest.run_optimised_backtest.
 
     The walk-forward simulation lives in the shared engine so the interactive page
     and the standalone HTML report (scripts/backtest_report.py) stay in lockstep.
