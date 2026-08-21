@@ -26,6 +26,7 @@ Usage:
 """
 
 import argparse
+import os
 import select
 import subprocess
 import sys
@@ -52,6 +53,8 @@ TIMEOUTS: dict[str, int] = {
     "short_interest": 900,  # 15m — FINRA consolidated short interest (semi-monthly; daily no-op between settlements)
     "filings":   3600,   # 1h — EDGAR index + per-company fetches
     "macro":      300,   # 5m  — FRED/Yahoo: 8 series, 3 retries each
+    "fillgaps_annual":    5400,  # 90m — monthly full-universe annual fill-gaps
+    "fillgaps_quarterly": 5400,  # 90m — monthly full-universe quarterly fill-gaps
     "factors":   2700,   # 45m
     "models":     900,   # 15m
     "risk":      2700,   # 45m
@@ -104,7 +107,11 @@ def run(cmd: list[str], timeout: int, dry_run: bool = False) -> bool:
         log.info("  [dry-run] %s", " ".join(cmd))
         return True
 
-    t0 = time.time()
+    # Monotonic clock, not wall-clock: on macOS time.monotonic() does not advance
+    # while the machine is asleep, so a mid-run sleep (laptop napping between the
+    # 6:30 wake and the end of a long yfinance pull) no longer counts against the
+    # step timeout and falsely kills it on wake. Elapsed values are true awake time.
+    t0 = time.monotonic()
     try:
         proc = subprocess.Popen(
             cmd, cwd=REPO_DIR,
@@ -124,11 +131,11 @@ def run(cmd: list[str], timeout: int, dry_run: bool = False) -> bool:
     deadline = t0 + timeout
     try:
         while True:
-            remaining = deadline - time.time()
+            remaining = deadline - time.monotonic()
             if remaining <= 0:
                 _stop_process(proc)
                 log.error("TIMEOUT %s after %.0fs (limit %ds)",
-                          label, time.time() - t0, timeout)
+                          label, time.monotonic() - t0, timeout)
                 return False
 
             # Wake at most every 5 s to recheck the deadline even if the child
@@ -153,7 +160,7 @@ def run(cmd: list[str], timeout: int, dry_run: bool = False) -> bool:
             log.info("  %s", ln)
 
     rc      = proc.wait()
-    elapsed = time.time() - t0
+    elapsed = time.monotonic() - t0
     if rc != 0:
         log.error("FAILED  %s (exit %d, %.0fs)", label, rc, elapsed)
         return False
@@ -212,6 +219,8 @@ def main() -> None:
                         help="Print steps without executing")
     parser.add_argument("--force-weekly",   action="store_true",
                         help="Run the full weekly rebuild today regardless of day")
+    parser.add_argument("--force-monthly",  action="store_true",
+                        help="Run the monthly EDGAR fill-gaps sweep today regardless of day")
     parser.add_argument("--skip-returns",   action="store_true",
                         help="Skip price update (downstream runs against existing DB)")
     parser.add_argument("--skip-svr",       action="store_true",
@@ -228,13 +237,35 @@ def main() -> None:
     today       = date.today()
     is_friday   = today.weekday() == 4
     run_weekly  = is_friday or args.force_weekly
+    # Monthly EDGAR fill-gaps on the first Friday of the month. The daily index
+    # scan keeps *quarters* current but never re-ingests *annual* 10-Ks (by the
+    # time a 10-K is filed, that fiscal year's Q1–Q3 are already stored, so
+    # process_filing_annual's `fy <= latest_fy` guard skips it). Non-Dec-FYE
+    # filers therefore fall behind on their annual right after their spring
+    # year-end. This monthly full-universe fill-gaps sweep re-checks every
+    # company for missing annual/quarterly years and pulls them before the
+    # weekly rebuild recomputes factors. See GOTCHAS.md.
+    run_monthly = (is_friday and today.day <= 7) or args.force_monthly
     snap_date   = today.isoformat()
 
     log.info("=" * 60)
     log.info("Ecosystem update starting — %s", datetime.now().isoformat())
     log.info("Python: %s", PYTHON)
-    log.info("Weekly rebuild: %s", f"YES ({snap_date})" if run_weekly else "no (not Friday)")
+    log.info("Weekly rebuild:  %s", f"YES ({snap_date})" if run_weekly else "no (not Friday)")
+    log.info("Monthly fill-gaps: %s", "YES" if run_monthly else "no (not first Friday)")
     log.info("=" * 60)
+
+    # Keep the machine awake for the whole run so a mid-run nap can't suspend a
+    # long yfinance pull. caffeinate is spawned as a CHILD tied to our PID (-w),
+    # never as the launchd program — as the program it would become the
+    # TCC-responsible process and lose this repo's ~/Desktop access (python
+    # launched directly by launchd keeps it). The child exits when we do.
+    if not args.dry_run:
+        try:
+            subprocess.Popen(["/usr/bin/caffeinate", "-s", "-i", "-w", str(os.getpid())])
+            log.info("caffeinate no-sleep assertion held for this run (pid %d)", os.getpid())
+        except Exception as exc:  # missing binary / non-macOS — degrade gracefully
+            log.warning("could not start caffeinate (continuing without): %s", exc)
 
     # results[name] ∈ {True, False}.  Steps marked True (either ran successfully
     # or user explicitly skipped) allow downstream steps to proceed.  False
@@ -279,6 +310,18 @@ def main() -> None:
         results["macro"] = True
     else:
         step("macro", "create_macro_signals.py", "--date", snap_date)
+
+    # ── Monthly EDGAR fill-gaps sweep ──────────────────────────────────────
+    # Catches new annual 10-Ks (and any missed quarters) the daily index scan
+    # cannot ingest. Runs before the weekly rebuild so factors pick up the new
+    # annuals. fill-gaps is idempotent — it only fetches fiscal years/quarters
+    # not already stored, so complete companies cost just one EDGAR lookup.
+    if run_monthly:
+        log.info("--- Monthly EDGAR fill-gaps sweep ---")
+        step("fillgaps_annual", "update_constituents.py",
+             "--fill-gaps", "--cache-filings", depends_on=("filings",))
+        step("fillgaps_quarterly", "update_constituents.py",
+             "--fill-gaps", "--quarterly", "--cache-filings", depends_on=("filings",))
 
     # ── Weekly rebuild ─────────────────────────────────────────────────────
     if run_weekly:

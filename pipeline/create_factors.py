@@ -5,7 +5,9 @@ create_factors.py — Point-in-time factor snapshots, written to factors.db.
 Each snapshot date produces one cross-section:
   - Only financial data with publish_date <= snapshot_date is used (no look-ahead).
   - Per company, the most recent annual report available by that date is chosen.
-  - Prices are referenced as of snapshot_date.
+  - Scheduled snapshots reference prices as of snapshot_date. Ad-hoc/manual
+    snapshots reference the prior trading close, so a same-day signal is
+    tradable from the snapshot date without using that day's close.
   - Z-scores are computed cross-sectionally within (data_date, factor_id).
 
 Usage:
@@ -22,6 +24,7 @@ Run order:
 
 import argparse
 import sqlite3
+import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -30,6 +33,7 @@ import pandas as pd
 from dateutil.relativedelta import relativedelta
 from typing import Optional
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config import (
     UNIVERSE_DB, CONSTITUENTS_DB, RETURNS_DB, FACTORS_DB,
@@ -639,6 +643,68 @@ def load_price_data() -> dict:
         )
     log.info("Loaded price data for %s ISINs", f"{len(prices):,}")
     return prices
+
+
+def load_trading_calendar(prices: dict) -> np.ndarray:
+    """Sorted union of trading dates available in the returns price panel."""
+    if not prices:
+        return np.array([], dtype="datetime64[ns]")
+    dates = np.concatenate([entry[0] for entry in prices.values() if len(entry[0])])
+    if len(dates) == 0:
+        return np.array([], dtype="datetime64[ns]")
+    return np.unique(dates.astype("datetime64[ns]"))
+
+
+def load_snapshot_cadences() -> dict[str, str]:
+    """{data_date: cadence} from the canonical snapshot schedule."""
+    if not UNIVERSE_DB.exists():
+        return {}
+    with get_db(UNIVERSE_DB) as conn:
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='snapshot_schedule'"
+        ).fetchone()
+        if not exists:
+            return {}
+        return {
+            str(data_date): str(cadence)
+            for data_date, cadence in conn.execute(
+                "SELECT data_date, cadence FROM snapshot_schedule"
+            ).fetchall()
+        }
+
+
+def market_data_asof_date(
+    snapshot: date,
+    trading_calendar: np.ndarray,
+    snapshot_cadences: dict[str, str],
+) -> date:
+    """
+    Market-data cut-off for a factor snapshot.
+
+    Scheduled snapshots (monthly/weekly/legacy) keep the historical convention:
+    data_date is the market close used by price/return factors, and consumers
+    trade it at the next rebalance. Ad-hoc/manual snapshots are safer as
+    same-day tradable signals, so their market data is cut off at the prior
+    trading day. This prevents an ad-hoc 2026-04-01 snapshot from using the
+    2026-04-01 close and then being used for 2026-04-01 returns.
+    """
+    date_str = snapshot.strftime("%Y-%m-%d")
+    cadence = snapshot_cadences.get(date_str)
+    if cadence in {"monthly", "weekly", "legacy"}:
+        return snapshot
+    if len(trading_calendar) == 0:
+        return snapshot
+
+    ref_np = np.datetime64(snapshot, "D").astype("datetime64[ns]")
+    idx = int(np.searchsorted(trading_calendar, ref_np, side="left")) - 1
+    if idx < 0:
+        log.warning(
+            "%s: no prior trading day found for ad-hoc/manual market-data cutoff; "
+            "using snapshot date",
+            date_str,
+        )
+        return snapshot
+    return pd.Timestamp(trading_calendar[idx]).date()
 
 
 def load_splits() -> dict:
@@ -1632,6 +1698,7 @@ def setup_factors_db(conn: sqlite3.Connection, clean: bool = False) -> None:
 
 def run_for_date(
     snapshot: date,
+    market_asof: date,
     universe: dict,
     ticker_map: dict,
     constituent_data: dict,
@@ -1647,9 +1714,13 @@ def run_for_date(
 ) -> int:
     """Compute and write all factor rows for one snapshot date. Returns row count."""
     date_str      = snapshot.strftime('%Y-%m-%d')
+    market_str    = market_asof.strftime('%Y-%m-%d')
     today         = datetime.now().strftime('%Y-%m-%d')
     rows          = []
     unknown_names: set = set()
+
+    if market_asof != snapshot:
+        log.info("%s: market-data factors use prior close %s", date_str, market_str)
 
     snapshot_isins = load_snapshot_isins(snapshot)
     if snapshot_isins is not None:
@@ -1658,41 +1729,52 @@ def run_for_date(
     else:
         active_universe = universe
 
+    no_constituents = 0
+    no_ltm = 0
+    price_only = 0
+
     for isin, meta in active_universe.items():
         ticker = meta.get('ticker') or ticker_map.get(isin)
         if not ticker:
             continue
         sid_data = constituent_data.get(isin)
-        if not sid_data:
-            continue
 
         # Growth factors use the multi-year trend series, not the prior-year LTM.
-        cdata, _ = select_ltm_data(sid_data, kind_map, snapshot)
-        if not cdata:
-            continue
-        growth_series = select_growth_series(sid_data, kind_map, snapshot)
+        if sid_data:
+            cdata, _ = select_ltm_data(sid_data, kind_map, snapshot)
+            growth_series = select_growth_series(sid_data, kind_map, snapshot) if cdata else {}
+            if not cdata:
+                no_ltm += 1
+        else:
+            cdata = {}
+            growth_series = {}
+            no_constituents += 1
 
         # Restate point-in-time shares onto the current split-adjusted basis so
         # market cap (split-adjusted price × shares) is continuous through splits.
-        _apply_split_adjustment(cdata, isin, splits)
+        if cdata:
+            _apply_split_adjustment(cdata, isin, splits)
 
         sector_type = meta.get('sector_type', 'general')
 
         factors: dict = {}
         factors.update(compute_quality_factors(cdata))
-        factors.update(compute_value_factors(cdata, isin, prices, ref_date=snapshot))
+        factors.update(compute_value_factors(cdata, isin, prices, ref_date=market_asof))
         factors.update(compute_growth_factors(growth_series))
         factors.update(compute_stability_factors(growth_series))
-        factors.update(compute_momentum_factors(isin, prices, ref_date=snapshot))
-        factors.update(compute_size_factor(cdata, isin, prices, ref_date=snapshot))
-        factors.update(compute_low_vol_factors(isin, prices, ref_date=snapshot))
-        factors.update(compute_liquidity_factors(isin, prices, ref_date=snapshot))
-        factors.update(compute_svr_factors(isin, svr_data, ref_date=snapshot))
+        factors.update(compute_momentum_factors(isin, prices, ref_date=market_asof))
+        factors.update(compute_size_factor(cdata, isin, prices, ref_date=market_asof))
+        factors.update(compute_low_vol_factors(isin, prices, ref_date=market_asof))
+        factors.update(compute_liquidity_factors(isin, prices, ref_date=market_asof))
+        factors.update(compute_svr_factors(isin, svr_data, ref_date=market_asof))
         factors.update(compute_short_interest_factor(isin, si_data, ref_date=snapshot))
         if sector_type == 'reit':
-            factors.update(compute_reit_factors(cdata, growth_series, isin, prices, ref_date=snapshot))
+            factors.update(compute_reit_factors(cdata, growth_series, isin, prices, ref_date=market_asof))
         if sector_type == 'bank':
-            factors.update(compute_bank_factors(cdata, isin, prices, ref_date=snapshot))
+            factors.update(compute_bank_factors(cdata, isin, prices, ref_date=market_asof))
+
+        if factors and not cdata:
+            price_only += 1
 
         allowed = _ALLOWED_FACTOR_SECTORS.get(sector_type, {'all', 'general'})
 
@@ -1747,6 +1829,11 @@ def run_for_date(
     conn.commit()
 
     n_companies = len({r[2] for r in rows})  # r[2] is isin
+    if no_constituents or no_ltm or price_only:
+        log.info(
+            "%s: price-only coverage for %s names; %s missing constituents, %s missing usable LTM",
+            date_str, f"{price_only:,}", f"{no_constituents:,}", f"{no_ltm:,}",
+        )
     log.info("%s: %s companies, %s factor rows", date_str, f"{n_companies:,}", f"{len(rows):,}")
     return len(rows)
 
@@ -1801,6 +1888,8 @@ def main():
     constituent_data = load_constituent_data()
 
     prices   = load_price_data()
+    trading_calendar = load_trading_calendar(prices)
+    snapshot_cadences = load_snapshot_cadences()
     splits   = load_splits()
     svr_data = load_svr_data()
     si_data  = load_short_interest_data()
@@ -1811,8 +1900,9 @@ def main():
         total_rows = 0
         log.info("Processing %d date(s): %s", len(dates_to_run), [str(d) for d in dates_to_run])
         for snapshot in dates_to_run:
+            market_asof = market_data_asof_date(snapshot, trading_calendar, snapshot_cadences)
             total_rows += run_for_date(
-                snapshot, universe, ticker_map,
+                snapshot, market_asof, universe, ticker_map,
                 constituent_data, kind_map, prices, splits, svr_data, si_data,
                 factor_name_to_id, factor_sector_types, log_transform_ids, conn,
             )

@@ -307,17 +307,32 @@ def rebuild_snapshot_schedule(
                   for d in pd.date_range(monthly_start, weekly_cutover, freq="ME")]
 
     # Discover already-computed dates from factors.db to tag weekly/legacy and to
-    # bootstrap factors_computed_at for dates that already exist.
+    # bootstrap factors_computed_at for dates that already exist. Preserve explicit
+    # ad-hoc dates from the existing schedule: create_factors treats ad-hoc signal
+    # dates as same-day tradable and cuts market data off at the prior close.
     computed: set[str] = set()
+    existing_adhoc: set[str] = set()
     try:
         with get_db(FACTORS_DB) as fconn:
             computed = {r[0] for r in fconn.execute("SELECT data_date FROM snapshot_dates").fetchall()}
     except Exception as exc:                       # factors.db / table may not exist yet
         log.warning("Could not read factors.db snapshot_dates (%s) — schedule built from rule only", exc)
+    try:
+        with get_db(DB_PATH) as conn:
+            seed_snapshot_schedule_table(conn)
+            existing_adhoc = {
+                r[0] for r in conn.execute(
+                    "SELECT data_date FROM snapshot_schedule WHERE cadence = 'adhoc'"
+                ).fetchall()
+            }
+    except Exception as exc:
+        log.warning("Could not read existing ad-hoc snapshot schedule (%s)", exc)
 
     cadence: dict[str, str] = {d: "monthly" for d in month_ends}
     for d in computed:
-        if d >= weekly_cutover:
+        if d in existing_adhoc:
+            cadence[d] = "adhoc"
+        elif d >= weekly_cutover:
             cadence[d] = "weekly"
         elif d not in cadence:
             cadence[d] = "legacy"
@@ -2111,6 +2126,27 @@ def _write_snapshots_only(snapshots: pd.DataFrame) -> None:
              n_reg, n_acc, f"{len(snapshots):,}")
 
 
+def _series_nport_accessions(series_id: str, count: int = 40) -> set[str]:
+    """Accession numbers of N-PORT-P filings for one fund *series* via EDGAR's
+    series-scoped browse feed (CIK=S000…).
+
+    The trust-wide `fund.series.get_filings()` mixes every iShares series, so a
+    month-end filing wave from other funds can bury the one we want. Filtering by
+    series_id here returns only this series' filings, exactly and robustly.
+    """
+    url = (f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={series_id}"
+           f"&type=NPORT-P&dateb=&owner=include&count={count}&output=atom")
+    data = _edgar_fetch_bytes(url, timeout=20)
+    root = ET.fromstring(data)
+    ns = {"a": "http://www.w3.org/2005/Atom"}
+    accs: set[str] = set()
+    for entry in root.findall(".//a:entry", ns):
+        acc_el = entry.find(".//a:accession-number", ns)
+        if acc_el is not None and acc_el.text:
+            accs.add(acc_el.text.strip())
+    return accs
+
+
 def _find_latest_nport(
     snap_date_iso: str,
     etf_ticker: str,
@@ -2119,12 +2155,17 @@ def _find_latest_nport(
     max_candidates: int = 20,
 ) -> tuple[str, str] | None:
     """
-    Discover the N-PORT-P filing for `etf_ticker` with the most recent
-    period_of_report ≤ snap_date.
+    Discover the N-PORT-P filing for `etf_ticker` (series `series_id`) with the
+    most recent period_of_report ≤ snap_date that was also *filed* ≤ snap_date.
 
-    iShares Trust (CIK 1100663) files one N-PORT-P per fund series per
-    reporting period. We disambiguate by reading each candidate's
-    primary_doc.xml and matching the <seriesId> element.
+    The filing-date guard keeps the choice point-in-time: a report whose period
+    ends before the snapshot but which was published afterwards (e.g. a 04-30
+    N-PORT filed end-of-June) is not yet knowable on the snapshot date and is
+    excluded.
+
+    Series disambiguation uses EDGAR's series-scoped feed (`_series_nport_accessions`)
+    rather than reading every candidate's primary_doc.xml. If that feed is
+    unavailable we fall back to the legacy per-filing seriesId scan.
 
     Returns (accession_number, period_of_report_iso) or None if not found.
     """
@@ -2139,15 +2180,30 @@ def _find_latest_nport(
     fund = find_fund(etf_ticker)
     df = fund.series.get_filings(form="NPORT-P").to_pandas()
     df["rd"] = pd.to_datetime(df["reportDate"]).dt.date.astype(str)
+    df["fd"] = pd.to_datetime(df["filing_date"]).dt.date.astype(str)
 
-    candidates = df[df["rd"] <= snap_date_iso].copy()
+    # Point-in-time: period ends on/before the snapshot AND was filed by then.
+    candidates = df[(df["rd"] <= snap_date_iso) & (df["fd"] <= snap_date_iso)].copy()
     if candidates.empty:
         log.warning("No %s N-PORT-P with period_of_report ≤ %s on EDGAR",
                     etf_ticker, snap_date_iso)
         return None
-    # Most recent period first; within a period, largest filing first
-    candidates = candidates.sort_values(["rd", "size"], ascending=[False, False])
 
+    # Restrict to this series via the series-scoped feed (robust to filing waves).
+    try:
+        series_accs = _series_nport_accessions(series_id)
+        series_cands = candidates[candidates["accession_number"].isin(series_accs)]
+        if not series_cands.empty:
+            row = series_cands.sort_values(["rd", "fd"], ascending=[False, False]).iloc[0]
+            return row["accession_number"], row["rd"]
+        log.warning("[%s] series feed returned no in-window filing; falling back to scan",
+                    etf_ticker)
+    except Exception as e:
+        log.warning("[%s] series feed lookup failed (%s); falling back to scan",
+                    etf_ticker, e)
+
+    # Fallback: legacy seriesId scan over the largest candidates, most recent first.
+    candidates = candidates.sort_values(["rd", "size"], ascending=[False, False])
     for _, row in candidates.head(max_candidates).iterrows():
         acc = row["accession_number"]
         try:

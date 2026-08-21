@@ -98,12 +98,16 @@ CATEGORY_TITLES = {
 # Chart palette — high-contrast, colour-blind-aware
 PALETTE  = ["#4C9BE8", "#F4C430", "#2ECC71", "#E74C3C",
             "#B388FF", "#FF7043", "#26C6DA", "#EF5350"]
-DARK_BG  = "#0E1117"
+# Transparent chart backgrounds so charts inherit the app theme background
+# (config.toml backgroundColor) rather than a hardcoded near-black box that
+# stood out against the dark-navy page. Font matches the theme text colour.
+CHART_BG   = "rgba(0,0,0,0)"
+CHART_FONT = "#E2E8F0"
 LINE_W   = 2.2          # consistent line weight across all charts
 CHART_LAYOUT = dict(
-    plot_bgcolor=DARK_BG,
-    paper_bgcolor=DARK_BG,
-    font_color="white",
+    plot_bgcolor=CHART_BG,
+    paper_bgcolor=CHART_BG,
+    font_color=CHART_FONT,
     font_size=13,
     hovermode="x unified",
     margin=dict(l=0, r=100, t=24, b=0),
@@ -463,8 +467,8 @@ def _chart_labor(df: pd.DataFrame, signals: list[tuple]) -> go.Figure:
     fig.update_layout(
         height=280, showlegend=False,
         margin=dict(l=0, r=0, t=32, b=0),
-        plot_bgcolor=DARK_BG, paper_bgcolor=DARK_BG,
-        font_color="white", hovermode="x unified",
+        plot_bgcolor=CHART_BG, paper_bgcolor=CHART_BG,
+        font_color=CHART_FONT, hovermode="x unified",
     )
     return fig
 

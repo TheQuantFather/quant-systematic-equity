@@ -356,19 +356,20 @@ def fetch_short_interest(
             if settle <= start_date:  # strict cutoff for incremental
                 continue
             sym = str(row.get("symbolCode", "")).upper()
-            isin = ticker_to_isin.get(sym) or ticker_to_isin.get(sym.split(".")[0])
-            if isin is None:
+            isins = ticker_to_isins.get(sym) or ticker_to_isins.get(sym.split(".")[0])
+            if not isins:
                 continue
-            rows_buf.append({
-                "isin": isin,
-                "settlement_date": settle,
-                "short_position": row.get("currentShortPositionQuantity"),
-                "prev_position": row.get("previousShortPositionQuantity"),
-                "avg_daily_volume": row.get("averageDailyVolumeQuantity"),
-                "days_to_cover": row.get("daysToCoverQuantity"),
-                "change_pct": row.get("changePercent"),
-                "market_class": row.get("marketClassCode"),
-            })
+            for isin in isins:
+                rows_buf.append({
+                    "isin": isin,
+                    "settlement_date": settle,
+                    "short_position": row.get("currentShortPositionQuantity"),
+                    "prev_position": row.get("previousShortPositionQuantity"),
+                    "avg_daily_volume": row.get("averageDailyVolumeQuantity"),
+                    "days_to_cover": row.get("daysToCoverQuantity"),
+                    "change_pct": row.get("changePercent"),
+                    "market_class": row.get("marketClassCode"),
+                })
 
         pages += 1
         offset += PAGE_SIZE
@@ -425,7 +426,7 @@ def print_si_coverage(conn: sqlite3.Connection) -> None:
              f"{total:,}", f"{n_isins:,}", f"{n_dates:,}", min_d, max_d)
 
 
-def run_short_interest(conn: sqlite3.Connection, ticker_to_isin: dict[str, str],
+def run_short_interest(conn: sqlite3.Connection, ticker_to_isins: dict[str, list[str]],
                        si_since: str | None) -> None:
     """Incremental by default (last settlement_date → today); --si-since backfills."""
     for stmt in SI_DDL.strip().split(";"):
@@ -446,7 +447,7 @@ def run_short_interest(conn: sqlite3.Connection, ticker_to_isin: dict[str, str],
         start_date = last
         log.info("Short-interest incremental: settlement dates after %s → %s", last, end_date)
 
-    n = fetch_short_interest(start_date, end_date, ticker_to_isin, conn)
+    n = fetch_short_interest(start_date, end_date, ticker_to_isins, conn)
     conn.execute("INSERT OR REPLACE INTO metadata VALUES ('last_si_update', ?)",
                  (date.today().isoformat(),))
     conn.commit()
@@ -480,7 +481,16 @@ def main() -> None:
             "SELECT ticker, isin FROM companies WHERE ticker IS NOT NULL AND ticker != ''"
         ).fetchall()
     ticker_to_isin: dict[str, str] = {t.upper(): i for t, i in rows}
-    log.info("Universe: %s tickers", f"{len(ticker_to_isin):,}")
+    # Multi-ISIN map for short interest: same-issuer ISIN changes (redomicile /
+    # new share class) leave a ticker pointing at >1 ISIN. The single-valued map
+    # above (used by SVR) silently keeps only one, dropping names whose snapshot
+    # uses the other ISIN; the short-interest path writes under all of them.
+    ticker_to_isins: dict[str, list[str]] = {}
+    for t, i in rows:
+        ticker_to_isins.setdefault(t.upper(), []).append(i)
+    log.info("Universe: %s tickers (%s with multiple ISINs)",
+             f"{len(ticker_to_isins):,}",
+             f"{sum(1 for v in ticker_to_isins.values() if len(v) > 1):,}")
 
     with get_db(RETURNS_DB) as conn:
         setup_db(conn)
@@ -493,7 +503,7 @@ def main() -> None:
             return
 
         if args.short_interest or args.si_since:
-            run_short_interest(conn, ticker_to_isin, args.si_since)
+            run_short_interest(conn, ticker_to_isins, args.si_since)
             return
 
         if args.check:
