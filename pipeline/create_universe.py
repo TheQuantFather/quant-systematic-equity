@@ -2013,7 +2013,8 @@ def write_db(companies: pd.DataFrame, snapshots: pd.DataFrame) -> None:
                 simfin_industry     TEXT,
                 data_date           TEXT,
                 update_date         TEXT,
-                delisted_date       TEXT
+                delisted_date       TEXT,
+                ibkr_symbol         TEXT
             );
 
             CREATE TABLE universe_snapshots (

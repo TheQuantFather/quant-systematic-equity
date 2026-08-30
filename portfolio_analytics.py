@@ -2,6 +2,67 @@ from __future__ import annotations
 
 import pandas as pd
 
+from brokers.schema import PORTFOLIO_ANALYTICS_DB
+from utils import get_db
+
+
+def load_latest_positions(
+    portfolio_id: str, as_of: str | None = None
+) -> tuple[pd.DataFrame, dict]:
+    """Latest live holdings for one portfolio from portfolio_analytics.db.
+
+    Single source of "what am I holding now" for both the optimiser turnover
+    anchor and the pre/post rebalance view. Returns ``(positions, meta)`` where
+    ``positions`` has one row per ``POSITION`` item with columns
+    ``[isin, ticker, name, weight, market_value_base, quantity]`` — ``weight`` is
+    the stored fraction of net-liq (so deploying held cash into the target counts
+    as genuine turnover). ``meta`` carries ``{snapshot_id, data_date,
+    net_liq_value}``. Both are empty when the portfolio has no snapshot.
+
+    ``as_of`` optionally caps the snapshot date (``data_date <= as_of``); default
+    uses the most recent snapshot.
+    """
+    empty = pd.DataFrame(
+        columns=["isin", "ticker", "name", "weight", "market_value_base", "quantity"]
+    )
+    if not PORTFOLIO_ANALYTICS_DB.exists():
+        return empty, {}
+
+    date_clause = "AND data_date <= ?" if as_of else ""
+    params: tuple = (portfolio_id, as_of) if as_of else (portfolio_id,)
+    with get_db(PORTFOLIO_ANALYTICS_DB) as conn:
+        snap = conn.execute(
+            f"""
+            SELECT snapshot_id, data_date, net_liq_value
+            FROM portfolio_snapshots
+            WHERE portfolio_id = ? {date_clause}
+            ORDER BY data_date DESC, snapshot_at DESC
+            LIMIT 1
+            """,
+            params,
+        ).fetchone()
+        if snap is None:
+            return empty, {}
+        snapshot_id, data_date, net_liq_value = snap
+        positions = pd.read_sql(
+            """
+            SELECT isin, symbol AS ticker, name, weight, market_value_base, quantity
+            FROM portfolio_snapshot_items
+            WHERE snapshot_id = ? AND item_type = 'POSITION'
+              AND quantity IS NOT NULL AND quantity != 0
+            ORDER BY ABS(COALESCE(weight, 0)) DESC
+            """,
+            conn,
+            params=(snapshot_id,),
+        )
+
+    meta = {
+        "snapshot_id": snapshot_id,
+        "data_date": data_date,
+        "net_liq_value": net_liq_value,
+    }
+    return positions, meta
+
 
 def nearest_risk_date(data_date: str, risk_dates: list[str]) -> str | None:
     """Return the nearest available risk snapshot on or before data_date."""

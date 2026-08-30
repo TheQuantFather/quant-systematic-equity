@@ -20,8 +20,9 @@ import db
 from config import (
     OUTPUT_DIR, PARAMS_FILE, MODELS_DB, RISK_DB,
     UNIVERSE_DB as UNIV_DB, BENCHMARK_DIR,
-    MODELS_REF,
+    MODELS_REF, INCUBATION_PORTFOLIO_ID,
 )
+from portfolio_analytics import load_latest_positions
 from utils import get_db, inject_css, get_barra_layout
 
 # Barra factor-group slices — single source of truth in models_reference.csv via
@@ -69,10 +70,74 @@ def load_latest(strategy_id: str) -> tuple[pd.DataFrame | None, dict | None]:
     return df, summary
 
 
-def run_optimizer(strategy_id: str) -> tuple[bool, pd.DataFrame | None, dict | None, str]:
+def build_prepost(df: pd.DataFrame, book: pd.DataFrame) -> pd.DataFrame:
+    """Union of current live holdings and the target, with per-name deltas.
+
+    Weights are fractions of net-liq on both sides (so deploying held cash counts
+    as a real buy). Off-universe holdings (in the book but not investable) are kept
+    as forced exits. Adds current_w / target_w / delta_w / action / gics_sector.
+    """
+    eps = 1e-4
+    universe_isins = set(df["isin"])
+    has_bucket = "market_cap_bucket" in df.columns
+    tgt_cols = ["isin", "ticker", "company_name", "portfolio_weight",
+                "benchmark_weight", "gics_sector", "industry"]
+    if has_bucket:
+        tgt_cols.append("market_cap_bucket")
+    tgt = (
+        df.loc[df["portfolio_weight"] > 1e-6, tgt_cols]
+        .rename(columns={"portfolio_weight": "target_w",
+                         "benchmark_weight": "bm_w"})
+    )
+    cur = (
+        book.rename(columns={"weight": "current_w", "name": "cur_name",
+                             "ticker": "cur_ticker"})
+        [["isin", "cur_ticker", "cur_name", "current_w"]]
+    )
+    m = tgt.merge(cur, on="isin", how="outer")
+    m["target_w"]     = m["target_w"].fillna(0.0)
+    m["current_w"]    = m["current_w"].fillna(0.0)
+    m["ticker"]       = m["ticker"].fillna(m["cur_ticker"])
+    m["company_name"] = m["company_name"].fillna(m["cur_name"])
+    m["delta_w"]      = m["target_w"] - m["current_w"]
+    m["in_universe"]  = m["isin"].isin(universe_isins)
+    # Metadata for off-universe holdings falls back to per-isin maps from df.
+    sector_map = dict(zip(df["isin"], df["gics_sector"]))
+    ind_map    = dict(zip(df["isin"], df["industry"]))
+    m["gics_sector"] = m["gics_sector"].fillna(m["isin"].map(sector_map)).fillna("Unclassified")
+    m["industry"]    = m["industry"].fillna(m["isin"].map(ind_map)).fillna("Unclassified")
+    m["bm_w"]        = m["bm_w"].fillna(0.0)
+    if has_bucket:
+        bucket_map = dict(zip(df["isin"], df["market_cap_bucket"]))
+        m["market_cap_bucket"] = (
+            m["market_cap_bucket"].fillna(m["isin"].map(bucket_map)).fillna("small")
+        )
+
+    def _action(r) -> str:
+        if r["current_w"] <= eps and r["target_w"] > eps:
+            return "NEW"
+        if r["current_w"] > eps and r["target_w"] <= eps:
+            return "EXIT" if r["in_universe"] else "EXIT (off-univ)"
+        if r["delta_w"] > eps:
+            return "ADD"
+        if r["delta_w"] < -eps:
+            return "TRIM"
+        return "HOLD"
+
+    m["action"] = m.apply(_action, axis=1)
+    return m
+
+
+def run_optimizer(
+    strategy_id: str, max_turnover: float | None = None
+) -> tuple[bool, pd.DataFrame | None, dict | None, str]:
     """
     Run optimization in-process (no subprocess). Returns (ok, df, summary, error_log).
     Results are also persisted to portfolio_output/ so they survive page refreshes.
+
+    ``max_turnover`` is the sidebar widget override (two-way fraction): when set it
+    caps Σ|w−w_prev| vs the live book; when None the constraint is cleared, so the
+    widget is the source of truth regardless of the sheet's max_turnover row.
     """
     from optimize_portfolio import (
         run_optimization, load_strategy_params, save_results,
@@ -81,7 +146,13 @@ def run_optimizer(strategy_id: str) -> tuple[bool, pd.DataFrame | None, dict | N
         strategies = load_strategy_params(strategy_id)
         if not strategies:
             return False, None, None, f"Strategy '{strategy_id}' not found in params file."
-        results_df, summary = run_optimization(strategies[0])
+        strat = strategies[0]
+        constraints = strat.setdefault("constraints", {})
+        if max_turnover is not None:
+            constraints["max_turnover"] = float(max_turnover)
+        else:
+            constraints.pop("max_turnover", None)
+        results_df, summary = run_optimization(strat)
         save_results(results_df, summary)
         return True, results_df, summary, ""
     except Exception as exc:
@@ -369,9 +440,25 @@ if not strategies:
 
 selected = st.sidebar.selectbox("Select strategy", strategies)
 
+st.sidebar.markdown("**Rebalance vs live book**")
+apply_turnover = st.sidebar.checkbox(
+    "Cap turnover", value=False,
+    help="Constrain Σ|w−w_prev| against the latest incubation holdings "
+         f"(`{INCUBATION_PORTFOLIO_ID}`). Applied on the next run.")
+turnover_pct = st.sidebar.slider(
+    "Max turnover (two-way)", min_value=5, max_value=200, value=10, step=5,
+    format="%d%%", disabled=not apply_turnover,
+    help="Two-way Σ|Δw|. 10% ≈ 5% one-way — a steady-state cap; a first "
+         "rebalance off a stale book needs a much looser value.")
+show_prepost = st.sidebar.toggle(
+    "Compare to live book (pre/post)", value=False,
+    help="Overlay your current holdings onto the Weights and Sector charts and "
+         "show turnover, buys and sells.")
+
 if st.sidebar.button("▶  Run Optimisation", use_container_width=True, type="primary"):
+    mt = (turnover_pct / 100.0) if apply_turnover else None
     with st.spinner("Optimising…"):
-        ok, _df, _summary, _log = run_optimizer(selected)
+        ok, _df, _summary, _log = run_optimizer(selected, max_turnover=mt)
     if ok:
         st.session_state[f"port_{selected}"] = (_df, _summary)
         st.success("Optimisation complete.")
@@ -443,6 +530,59 @@ else:
     c6.metric("Positions",      summary.get("n_positions", "—"))
     c7.metric("Benchmark Stocks", summary.get("n_benchmark", "—"))
 
+# ── Pre/post comparison vs live book (drives overlays in the tabs below) ──────
+# Computed once here so the turnover header and the Weights/Sector overlays all
+# read from the same frame. `prepost` is None unless the sidebar toggle is on and
+# a live book exists.
+prepost: pd.DataFrame | None = None
+prepost_nav: float | None = None
+if show_prepost:
+    _book, _book_meta = load_latest_positions(INCUBATION_PORTFOLIO_ID)
+    if _book.empty:
+        st.info(
+            f"No live holdings for `{INCUBATION_PORTFOLIO_ID}`. Run "
+            "`python daily_position_update.py --only ibkr` to snapshot the book, "
+            "then re-enable the compare toggle."
+        )
+    else:
+        prepost = build_prepost(df, _book)
+        prepost_nav = _book_meta.get("net_liq_value")
+        _eps = 1e-4
+        _two_way = float(prepost["delta_w"].abs().sum())
+        _buys_w  = float(prepost.loc[prepost["delta_w"] > 0, "delta_w"].sum())
+        _sells_w = float(-prepost.loc[prepost["delta_w"] < 0, "delta_w"].sum())
+        _n_new   = int((prepost["action"] == "NEW").sum())
+        _n_exit  = int(prepost["action"].str.startswith("EXIT").sum())
+        _off_w   = float(prepost.loc[~prepost["in_universe"], "current_w"].sum())
+
+        st.markdown(f"**Rebalance vs live book** ({_book_meta.get('data_date')})")
+        t1, t2, t3, t4, t5, t6 = st.columns(6)
+        t1.metric("One-way turnover", f"{_two_way / 2:.1%}")
+        t2.metric("Two-way turnover", f"{_two_way:.1%}")
+        t3.metric("Buys",  f"${_buys_w * prepost_nav:,.0f}" if prepost_nav else f"{_buys_w:.1%}")
+        t4.metric("Sells", f"${_sells_w * prepost_nav:,.0f}" if prepost_nav else f"{_sells_w:.1%}")
+        t5.metric("New names", _n_new)
+        t6.metric("Exits", _n_exit)
+
+        _cap = summary.get("turnover_cap")
+        if _cap is not None:
+            _realized = summary.get("turnover_two_way")
+            st.caption(
+                f"Last run capped turnover at {_cap:.0%} two-way — realized "
+                f"{_realized:.1%}." if _realized is not None
+                else f"Last run capped turnover at {_cap:.0%} two-way."
+            )
+        else:
+            st.caption(
+                "Last run had no turnover cap — this is the natural drift. Tick "
+                "**Cap turnover** in the sidebar and re-run to throttle it."
+            )
+        if _off_w > _eps:
+            st.warning(
+                f"{_off_w:.1%} of the book is in names outside this target's "
+                "investable universe — forced exits the turnover cap does not count."
+            )
+
 st.markdown("---")
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
@@ -502,18 +642,79 @@ with tab1:
         )
         cap["label"] = cap["market_cap_bucket"].str.title()
         st.markdown("**Market-Cap Bucket Weights**")
-        fig = go.Figure(go.Bar(
-            x=cap["label"],
-            y=cap["portfolio_weight"] * 100,
-            marker_color=["#1F4E79", "#5B8DEF", "#8BC34A"],
+        fig = go.Figure()
+        if prepost is not None:
+            cur_cap = prepost.groupby("market_cap_bucket")["current_w"].sum()
+            fig.add_trace(go.Bar(
+                name="Current", x=cap["label"],
+                y=cap["market_cap_bucket"].map(cur_cap).fillna(0.0) * 100,
+                marker_color="#FF9800",
+                hovertemplate="%{x}<br>Current: %{y:.2f}%<extra></extra>",
+            ))
+        fig.add_trace(go.Bar(
+            name="Target", x=cap["label"], y=cap["portfolio_weight"] * 100,
+            marker_color="#1F4E79",
             text=[f"{v:.1f}%" for v in cap["portfolio_weight"] * 100],
             textposition="outside",
-            hovertemplate="%{x}<br>Weight: %{y:.2f}%<extra></extra>",
+            hovertemplate="%{x}<br>Target: %{y:.2f}%<extra></extra>",
         ))
-        fig.update_layout(height=320, margin=dict(l=10, r=10, t=10, b=40),
-                          yaxis_title="Portfolio Weight (%)",
+        fig.update_layout(barmode="group", height=320, margin=dict(l=10, r=10, t=10, b=40),
+                          yaxis_title="Weight (%)", showlegend=prepost is not None,
+                          legend=dict(orientation="h", y=1.05),
                           plot_bgcolor="rgba(0,0,0,0)")
         st.plotly_chart(fig, use_container_width=True)
+
+    if prepost is not None:
+        st.markdown("---")
+        st.markdown("**Current → Target — largest weight changes**")
+        movers = (
+            prepost.assign(absd=prepost["delta_w"].abs())
+            .sort_values("absd", ascending=False).head(20)
+        )
+        fig = go.Figure()
+        fig.add_trace(go.Bar(
+            name="Current", x=movers["current_w"] * 100, y=movers["company_name"],
+            orientation="h", marker_color="#90A4AE",
+            hovertemplate="%{y}<br>Current: %{x:.2f}%<extra></extra>",
+        ))
+        fig.add_trace(go.Bar(
+            name="Target", x=movers["target_w"] * 100, y=movers["company_name"],
+            orientation="h", marker_color="#1F4E79",
+            hovertemplate="%{y}<br>Target: %{x:.2f}%<extra></extra>",
+        ))
+        fig.update_layout(barmode="group", height=560,
+                          margin=dict(l=10, r=30, t=10, b=30),
+                          xaxis_title="Weight (%)",
+                          yaxis=dict(autorange="reversed", automargin=True),
+                          legend=dict(orientation="h", y=1.04),
+                          plot_bgcolor="rgba(0,0,0,0)")
+        st.plotly_chart(fig, use_container_width=True)
+
+        def _fmt_movers(frame: pd.DataFrame) -> pd.DataFrame:
+            keep = ["ticker", "company_name", "current_w", "target_w",
+                    "delta_w", "action"]
+            out = frame[keep].copy()
+            if prepost_nav:
+                out["delta_$"] = (frame["delta_w"] * prepost_nav).round(0)
+            out["current_w"] = (out["current_w"] * 100).round(2)
+            out["target_w"]  = (out["target_w"] * 100).round(2)
+            out["delta_w"]   = (out["delta_w"] * 100).round(2)
+            return out.rename(columns={
+                "ticker": "Ticker", "company_name": "Name",
+                "current_w": "Current %", "target_w": "Target %",
+                "delta_w": "Δ %", "action": "Action",
+            })
+
+        _eps = 1e-4
+        col_b, col_s = st.columns(2)
+        with col_b:
+            st.markdown("**Biggest buys / adds**")
+            _b = prepost[prepost["delta_w"] > _eps].sort_values("delta_w", ascending=False)
+            st.dataframe(_fmt_movers(_b), use_container_width=True, hide_index=True)
+        with col_s:
+            st.markdown("**Biggest sells / exits**")
+            _s = prepost[prepost["delta_w"] < -_eps].sort_values("delta_w")
+            st.dataframe(_fmt_movers(_s), use_container_width=True, hide_index=True)
 
 
 # ── Tab 2: Sector & Industry ──────────────────────────────────────────────────
@@ -539,23 +740,48 @@ with tab2:
         name="Portfolio", x=sec["portfolio_weight"] * 100, y=sec["gics_sector"],
         orientation="h", marker_color="#1F4E79",
     ))
+    if prepost is not None:
+        cur_sec = prepost.groupby("gics_sector")["current_w"].sum()
+        fig.add_trace(go.Bar(
+            name="Current book",
+            x=sec["gics_sector"].map(cur_sec).fillna(0.0) * 100, y=sec["gics_sector"],
+            orientation="h", marker_color="#FF9800",
+        ))
     fig.update_layout(barmode="group", height=420, margin=dict(l=10, r=10, t=10, b=30),
                       xaxis_title="Weight (%)", legend=dict(orientation="h", y=1.05),
                       plot_bgcolor="rgba(0,0,0,0)")
     st.plotly_chart(fig, use_container_width=True)
 
     st.markdown("**Sector Active Weights**")
-    colors = ["#F44336" if v < 0 else "#2196F3" for v in sec["active_weight"]]
-    fig = go.Figure(go.Bar(
-        x=sec["active_weight"] * 100, y=sec["gics_sector"],
-        orientation="h", marker_color=colors,
-        text=[f"{v:+.2f}%" for v in sec["active_weight"] * 100],
-        textposition="outside",
-    ))
-    fig.update_layout(height=350, margin=dict(l=10, r=80, t=10, b=30),
-                      xaxis_title="Active Weight (%)", plot_bgcolor="rgba(0,0,0,0)",
-                      shapes=[dict(type="line", x0=0, x1=0, y0=-0.5, y1=len(sec)-0.5,
-                                   line=dict(color="black", width=1))])
+    if prepost is not None:
+        cur_sec = prepost.groupby("gics_sector")["current_w"].sum()
+        sec["current_active"] = sec["gics_sector"].map(cur_sec).fillna(0.0) - sec["benchmark_weight"]
+        fig = go.Figure()
+        fig.add_trace(go.Bar(
+            name="Current active", x=sec["current_active"] * 100, y=sec["gics_sector"],
+            orientation="h", marker_color="#FF9800",
+        ))
+        fig.add_trace(go.Bar(
+            name="Target active", x=sec["active_weight"] * 100, y=sec["gics_sector"],
+            orientation="h", marker_color="#1F4E79",
+        ))
+        fig.update_layout(barmode="group", height=380, margin=dict(l=10, r=40, t=10, b=30),
+                          xaxis_title="Active Weight (%)", plot_bgcolor="rgba(0,0,0,0)",
+                          legend=dict(orientation="h", y=1.05),
+                          shapes=[dict(type="line", x0=0, x1=0, y0=-0.5, y1=len(sec)-0.5,
+                                       line=dict(color="black", width=1))])
+    else:
+        colors = ["#F44336" if v < 0 else "#2196F3" for v in sec["active_weight"]]
+        fig = go.Figure(go.Bar(
+            x=sec["active_weight"] * 100, y=sec["gics_sector"],
+            orientation="h", marker_color=colors,
+            text=[f"{v:+.2f}%" for v in sec["active_weight"] * 100],
+            textposition="outside",
+        ))
+        fig.update_layout(height=350, margin=dict(l=10, r=80, t=10, b=30),
+                          xaxis_title="Active Weight (%)", plot_bgcolor="rgba(0,0,0,0)",
+                          shapes=[dict(type="line", x0=0, x1=0, y0=-0.5, y1=len(sec)-0.5,
+                                       line=dict(color="black", width=1))])
     st.plotly_chart(fig, use_container_width=True)
 
     ind = (
@@ -565,23 +791,42 @@ with tab2:
         .reset_index()
     )
     ind["active_weight"] = ind["portfolio_weight"] - ind["benchmark_weight"]
+    if prepost is not None:
+        cur_ind = prepost.groupby("industry")["current_w"].sum()
+        ind["current_active"] = ind["industry"].map(cur_ind).fillna(0.0) - ind["benchmark_weight"]
     ind_top = pd.concat([
         ind.nlargest(10, "active_weight"),
         ind.nsmallest(10, "active_weight"),
     ]).drop_duplicates().sort_values("active_weight", ascending=True)
 
     st.markdown("**Industry Active Weights (top 10 over/under)**")
-    colors = ["#F44336" if v < 0 else "#2196F3" for v in ind_top["active_weight"]]
-    fig = go.Figure(go.Bar(
-        x=ind_top["active_weight"] * 100, y=ind_top["industry"],
-        orientation="h", marker_color=colors,
-        text=[f"{v:+.2f}%" for v in ind_top["active_weight"] * 100],
-        textposition="outside",
-    ))
-    fig.update_layout(height=500, margin=dict(l=10, r=80, t=10, b=30),
-                      xaxis_title="Active Weight (%)", plot_bgcolor="rgba(0,0,0,0)",
-                      shapes=[dict(type="line", x0=0, x1=0, y0=-0.5, y1=len(ind_top)-0.5,
-                                   line=dict(color="black", width=1))])
+    if prepost is not None:
+        fig = go.Figure()
+        fig.add_trace(go.Bar(
+            name="Current active", x=ind_top["current_active"] * 100, y=ind_top["industry"],
+            orientation="h", marker_color="#FF9800",
+        ))
+        fig.add_trace(go.Bar(
+            name="Target active", x=ind_top["active_weight"] * 100, y=ind_top["industry"],
+            orientation="h", marker_color="#1F4E79",
+        ))
+        fig.update_layout(barmode="group", height=560, margin=dict(l=10, r=40, t=10, b=30),
+                          xaxis_title="Active Weight (%)", plot_bgcolor="rgba(0,0,0,0)",
+                          legend=dict(orientation="h", y=1.03),
+                          shapes=[dict(type="line", x0=0, x1=0, y0=-0.5, y1=len(ind_top)-0.5,
+                                       line=dict(color="black", width=1))])
+    else:
+        colors = ["#F44336" if v < 0 else "#2196F3" for v in ind_top["active_weight"]]
+        fig = go.Figure(go.Bar(
+            x=ind_top["active_weight"] * 100, y=ind_top["industry"],
+            orientation="h", marker_color=colors,
+            text=[f"{v:+.2f}%" for v in ind_top["active_weight"] * 100],
+            textposition="outside",
+        ))
+        fig.update_layout(height=500, margin=dict(l=10, r=80, t=10, b=30),
+                          xaxis_title="Active Weight (%)", plot_bgcolor="rgba(0,0,0,0)",
+                          shapes=[dict(type="line", x0=0, x1=0, y0=-0.5, y1=len(ind_top)-0.5,
+                                       line=dict(color="black", width=1))])
     st.plotly_chart(fig, use_container_width=True)
 
 
@@ -597,26 +842,59 @@ with tab3:
         tilts   = compute_factor_tilts(df, scores_wide, has_bm)
         ref_lbl = tilts["ref_label"].iloc[0] if not tilts.empty else ("Benchmark" if has_bm else "Univ. Avg")
 
+        # Current-book weighted factor averages (same reference), for pre/post overlay.
+        if prepost is not None:
+            cur_w   = prepost.set_index("isin")["current_w"]
+            cur_sc  = scores_wide.reindex(cur_w.index)
+            cur_sum = float(cur_w.sum())
+            cur_avg_by_factor = {}
+            for _mid, _fname in BASE_MODELS.items():
+                if _mid in scores_wide.columns and cur_sum > 0:
+                    cur_avg_by_factor[_fname] = float(
+                        (cur_sc[_mid].fillna(0) * cur_w).sum() / cur_sum
+                    )
+            tilts["Current"]      = tilts["Factor"].map(cur_avg_by_factor)
+            tilts["Current Tilt"] = tilts["Current"] - tilts[ref_lbl]
+
         st.markdown(f"**Active Factor Tilts — Portfolio vs {ref_lbl}**")
         st.caption("Positive = portfolio overweights that factor vs reference.")
 
-        colors = ["#2196F3" if v >= 0 else "#F44336" for v in tilts["Active Tilt"]]
-        fig = go.Figure(go.Bar(
-            x=tilts["Active Tilt"], y=tilts["Factor"],
-            orientation="h", marker_color=colors,
-            text=[f"{v:+.3f}" for v in tilts["Active Tilt"]],
-            textposition="outside",
-        ))
-        fig.add_vline(x=0, line_color="black", line_width=1)
-        fig.update_layout(height=340, margin=dict(l=10, r=80, t=10, b=30),
-                          xaxis_title="Active Tilt (z-score units)",
-                          plot_bgcolor="rgba(0,0,0,0)", showlegend=False)
+        if prepost is not None:
+            fig = go.Figure()
+            fig.add_trace(go.Bar(
+                name="Current tilt", x=tilts["Current Tilt"], y=tilts["Factor"],
+                orientation="h", marker_color="#FF9800",
+            ))
+            fig.add_trace(go.Bar(
+                name="Target tilt", x=tilts["Active Tilt"], y=tilts["Factor"],
+                orientation="h", marker_color="#1F4E79",
+            ))
+            fig.add_vline(x=0, line_color="black", line_width=1)
+            fig.update_layout(barmode="group", height=380, margin=dict(l=10, r=40, t=10, b=30),
+                              xaxis_title="Active Tilt (z-score units)",
+                              legend=dict(orientation="h", y=1.05),
+                              plot_bgcolor="rgba(0,0,0,0)")
+        else:
+            colors = ["#2196F3" if v >= 0 else "#F44336" for v in tilts["Active Tilt"]]
+            fig = go.Figure(go.Bar(
+                x=tilts["Active Tilt"], y=tilts["Factor"],
+                orientation="h", marker_color=colors,
+                text=[f"{v:+.3f}" for v in tilts["Active Tilt"]],
+                textposition="outside",
+            ))
+            fig.add_vline(x=0, line_color="black", line_width=1)
+            fig.update_layout(height=340, margin=dict(l=10, r=80, t=10, b=30),
+                              xaxis_title="Active Tilt (z-score units)",
+                              plot_bgcolor="rgba(0,0,0,0)", showlegend=False)
         st.plotly_chart(fig, use_container_width=True)
 
         st.markdown(f"**Factor Scores — Portfolio vs {ref_lbl}**")
         fig = go.Figure()
         fig.add_trace(go.Bar(name=ref_lbl, x=tilts["Factor"], y=tilts[ref_lbl],
                              marker_color="#90A4AE"))
+        if prepost is not None:
+            fig.add_trace(go.Bar(name="Current", x=tilts["Factor"], y=tilts["Current"],
+                                 marker_color="#FF9800"))
         fig.add_trace(go.Bar(name="Portfolio", x=tilts["Factor"], y=tilts["Portfolio"],
                              marker_color="#1F4E79"))
         fig.update_layout(barmode="group", height=320, margin=dict(l=10, r=10, t=10, b=30),
@@ -647,6 +925,14 @@ with tab3:
     fig.add_vline(x=bm_alpha, line_color="#90A4AE", line_width=2, line_dash="dash",
                   annotation_text=f"{bm_label}: {bm_alpha:+.3f}",
                   annotation_position="top left")
+    if prepost is not None:
+        _a  = prepost.merge(df[["isin", "alpha_score"]], on="isin", how="left")
+        _cw = _a["current_w"]
+        cur_alpha = float((_a["alpha_score"].fillna(0) * _cw).sum() / _cw.sum()) \
+            if _cw.sum() > 0 else 0.0
+        fig.add_vline(x=cur_alpha, line_color="#FF9800", line_width=2, line_dash="dot",
+                      annotation_text=f"Current: {cur_alpha:+.3f}",
+                      annotation_position="bottom right")
     fig.update_layout(height=280, margin=dict(l=10, r=10, t=30, b=30),
                       xaxis_title="Alpha Score (z-score)", plot_bgcolor="rgba(0,0,0,0)")
     st.plotly_chart(fig, use_container_width=True)
@@ -711,6 +997,21 @@ with tab4:
         rc_active = _compute_attribution(active_isins, active_weights, barra_comps, lw_raw) \
                     if has_benchmark else None
 
+        # ── Current live book (pre/post) — same risk model, for comparison ────
+        rc_cur_port = rc_cur_active = None
+        if prepost is not None:
+            cur_map   = dict(zip(prepost["isin"], prepost["current_w"]))
+            cur_held  = prepost[prepost["current_w"] > 1e-6]
+            if cur_held["current_w"].sum() > 0:
+                rc_cur_port = _compute_attribution(
+                    cur_held["isin"].tolist(),
+                    cur_held["current_w"].values / cur_held["current_w"].sum(),
+                    barra_comps, lw_raw)
+            if has_benchmark:
+                cur_active_w = np.array([cur_map.get(i, 0.0) for i in active_isins]) \
+                               - df["benchmark_weight"].values
+                rc_cur_active = _compute_attribution(active_isins, cur_active_w, barra_comps, lw_raw)
+
         sub_port, sub_active = st.tabs(["Portfolio Risk", "Active Risk (TE)"])
 
         # ════════════════════════════════════════════════════════════════════
@@ -721,7 +1022,12 @@ with tab4:
                 st.info("Could not compute portfolio risk attribution.")
             else:
                 sigma_p = float(rc_port["sigma_p"].iloc[0])
+                _cur_vol_txt = ""
+                if rc_cur_port is not None:
+                    _cur_vol = float(rc_cur_port["sigma_p"].iloc[0])
+                    _cur_vol_txt = f"Current book vol: **{_cur_vol:.2%}** → target **{sigma_p:.2%}**  |  "
                 st.caption(
+                    f"{_cur_vol_txt}"
                     f"Total portfolio volatility: **{sigma_p:.2%}**  |  "
                     f"Risk model: {risk_model_label}  |  "
                     f"Stocks: {len(rc_port)}"
@@ -839,7 +1145,12 @@ with tab4:
                     if has_bm_underweights else
                     "Benchmark underweights not available — held positions only  |  "
                 )
+                cur_te_txt = ""
+                if rc_cur_active is not None:
+                    cur_te = float(rc_cur_active["sigma_p"].iloc[0])
+                    cur_te_txt = f"Current book TE: **{cur_te:.2%}** → target **{te:.2%}**  |  "
                 st.caption(
+                    f"{cur_te_txt}"
                     f"Tracking error: **{te:.2%}**  |  "
                     f"Risk model: {risk_model_label}  |  "
                     + bm_note +
@@ -973,6 +1284,12 @@ with tab5:
     if has_mcap:
         display_df["market_cap_bucket"] = df["market_cap_bucket"]
         display_df["market_cap_b"] = df["market_cap"] / 1e9
+    if prepost is not None:
+        cur_map = dict(zip(prepost["isin"], prepost["current_w"]))
+        display_df["current_weight"] = df["isin"].map(cur_map).fillna(0.0)
+        display_df["delta_weight"]   = display_df["portfolio_weight"] - display_df["current_weight"]
+        display_df["current_weight"] = (display_df["current_weight"] * 100).round(3)
+        display_df["delta_weight"]   = (display_df["delta_weight"]   * 100).round(3)
     display_df["benchmark_weight"] = (display_df["benchmark_weight"] * 100).round(3)
     display_df["portfolio_weight"] = (display_df["portfolio_weight"] * 100).round(3)
     display_df["active_weight"]    = (display_df["active_weight"]    * 100).round(3)
@@ -982,7 +1299,9 @@ with tab5:
         "gics_sector": "Sector",
         "industry": "Industry",
         "benchmark_weight": "BM Weight %",
+        "current_weight": "Current %",
         "portfolio_weight": "Port Weight %",
+        "delta_weight": "Δ Weight %",
         "active_weight": "Active Weight %",
         "alpha_score": "Alpha Score",
         "market_cap_bucket": "Cap Bucket",

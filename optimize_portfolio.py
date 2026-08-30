@@ -69,8 +69,9 @@ _ensure_mosek_symlink()
 
 from config import (
     OUTPUT_DIR, PARAMS_FILE, UNIVERSE_DB, CONSTITUENTS_DB, RETURNS_DB,
-    MODELS_DB, RISK_DB, BENCHMARK_DIR,
+    MODELS_DB, RISK_DB, BENCHMARK_DIR, INCUBATION_PORTFOLIO_ID,
 )
+from portfolio_analytics import load_latest_positions
 from universe_loader import load_clean_universe
 from utils import get_db, get_logger
 
@@ -1569,6 +1570,53 @@ def optimize_for_backtest(
 
 # ── Main orchestration ────────────────────────────────────────────────────────
 
+def _load_turnover_anchor(
+    c_pre: dict,
+    investable: list[str],
+    identity_aliases: dict[str, str],
+) -> tuple[np.ndarray | None, float | None]:
+    """Resolve the optional two-way turnover cap and its prev-weights anchor.
+
+    Returns ``(prev_weights_arr, max_turnover)`` aligned to ``investable``, or
+    ``(None, None)`` when the strategy has no enabled ``max_turnover`` — the
+    default, leaving the optimiser unconstrained and byte-for-byte unchanged. The
+    anchor is the latest live holdings of the incubation book (weights as a
+    fraction of net-liq, so deploying held cash into the target counts as genuine
+    turnover). Held names outside the investable set are logged as forced exits
+    the in-universe cap does not count.
+    """
+    raw = c_pre.get("max_turnover")
+    try:
+        max_turnover = float(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        max_turnover = None
+    if max_turnover is None or max_turnover <= 0:
+        return None, None
+
+    book, book_meta = load_latest_positions(INCUBATION_PORTFOLIO_ID)
+    if book.empty:
+        log.warning(
+            "max_turnover=%.3f set but no live holdings for %s — turnover "
+            "constraint skipped.", max_turnover, INCUBATION_PORTFOLIO_ID,
+        )
+        return None, None
+
+    book_w = dict(zip(book["isin"], book["weight"]))
+    prev = np.array([
+        float(book_w.get(isin, book_w.get(identity_aliases.get(isin, ""), 0.0)))
+        for isin in investable
+    ])
+    in_universe = float(prev.sum())
+    off_universe = float(book["weight"].sum()) - in_universe
+    log.info(
+        "Turnover cap %.1f%% two-way | anchor %s @ %s: %d/%d holdings in universe "
+        "(%.1f%% of book; %.1f%% off-universe forced-exit).",
+        max_turnover * 100, INCUBATION_PORTFOLIO_ID, book_meta.get("data_date"),
+        int((prev > 0).sum()), len(book), in_universe * 100, off_universe * 100,
+    )
+    return prev, max_turnover
+
+
 def run_optimization(strategy: dict) -> tuple[pd.DataFrame, dict]:
     log.info("=== Strategy: %s  (%s)  Objective: %s ===",
              strategy["name"], strategy["strategy_id"], strategy["objective"])
@@ -1789,22 +1837,46 @@ def run_optimization(strategy: dict) -> tuple[pd.DataFrame, dict]:
 
     _ensure_mosek(strategy)
 
+    # ── Turnover anchor (optional) ───────────────────────────────────────────
+    # When a strategy enables max_turnover > 0, constrain Σ|w − w_prev| ≤
+    # max_turnover (two-way) against the latest live holdings of the incubation
+    # book. Disabled by default (no enabled max_turnover row) → both stay None and
+    # the optimiser behaves exactly as before. Aligned to the FINAL investable set
+    # (after any pre-screen); held names outside it are forced exits the cap does
+    # not count — reported below and surfaced in the pre/post view.
+    prev_weights_arr, max_turnover = _load_turnover_anchor(
+        c_pre, investable, identity_aliases
+    )
+
     # Dispatch to objective
-    if objective == "maximize_sharpe":
-        weights, extra = _optimize_sharpe(
-            strategy, investable, alpha, b, Sigma, L,
-            sectors, industries, B_sector, B_ind, cap_buckets, B_cap,
-            issuers, B_issuer)
-    elif objective == "minimize_variance":
-        weights, extra = _optimize_min_variance(
-            strategy, investable, b, Sigma, L,
-            sectors, industries, B_sector, B_ind, cap_buckets, B_cap,
-            issuers, B_issuer)
-    else:
-        weights, extra = _optimize_alpha(
-            strategy, investable, alpha, b, Sigma, L,
-            sectors, industries, B_sector, B_ind, cap_buckets, B_cap,
-            issuers, B_issuer)
+    try:
+        if objective == "maximize_sharpe":
+            weights, extra = _optimize_sharpe(
+                strategy, investable, alpha, b, Sigma, L,
+                sectors, industries, B_sector, B_ind, cap_buckets, B_cap,
+                issuers, B_issuer,
+                prev_weights_arr=prev_weights_arr, max_turnover=max_turnover)
+        elif objective == "minimize_variance":
+            weights, extra = _optimize_min_variance(
+                strategy, investable, b, Sigma, L,
+                sectors, industries, B_sector, B_ind, cap_buckets, B_cap,
+                issuers, B_issuer,
+                prev_weights_arr=prev_weights_arr, max_turnover=max_turnover)
+        else:
+            weights, extra = _optimize_alpha(
+                strategy, investable, alpha, b, Sigma, L,
+                sectors, industries, B_sector, B_ind, cap_buckets, B_cap,
+                issuers, B_issuer,
+                prev_weights_arr=prev_weights_arr, max_turnover=max_turnover)
+    except RuntimeError as exc:
+        # A too-tight turnover cap is a common infeasibility cause — surface it.
+        if max_turnover is not None:
+            raise RuntimeError(
+                f"{exc} — the max_turnover cap ({max_turnover:.0%} two-way) may be "
+                "too tight against the current book; loosen it (or disable the "
+                "max_turnover row) and re-run."
+            ) from exc
+        raise
 
     # Build results DataFrame
     isin_to_ticker = dict(zip(meta_df["isin"], meta_df["ticker"]))
@@ -1828,6 +1900,16 @@ def run_optimization(strategy: dict) -> tuple[pd.DataFrame, dict]:
         })
     results_df = pd.DataFrame(rows).sort_values("active_weight", ascending=False)
 
+    turnover_summary: dict = {}
+    if prev_weights_arr is not None:
+        two_way = float(np.abs(np.asarray(weights, dtype=float) - prev_weights_arr).sum())
+        turnover_summary = {
+            "turnover_cap":     round(float(max_turnover), 4),
+            "turnover_two_way": round(two_way, 4),
+        }
+        log.info("Realized turnover: %.1f%% two-way (cap %.1f%%).",
+                 two_way * 100, max_turnover * 100)
+
     summary = {
         "strategy_id": strategy["strategy_id"],
         "name":        strategy["name"],
@@ -1840,6 +1922,7 @@ def run_optimization(strategy: dict) -> tuple[pd.DataFrame, dict]:
         "run_date":    datetime.now().strftime("%Y-%m-%d %H:%M"),
         **universe_meta,
         **bm_meta,
+        **turnover_summary,
         **extra,
     }
     if used_barra_date:

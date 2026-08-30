@@ -44,6 +44,11 @@ OUTPUT_DIR    = DATA_DIR / "portfolio_output"
 PARAMS_FILE   = DATA_DIR / "strategy_params.xlsx"
 BENCHMARK_DIR = DATA_DIR / "universe_index"
 
+# Live incubation book (IBKR US quant equities) tracked in portfolio_analytics.db.
+# Default anchor for the optimiser turnover constraint and the pre/post rebalance
+# view — i.e. "what am I holding now" for both features.
+INCUBATION_PORTFOLIO_ID = "ibkr_us_quant"
+
 # ---------------------------------------------------------------------------
 # SimFin source data
 # ---------------------------------------------------------------------------
