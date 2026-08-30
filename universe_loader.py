@@ -20,6 +20,14 @@ log = get_logger(__name__)
 
 UniverseMode = Literal["live", "point_in_time"]
 
+# Maximum lag (in business days) between the latest available return date and the
+# requested snapshot date that the live loader tolerates before treating the whole
+# universe as stale. Covers running an optimisation on the snapshot day itself,
+# before that day's close exists in returns.db (a snapshot is built from returns
+# strictly before its date), including weekend/holiday gaps. A larger lag means the
+# returns pipeline is genuinely behind, so the loader locks out loudly instead.
+MAX_LIVE_RETURN_LAG_BDAYS = 3
+
 
 @dataclass(frozen=True)
 class CleanUniverseResult:
@@ -414,12 +422,33 @@ def load_clean_universe(
     if min_return_date is None and mode == "live":
         min_return_date = snapshot_date
         if latest_return_date is not None and str(latest_return_date) < str(snapshot_date):
-            log.warning(
-                "Returns data lags requested snapshot: latest return date %s < snapshot %s "
-                "for %s. Most members will be marked stale_returns and non-tradable — "
-                "run `create_returns --update` before loading this date.",
-                latest_return_date, snapshot_date, index_name,
-            )
+            # A snapshot can be built before its own session closes: Barra/factors
+            # use returns strictly before the snapshot date, so running an
+            # optimisation intraday on the snapshot day finds returns.db one (or a
+            # few, across weekends/holidays) business days behind. Rather than mark
+            # the entire universe stale and lock the optimiser out for the day, fall
+            # back to the latest available return date as the freshness threshold
+            # when the lag is small — names that traded on the most recent available
+            # day stay tradable (and sizing already uses those latest prices). A
+            # genuinely stalled returns pipeline (lag beyond tolerance) still locks
+            # out loudly rather than silently trading a badly stale universe.
+            lag_bdays = len(pd.bdate_range(latest_return_date, snapshot_date)) - 1
+            if lag_bdays <= MAX_LIVE_RETURN_LAG_BDAYS:
+                log.info(
+                    "Returns lag requested snapshot by %d business day(s) (latest %s < "
+                    "snapshot %s for %s); using latest return date as the freshness "
+                    "threshold so a same-day snapshot stays tradable.",
+                    lag_bdays, latest_return_date, snapshot_date, index_name,
+                )
+                min_return_date = str(latest_return_date)
+            else:
+                log.warning(
+                    "Returns data lags requested snapshot by %d business days: latest "
+                    "return date %s < snapshot %s for %s. Most members will be marked "
+                    "stale_returns and non-tradable — run `create_returns --update` "
+                    "before loading this date.",
+                    lag_bdays, latest_return_date, snapshot_date, index_name,
+                )
     members = _add_exclusion_reasons(
         members,
         snapshot_date=snapshot_date,

@@ -82,7 +82,8 @@ EQUITY_GROUPS: dict[str, list[str]] = {
     "Broad Market": ["sp500", "russell_1000", "russell_2000"],
     "Factors":      ["russell_1000_growth", "msci_usa_quality",
                      "msci_usa_momentum", "russell_1000_value"],
-    "Global":       ["msci_usa", "europe_equity", "japan_equity", "em_equity"],
+    "Global":       ["msci_usa", "europe_equity", "japan_equity", "em_equity",
+                     "india_equity", "china_equity"],
 }
 
 # Category display order and section titles
@@ -131,6 +132,8 @@ INDEX_LABELS: dict[str, str] = {
     "europe_equity":       "Europe",
     "japan_equity":        "Japan",
     "em_equity":           "Emerging Mkts",
+    "india_equity":        "India",
+    "china_equity":        "China",
     "gold":                "Gold",
     "global_reits":        "Global REITs",
     "treasury_long":       "20yr Treasury",
@@ -481,14 +484,21 @@ wide, ref       = _load_macro()
 equity_wide     = _load_indices()
 by_cat          = _by_category(ref)
 
-# Lookback selector
-lb_options = {"1Y": 1, "3Y": 3, "5Y": 5, "Full": None}
-lb_label   = st.radio("Lookback", list(lb_options.keys()),
-                      horizontal=True, index=1, label_visibility="collapsed")
-lb_years   = lb_options[lb_label]
+# Lookback selector — each label maps to a DateOffset (None = full history).
+lb_options = {
+    "3M":   pd.DateOffset(months=3),
+    "6M":   pd.DateOffset(months=6),
+    "1Y":   pd.DateOffset(years=1),
+    "3Y":   pd.DateOffset(years=3),
+    "5Y":   pd.DateOffset(years=5),
+    "Full": None,
+}
+lb_label  = st.radio("Lookback", list(lb_options.keys()),
+                     horizontal=True, index=3, label_visibility="collapsed")
+lb_offset = lb_options[lb_label]
 
-if lb_years is not None:
-    cutoff       = pd.Timestamp("today") - pd.DateOffset(years=lb_years)
+if lb_offset is not None:
+    cutoff       = pd.Timestamp("today") - lb_offset
     display_wide = wide[wide.index >= cutoff]
     display_eq   = equity_wide[equity_wide.index >= cutoff]
 else:
