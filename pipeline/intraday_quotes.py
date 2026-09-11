@@ -24,7 +24,7 @@ from __future__ import annotations
 import concurrent.futures as cf
 import urllib.parse
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 
@@ -89,6 +89,7 @@ class Quote:
     state: str
     currency: str | None
     name: str | None
+    session_hint: str | None = None  # e.g. "pre-market opens 04:00 EDT" when CLOSED
 
 
 def get_style_etfs() -> list[tuple[str, str]]:
@@ -130,6 +131,37 @@ def _derive_state(meta: dict) -> str:
     return "CLOSED"
 
 
+def _session_hint(state: str, meta: dict) -> str | None:
+    """Human hint about the next live session, for the banner.
+
+    CLOSED → "pre-market opens HH:MM TZ" (+" next session" once today's window
+    has already passed); PRE → "market opens HH:MM TZ". Times use the exchange's
+    own gmtoffset from the trading-period window, so DST needs no special-casing.
+    """
+    cp = meta.get("currentTradingPeriod") or {}
+
+    def at(window: str, key: str) -> tuple[str, str] | None:
+        w = cp.get(window)
+        if not w or key not in w:
+            return None
+        tz = timezone(timedelta(seconds=w.get("gmtoffset", 0)))
+        return datetime.fromtimestamp(w[key], tz).strftime("%H:%M"), w.get("timezone", "ET")
+
+    if state == "CLOSED":
+        pre = cp.get("pre")
+        got = at("pre", "start")
+        if not (pre and got):
+            return None
+        t, tzabbr = got
+        passed = datetime.now(timezone.utc).timestamp() >= pre["start"]
+        return f"pre-market opens {t} {tzabbr}" + (" next session" if passed else "")
+    if state == "PRE":
+        got = at("regular", "start")
+        if got:
+            return f"market opens {got[0]} {got[1]}"
+    return None
+
+
 def _parse(symbol: str, data: dict) -> Quote | None:
     try:
         result = data["chart"]["result"][0]
@@ -156,8 +188,9 @@ def _parse(symbol: str, data: dict) -> Quote | None:
 
     pct = (price / prev_close - 1.0) if (price and prev_close) else None
     name = meta.get("shortName") or meta.get("longName")
-    return Quote(symbol, price, prev_close, pct, _derive_state(meta),
-                 meta.get("currency"), name)
+    state = _derive_state(meta)
+    return Quote(symbol, price, prev_close, pct, state,
+                 meta.get("currency"), name, _session_hint(state, meta))
 
 
 def fetch_quote(symbol: str) -> Quote | None:
