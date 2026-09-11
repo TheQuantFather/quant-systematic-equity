@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from brokers.schema import PORTFOLIO_ANALYTICS_DB
+from config import PORTFOLIO_ANALYTICS_DB
 from utils import get_db
 
 
