@@ -25,6 +25,7 @@ FACTORS_DB       = DATA_DIR / "factors.db"
 MODELS_DB        = DATA_DIR / "models.db"
 RISK_DB          = DATA_DIR / "risk.db"   # Ledoit-Wolf covariance + Barra tables
 MACRO_DB         = DATA_DIR / "macro.db"  # US macro signals: treasury yields, spreads, commodities, economic data
+PORTFOLIO_ANALYTICS_DB = DATA_DIR / "portfolio_analytics.db"  # broker-synced book snapshots + NAV (brokers/)
 
 # ---------------------------------------------------------------------------
 # Reference / mapping files
