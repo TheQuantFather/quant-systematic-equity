@@ -1300,12 +1300,14 @@ _MOSEK_PARAMS = {
 }
 
 # Extra params applied only when the problem contains integer variables.
-# Allow MOSEK up to 300 s of branch-and-bound; it will return the best
+# Allow MOSEK up to 900 s of branch-and-bound; it will return the best
 # incumbent if time expires (status = optimal_inaccurate → still accepted).
+# It stops early once the 0.1% optimality gap is proven, so a well-behaved
+# solve converges to a clean `optimal` well before the cap.
 _MOSEK_PARAMS_MIP = {
     **_MOSEK_PARAMS,
-    "MSK_DPAR_OPTIMIZER_MAX_TIME":      300.0,
-    "MSK_DPAR_MIO_MAX_TIME":            300.0,
+    "MSK_DPAR_OPTIMIZER_MAX_TIME":      900.0,
+    "MSK_DPAR_MIO_MAX_TIME":            900.0,
     "MSK_DPAR_MIO_TOL_REL_GAP":         1e-3,   # 0.1% optimality gap is fine in practice
 }
 

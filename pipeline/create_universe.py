@@ -31,6 +31,8 @@ Legacy/bootstrap only:
 
 import json
 import re
+import subprocess
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -152,6 +154,50 @@ def seed_security_data_start_table(conn: "sqlite3.Connection") -> None:
     conn.commit()
 
 
+# iShares product pages whose holdings CSV carries GICS sector. Seeded into
+# index_registry.ishares_product_url; add a row here (and re-run any create_universe
+# command) to enable browser-driven holdings fetch for another index.
+_ISHARES_PRODUCT_URLS: dict[str, str] = {
+    "russell_1000": "https://www.ishares.com/us/products/239707/ishares-russell-1000-etf",
+    "sp500":        "https://www.ishares.com/us/products/239726/ishares-core-sp-500-etf",
+}
+
+# Human-readable index labels, seeded into index_registry.display_name and read
+# back by pages/logic — the single source of truth for benchmark display names, so
+# no page hardcodes an index_name → label map (mirrors _ISHARES_PRODUCT_URLS).
+_INDEX_DISPLAY_NAMES: dict[str, str] = {
+    "sp500":               "S&P 500",
+    "sp500_3pct_capped":   "S&P 500 3% Capped",
+    "sp500_equal_weight":  "S&P 500 Equal-Weight",
+    "sp500_growth":        "S&P 500 Growth",
+    "sp500_value":         "S&P 500 Value",
+    "russell_1000":        "Russell 1000",
+    "russell_1000_growth": "Russell 1000 Growth",
+    "russell_1000_value":  "Russell 1000 Value",
+    "russell_2000":        "Russell 2000",
+    "msci_usa":            "MSCI USA",
+    "msci_usa_quality":    "MSCI USA Quality",
+    "msci_usa_momentum":   "MSCI USA Momentum",
+    "msci_usa_min_vol":    "MSCI USA Min Vol",
+    "msci_usa_value":      "MSCI USA Value",
+    "msci_usa_size":       "MSCI USA Size",
+    "europe_equity":       "Europe Equity",
+    "japan_equity":        "Japan Equity",
+    "em_equity":           "EM Equity",
+    "india_equity":        "India Equity",
+    "china_equity":        "China A Equity",
+    "ai_tech":             "AI & Technology",
+    "global_reits":        "Global REITs",
+    "broad_commodities":   "Broad Commodities",
+    "gold":                "Gold",
+    "treasury_long":       "US Treasury 20+yr",
+    "treasury_mid":        "US Treasury 7-10yr",
+    "treasury_short":      "US Treasury 1-3yr",
+    "corp_bonds":          "USD Corporate Bonds",
+    "em_bonds":            "EM USD Bonds",
+}
+
+
 def seed_registry_tables(conn: "sqlite3.Connection") -> None:
     """Create index_registry and nport_accessions tables if they don't exist yet."""
     conn.execute("""
@@ -174,6 +220,25 @@ def seed_registry_tables(conn: "sqlite3.Connection") -> None:
             FOREIGN KEY (index_name) REFERENCES index_registry(index_name)
         )
     """)
+    # iShares product page URL per index — the source for the browser-driven
+    # holdings-CSV fetch (GICS sector). Kept in the DB, never hardcoded in logic.
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(index_registry)").fetchall()}
+    if "ishares_product_url" not in cols:
+        conn.execute("ALTER TABLE index_registry ADD COLUMN ishares_product_url TEXT")
+    if "display_name" not in cols:
+        conn.execute("ALTER TABLE index_registry ADD COLUMN display_name TEXT")
+    for index_name, url in _ISHARES_PRODUCT_URLS.items():
+        conn.execute(
+            "UPDATE index_registry SET ishares_product_url = ? "
+            "WHERE index_name = ? AND (ishares_product_url IS NULL OR ishares_product_url = '')",
+            (url, index_name),
+        )
+    for index_name, label in _INDEX_DISPLAY_NAMES.items():
+        conn.execute(
+            "UPDATE index_registry SET display_name = ? "
+            "WHERE index_name = ? AND (display_name IS NULL OR display_name = '')",
+            (label, index_name),
+        )
     conn.commit()
 
 
@@ -422,6 +487,110 @@ def load_simfin() -> pd.DataFrame:
     df["cik"]    = pd.to_numeric(df["cik"],    errors="coerce").astype("Int64")
     df["simfin_id"] = pd.to_numeric(df["simfin_id"], errors="coerce").astype("Int64")
     return df
+
+
+# Boilerplate suffixes stripped before comparing two company names for same-issuer
+# identity. Keep to legal-form / share-class tokens only — never industry words.
+_ISSUER_NAME_STOPWORDS = frozenset({
+    "inc", "corp", "corporation", "co", "ltd", "plc", "holdings", "holding",
+    "group", "the", "company", "cos", "nv", "sa", "class", "reit",
+    "international", "industries", "common", "stock",
+})
+
+
+def _same_issuer(name_a: object, name_b: object) -> bool:
+    """True if two company names share a meaningful (non-boilerplate) token.
+
+    This is the guard that lets a stable-ISIN ticker rename (Square→Block,
+    HollyFrontier→HF Sinclair) import its SimFin classification, while rejecting
+    ISIN reuse across a SPAC/reverse-merger — e.g. an Oklo ISIN whose SimFin row
+    still reads 'AltC Acquisition Corp'. No shared word → treat as a different
+    issuer and refuse the import.
+    """
+    def toks(s: object) -> set[str]:
+        return set(re.findall(r"[a-z]+", str(s or "").lower())) - _ISSUER_NAME_STOPWORDS
+    return bool(toks(name_a) & toks(name_b))
+
+
+def _load_simfin_by_isin() -> dict[str, dict]:
+    """{isin: {company_name, simfin_sector, simfin_industry, simfin_id}} from the
+    local SimFin bulk. ISIN is the stable issuer key — it survives ticker renames,
+    and _same_issuer guards the reuse case. Empty dict if the bulk is absent."""
+    try:
+        df = load_simfin()
+    except Exception as exc:
+        log.warning("SimFin bulk unavailable for classification: %s", exc)
+        return {}
+    out: dict[str, dict] = {}
+    for r in df.itertuples(index=False):
+        isin = getattr(r, "isin", None)
+        if not isin or pd.isna(isin):
+            continue
+        ss = getattr(r, "simfin_sector", None)
+        si = getattr(r, "simfin_industry", None)
+        sid = getattr(r, "simfin_id", None)
+        out[str(isin)] = {
+            "company_name":    str(getattr(r, "company_name", "") or ""),
+            "simfin_sector":   None if (ss is None or pd.isna(ss)) else str(ss),
+            "simfin_industry": None if (si is None or pd.isna(si)) else str(si),
+            "simfin_id":       None if (sid is None or pd.isna(sid)) else int(sid),
+        }
+    return out
+
+
+def _fill_simfin_from_bulk(row: dict, simfin_by_isin: dict) -> None:
+    """Populate a company row's simfin_sector/industry/id from the bulk by ISIN when
+    missing. Matched on the stable ISIN and gated by _same_issuer: an ISIN can be
+    reused across a SPAC/reverse-merger, so a name mismatch means the bulk row still
+    describes the prior entity and must not be imported."""
+    if row.get("simfin_sector") or not row.get("isin"):
+        return
+    meta = simfin_by_isin.get(str(row["isin"]))
+    if not meta or not meta.get("simfin_sector"):
+        return
+    if not _same_issuer(meta.get("company_name"), row.get("company_name")):
+        return   # ISIN reused by a different issuer — do not import
+    row["simfin_sector"] = meta["simfin_sector"]
+    row["simfin_industry"] = meta["simfin_industry"]
+    if not row.get("simfin_id"):
+        row["simfin_id"] = meta["simfin_id"]
+
+
+def backfill_simfin_classification() -> int:
+    """Fill companies.simfin_sector/simfin_industry from the SimFin bulk (matched by
+    ISIN, gated by _same_issuer) for rows the N-PORT onboarding path left NULL. Same
+    source/taxonomy as build_companies. Returns the number of rows updated.
+
+    ISIN match (not CIK+ticker) is what fills genuine ticker renames — the new ISIN
+    is stable and the bulk still carries the classification under the old ticker."""
+    simfin = _load_simfin_by_isin()
+    if not simfin:
+        log.warning("No SimFin bulk — nothing to backfill.")
+        return 0
+    with get_db(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT isin, company_name FROM companies "
+            "WHERE (simfin_sector IS NULL OR simfin_sector = '') "
+            "AND isin IS NOT NULL AND isin != ''"
+        ).fetchall()
+        updates = []
+        for isin, company_name in rows:
+            meta = simfin.get(str(isin))
+            if not meta or not meta.get("simfin_sector"):
+                continue
+            if not _same_issuer(meta.get("company_name"), company_name):
+                continue   # ISIN reused by a different issuer (SPAC/reverse-merger)
+            updates.append((meta["simfin_sector"], meta["simfin_industry"],
+                            meta["simfin_id"], isin))
+        conn.executemany(
+            "UPDATE companies SET simfin_sector = ?, simfin_industry = ?, "
+            "simfin_id = COALESCE(simfin_id, ?) WHERE isin = ?",
+            updates,
+        )
+        conn.commit()
+    log.info("Backfilled SimFin classification for %d compan(ies) of %d NULL-simfin "
+             "candidates from bulk (ISIN match).", len(updates), len(rows))
+    return len(updates)
 
 
 # Canonical index name for known iShares ETF products.
@@ -1393,14 +1562,336 @@ def resolve_nport_company_candidates(limit: int | None = None) -> None:
     log.info("N-PORT candidate resolution staged: %s", status_counts)
 
 
-def promote_nport_company_candidates(min_confidence: float = 0.85) -> None:
+def fetch_ishares_holdings(index_name: str = "russell_1000") -> Path:
+    """Download the current iShares holdings CSV for `index_name` via a headless
+    browser and save it under INDEX_DIR. Returns the saved path.
+
+    The holdings download link is JavaScript-rendered and session-gated: a plain
+    HTTP client only receives the page shell (it returns HTML under a text/csv
+    header). A real browser executes the page and fetches the authoritative,
+    GICS-licensed CSV — the sector source for onboarding new constituents. Uses
+    Playwright driving the system Chrome channel (no bundled-browser download, so
+    it works on macOS 12); Playwright is imported lazily and is NOT a hard
+    dependency of the routine pipeline.
+    """
+    from urllib.parse import urljoin
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:
+        raise RuntimeError(
+            "Playwright not installed — run: pip install playwright "
+            "(the system Chrome channel is used, so no browser download is needed)."
+        ) from exc
+
+    with get_db(DB_PATH) as conn:
+        seed_registry_tables(conn)
+        row = conn.execute(
+            "SELECT ishares_product_url FROM index_registry WHERE index_name = ?",
+            (index_name,),
+        ).fetchone()
+    product_url = row[0] if row else None
+    if not product_url:
+        raise RuntimeError(
+            f"No ishares_product_url for index '{index_name}' in index_registry — "
+            f"add it to _ISHARES_PRODUCT_URLS and re-run."
+        )
+
+    log.info("Fetching iShares holdings for %s via browser: %s", index_name, product_url)
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(channel="chrome", headless=True)
+        try:
+            ctx = browser.new_context(accept_downloads=True)
+            page = ctx.new_page()
+            page.goto(product_url, wait_until="domcontentloaded", timeout=60000)
+            # Best-effort dismissal of an investor-type / consent interstitial.
+            for label in ("Accept", "I Agree", "Individual", "Continue"):
+                try:
+                    btn = page.get_by_role("button", name=label)
+                    if btn.count():
+                        btn.first.click(timeout=3000)
+                        page.wait_for_timeout(500)
+                        break
+                except Exception:
+                    pass
+            href = page.eval_on_selector_all(
+                "a",
+                "els => (els.map(e=>e.getAttribute('href'))"
+                ".find(h=>h && h.toLowerCase().includes('holdings.csv')) || '')",
+            )
+            if not href:
+                raise RuntimeError("No holdings.csv link found on the product page.")
+            csv_url = urljoin(product_url + "/", href)
+            resp = ctx.request.get(csv_url, timeout=60000)
+            if resp.status != 200:
+                raise RuntimeError(f"holdings.csv fetch returned HTTP {resp.status}")
+            body = resp.body()
+        finally:
+            browser.close()
+
+    lines = body.decode("utf-8", errors="replace").splitlines()
+    header_idx = next(
+        (i for i, l in enumerate(lines)
+         if l.lstrip('"').startswith("Ticker") and "Sector" in l),
+        None,
+    )
+    if header_idx is None:
+        raise RuntimeError(
+            "Downloaded file is not the expected holdings CSV (no 'Ticker,…,Sector' "
+            "header) — iShares may have changed the page or gated the download."
+        )
+    asof = datetime.now().strftime("%Y_%m_%d")
+    for l in lines[:header_idx]:
+        if l.lower().startswith("fund holdings as of"):
+            m = re.search(r'([A-Za-z]{3} \d{1,2}, \d{4})', l)
+            if m:
+                try:
+                    asof = datetime.strptime(m.group(1), "%b %d, %Y").strftime("%Y_%m_%d")
+                except ValueError:
+                    pass
+            break
+    INDEX_DIR.mkdir(parents=True, exist_ok=True)
+    out_path = INDEX_DIR / f"{index_name}_{asof}.csv"
+    out_path.write_bytes(body)
+    log.info("Saved %s holdings CSV: %s (%d holdings rows, as of %s)",
+             index_name, out_path, len(lines) - header_idx - 1, asof)
+    return out_path
+
+
+def detect_reconstitution(index_name: str = "russell_1000", alert_threshold: int = 5) -> dict:
+    """Report index members on the latest snapshot missing from companies.
+
+    A quarterly/annual reconstitution rotates in a fresh N-PORT filing, so
+    `ensure_snapshot` records new constituents as membership-only ISINs (no
+    company row). This surfaces them — the onboarding trigger. Logs an alert when
+    the count exceeds `alert_threshold` (baseline is ~1). Returns
+    {snapshot_date, unmapped_count, names:[{isin, security_name}]}.
+    """
+    with get_db(DB_PATH) as conn:
+        seed_registry_tables(conn)
+        latest = conn.execute(
+            "SELECT MAX(snapshot_date) FROM universe_snapshots WHERE index_name = ?",
+            (index_name,),
+        ).fetchone()[0]
+        if latest is None:
+            log.warning("No snapshots for index '%s'.", index_name)
+            return {"snapshot_date": None, "unmapped_count": 0, "names": []}
+        rows = conn.execute(
+            """
+            SELECT us.isin, COALESCE(m.security_name, '') AS name
+            FROM universe_snapshots us
+            LEFT JOIN companies c ON c.isin = us.isin
+            LEFT JOIN nport_accessions na
+              ON na.index_name = us.index_name AND na.snapshot_date = us.snapshot_date
+            LEFT JOIN nport_security_metadata m
+              ON m.accession = na.accession AND m.isin = us.isin
+            WHERE us.index_name = ? AND us.snapshot_date = ?
+              AND (c.isin IS NULL OR c.ticker IS NULL)
+            ORDER BY name, us.isin
+            """,
+            (index_name, latest),
+        ).fetchall()
+    names = [{"isin": r[0], "security_name": r[1]} for r in rows]
+    count = len(names)
+    if count > alert_threshold:
+        preview = ", ".join(n["security_name"] or n["isin"] for n in names[:15])
+        log.warning(
+            "RECONSTITUTION: %s snapshot %s has %d member(s) missing from companies "
+            "(baseline ~1). Onboard: fetch_ishares_holdings -> refresh/stage/resolve "
+            "-> --promote-nport-company-candidates --ishares-csv <csv> -> fundamentals "
+            "-> returns -> re-snapshot %s. New: %s%s",
+            index_name, latest, count, latest, preview, " ..." if count > 15 else "",
+        )
+    else:
+        log.info("%s snapshot %s: %d unmapped member(s) (within baseline).",
+                 index_name, latest, count)
+    return {"snapshot_date": latest, "unmapped_count": count, "names": names}
+
+
+def _run_module(module: str, *args: str) -> bool:
+    """Run a pipeline module as a subprocess from the repo root, inheriting
+    stdout/stderr so its output streams into the caller's log. Returns rc==0.
+    """
+    cmd = [sys.executable, "-u", "-m", module, *args]
+    log.info("  -> %s", " ".join(cmd[3:]))
+    try:
+        return subprocess.run(cmd, cwd=str(ROOT)).returncode == 0
+    except Exception as exc:
+        log.error("subprocess failed (%s): %s", module, exc)
+        return False
+
+
+def onboard_new_constituents(index_name: str = "russell_1000") -> dict:
+    """End-to-end, unattended onboarding of new index constituents.
+
+    Self-gating: does nothing unless the latest snapshot has members missing from
+    companies that resolve to a *new* US-listed equity — so the persistent
+    unresolvable artifacts (a CVR, an unmappable ISIN) never trigger a browser
+    fetch or any writes. On a real reconstitution it:
+      1. refreshes N-PORT security metadata, then stages + resolves candidates;
+      2. downloads the authoritative iShares holdings CSV (browser) for GICS;
+      3. promotes the resolvable new names into companies (sector from the CSV;
+         unresolved / non-equity / no-sector names are skipped, never guessed);
+      4. backfills EDGAR fundamentals (annual + quarterly) for the new ISINs;
+      5. backfills returns for the new tickers.
+    The weekly factors->models->risk->barra steps that follow fold the new names
+    into that snapshot's cross-section. Idempotent: once onboarded, re-running is
+    a fast no-op (before/after companies sets are equal, so steps 4-5 are skipped).
+    Steps 4-5 are best-effort — a failure is logged but does not abort, since the
+    daily returns pull and monthly fill-gaps sweep self-heal missing data.
+
+    Returns a summary dict.
+    """
+    summary = {"index": index_name, "detected": 0, "resolvable": 0,
+               "onboarded": 0, "new_tickers": []}
+    detect = detect_reconstitution(index_name)
+    summary["detected"] = detect["unmapped_count"]
+    if detect["unmapped_count"] == 0:
+        log.info("Onboarding: nothing unmapped — no-op.")
+        return summary
+
+    # Stage + resolve the unmapped names (cheap: a handful of OpenFIGI/SEC calls).
+    refresh_nport_security_metadata(only_latest=True)
+    stage_nport_company_candidates(only_latest=True)
+    resolve_nport_company_candidates()
+
+    with get_db(DB_PATH) as conn:
+        resolvable = conn.execute(
+            """
+            SELECT COUNT(*) FROM nport_company_candidates
+            WHERE company_status = 'missing_from_companies'
+              AND resolution_status IN ('resolved', 'resolved_sec_name_match')
+              AND resolved_ticker IS NOT NULL AND resolved_ticker != ''
+              AND resolved_cik IS NOT NULL AND resolved_cik != ''
+            """
+        ).fetchone()[0]
+    summary["resolvable"] = resolvable
+    if resolvable == 0:
+        log.info("Onboarding: %d unmapped but none resolve to a new equity "
+                 "(artifacts) — no-op.", detect["unmapped_count"])
+        return summary
+
+    # A real reconstitution: fetch authoritative GICS and promote.
+    try:
+        csv_path = fetch_ishares_holdings(index_name)
+    except Exception as exc:
+        log.error("Onboarding aborted — could not fetch iShares holdings CSV: %s. "
+                  "New names stay unmapped; next weekly run retries.", exc)
+        return summary
+
+    with get_db(DB_PATH) as conn:
+        before = {r[0] for r in conn.execute("SELECT isin FROM companies").fetchall()}
+    promote_nport_company_candidates(ishares_csv=str(csv_path))
+    with get_db(DB_PATH) as conn:
+        after_rows = conn.execute("SELECT isin, ticker FROM companies").fetchall()
+    new_isins = [r[0] for r in after_rows if r[0] not in before]
+    new_tickers = sorted({r[1] for r in after_rows if r[0] in set(new_isins) and r[1]})
+    summary["onboarded"] = len(new_isins)
+    summary["new_tickers"] = new_tickers
+    log.info("Onboarding: promoted %d new constituent(s): %s",
+             len(new_isins), ", ".join(new_tickers) or "(none)")
+    if not new_isins:
+        return summary
+
+    # Backfill fundamentals + returns for the new names (best-effort).
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as fh:
+        fh.write("\n".join(new_isins) + "\n")
+        isins_file = fh.name
+    try:
+        for label, extra in (("annual", ()), ("quarterly", ("--quarterly",))):
+            ok = _run_module("pipeline.update_constituents", "--fill-gaps",
+                             "--isins-file", isins_file, "--cache-filings",
+                             "--min-year", "2021", *extra)
+            if not ok:
+                log.error("Onboarding: %s fundamentals backfill returned non-zero "
+                          "(continuing; monthly fill-gaps will self-heal).", label)
+        ticker_args: list[str] = []
+        for t in new_tickers:
+            ticker_args += ["--ticker", t]
+        if ticker_args and not _run_module("pipeline.create_returns", "--update", *ticker_args):
+            log.error("Onboarding: returns backfill returned non-zero "
+                      "(continuing; daily returns pull will self-heal).")
+    finally:
+        try:
+            Path(isins_file).unlink()
+        except OSError:
+            pass
+    return summary
+
+
+def _norm_ticker_key(value: object) -> str:
+    """Normalise a ticker for cross-source joins (uppercase, alnum only)."""
+    return "".join(ch for ch in str(value).upper() if ch.isalnum())
+
+
+def _load_ishares_sector_map(csv_path: str) -> dict[str, dict]:
+    """Parse an iShares holdings CSV into {normalised_ticker: metadata}.
+
+    iShares CSVs carry a multi-line fund-level preamble before the holdings
+    header (the line beginning with 'Ticker,'). GICS sector is the one field
+    the EDGAR/N-PORT path cannot supply, so this is the authoritative source
+    for classifying brand-new constituents at onboarding time.
+    """
+    raw = Path(csv_path).read_text().splitlines()
+    header_idx = next(
+        (i for i, line in enumerate(raw)
+         if line.lstrip('"').startswith("Ticker") and "Sector" in line),
+        None,
+    )
+    if header_idx is None:
+        raise RuntimeError(f"Could not find holdings header row in {csv_path}")
+    frame = pd.read_csv(csv_path, skiprows=header_idx)
+    frame.columns = [str(c).strip() for c in frame.columns]
+
+    out: dict[str, dict] = {}
+    for _, r in frame.iterrows():
+        if str(r.get("Asset Class", "")).strip() != "Equity":
+            continue
+        key = _norm_ticker_key(r.get("Ticker"))
+        if not key:
+            continue
+        raw_sector = str(r.get("Sector", "")).strip()
+        out[key] = {
+            "ticker": str(r.get("Ticker", "")).strip(),
+            "company_name": str(r.get("Name", "")).strip(),
+            "gics_sector": GICS_SECTOR_NORM.get(raw_sector, raw_sector) or None,
+            "country": str(r.get("Location", "")).strip() or None,
+            "exchange": str(r.get("Exchange", "")).strip() or None,
+            "currency": (str(r.get("Currency", "USD")).strip() or "USD"),
+        }
+    return out
+
+
+def _fetch_sec_fiscal_year_end(cik: str) -> int | None:
+    """Fiscal-year-end month (1-12) from SEC submissions, or None on failure."""
+    if not cik:
+        return None
+    try:
+        sub = _edgar_fetch(f"https://data.sec.gov/submissions/CIK{cik}.json", timeout=15)
+    except Exception:
+        return None
+    fye = str(sub.get("fiscalYearEnd", "") or "")
+    if len(fye) == 4 and fye.isdigit():
+        return int(fye[:2])
+    return None
+
+
+def promote_nport_company_candidates(
+    min_confidence: float = 0.85,
+    ishares_csv: str | None = None,
+) -> None:
     """Insert reviewed N-PORT candidate resolutions into companies.
 
     Promotion is intentionally conservative:
       - only missing candidates with a resolved ticker and CIK are eligible;
-      - the resolved ticker must already exist in companies, so sector/classification
-        metadata is copied from a known row instead of guessed;
-      - unresolved or ticker-only rows remain in nport_company_candidates.
+      - when the resolved ticker already exists in companies, sector/classification
+        metadata is copied from that known row instead of guessed;
+      - a brand-new ticker (no existing row) is onboarded only when `ishares_csv`
+        is supplied: GICS sector — the one field EDGAR/N-PORT cannot provide — is
+        taken from the iShares holdings CSV (the index provider's authoritative,
+        GICS-licensed classification), CIK/exchange from the SEC resolution, and
+        fiscal-year-end from SEC submissions. Without a CSV match such a candidate
+        is skipped (never guessed), so a snapshot never gets a phantom sector;
+      - unresolved or unmatched rows remain in nport_company_candidates.
     """
     eligible_statuses = ("resolved", "resolved_sec_name_match")
     with get_db(DB_PATH) as conn:
@@ -1440,8 +1931,11 @@ def promote_nport_company_candidates(min_confidence: float = 0.85) -> None:
             params=tuple(tickers),
         )
 
-    if existing.empty:
-        log.warning("No existing same-ticker companies rows found; nothing promoted.")
+    sector_map = _load_ishares_sector_map(ishares_csv) if ishares_csv else {}
+    if existing.empty and not sector_map:
+        log.warning(
+            "No existing same-ticker companies rows and no --ishares-csv; nothing promoted."
+        )
         return
 
     existing_by_ticker = (
@@ -1457,29 +1951,73 @@ def promote_nport_company_candidates(min_confidence: float = 0.85) -> None:
         "delisted_date",
     ]
     today = datetime.now().strftime("%Y-%m-%d")
+    simfin_by_isin = _load_simfin_by_isin()   # SimFin sector/industry backfill by ISIN
     rows: list[tuple] = []
     skipped: list[tuple[str, str, str]] = []
+    copied_from_existing = onboarded_from_csv = 0
     for candidate in candidates.to_dict("records"):
         ticker = str(candidate["resolved_ticker"])
         base = existing_by_ticker.get(ticker)
-        if not base:
-            skipped.append((candidate["isin"], ticker, "no_existing_ticker_metadata"))
+        if base:
+            row = {col: base.get(col) for col in company_cols}
+            row["isin"] = candidate["isin"]
+            row["ticker"] = ticker
+            row["company_name"] = (
+                candidate.get("resolved_company_name")
+                or candidate.get("security_name")
+                or base.get("company_name")
+            )
+            row["cik"] = candidate.get("resolved_cik") or base.get("cik")
+            row["cusip"] = candidate.get("cusip") or base.get("cusip")
+            row["exchange"] = base.get("exchange") or candidate.get("resolved_exchange")
+            row["currency"] = base.get("currency") or candidate.get("currency")
+            # A re-ISIN can coincide with a GICS reclassification (e.g. a spinoff:
+            # DuPont Materials→Industrials after shedding Qnity). The index
+            # provider's current sector is authoritative over the stale copied one;
+            # drop the finer copied GICS fields when the sector actually changed.
+            csv_existing = sector_map.get(_norm_ticker_key(ticker))
+            csv_sector = csv_existing.get("gics_sector") if csv_existing else None
+            if csv_sector and csv_sector != row.get("gics_sector"):
+                row["gics_sector"] = csv_sector
+                row["gics_industry_group"] = None
+                row["gics_industry"] = None
+                row["gics_sub_industry"] = None
+            row["data_date"] = candidate.get("last_snapshot_date") or today
+            row["update_date"] = today
+            row["delisted_date"] = None
+            _fill_simfin_from_bulk(row, simfin_by_isin)
+            copied_from_existing += 1
+            rows.append(tuple(row.get(col) for col in company_cols))
             continue
-        row = {col: base.get(col) for col in company_cols}
+
+        # Brand-new ticker: onboard only with an iShares CSV GICS match.
+        csv_meta = sector_map.get(_norm_ticker_key(ticker))
+        if not csv_meta:
+            reason = "no_existing_ticker_metadata_no_csv" if sector_map else "no_existing_ticker_metadata"
+            skipped.append((candidate["isin"], ticker, reason))
+            continue
+        row = {col: None for col in company_cols}
         row["isin"] = candidate["isin"]
         row["ticker"] = ticker
         row["company_name"] = (
             candidate.get("resolved_company_name")
+            or csv_meta.get("company_name")
             or candidate.get("security_name")
-            or base.get("company_name")
         )
-        row["cik"] = candidate.get("resolved_cik") or base.get("cik")
-        row["cusip"] = candidate.get("cusip") or base.get("cusip")
-        row["exchange"] = base.get("exchange") or candidate.get("resolved_exchange")
-        row["currency"] = base.get("currency") or candidate.get("currency")
+        row["gics_sector"] = csv_meta.get("gics_sector")
+        row["country"] = csv_meta.get("country") or candidate.get("investment_country")
+        row["exchange"] = candidate.get("resolved_exchange") or csv_meta.get("exchange")
+        row["currency"] = csv_meta.get("currency") or candidate.get("currency") or "USD"
+        row["cik"] = candidate.get("resolved_cik")
+        row["cusip"] = candidate.get("cusip")
+        row["fiscal_year_end"] = _fetch_sec_fiscal_year_end(
+            str(candidate.get("resolved_cik") or "")
+        )
         row["data_date"] = candidate.get("last_snapshot_date") or today
         row["update_date"] = today
         row["delisted_date"] = None
+        _fill_simfin_from_bulk(row, simfin_by_isin)
+        onboarded_from_csv += 1
         rows.append(tuple(row.get(col) for col in company_cols))
 
     if not rows:
@@ -1494,7 +2032,11 @@ def promote_nport_company_candidates(min_confidence: float = 0.85) -> None:
         conn.executemany(insert_sql, rows)
         conn.commit()
 
-    log.info("Promoted %d N-PORT candidate(s) into companies.", len(rows))
+    log.info(
+        "Promoted %d N-PORT candidate(s) into companies "
+        "(copied_from_existing=%d, onboarded_from_ishares_csv=%d).",
+        len(rows), copied_from_existing, onboarded_from_csv,
+    )
     for isin, ticker, reason in skipped:
         log.warning("Skipped %s/%s: %s", isin, ticker, reason)
 
@@ -3264,6 +3806,50 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--ishares-csv", metavar="PATH", default=None,
+        help=(
+            "iShares holdings CSV used by --promote-nport-company-candidates to "
+            "classify brand-new tickers (GICS sector). Required to onboard "
+            "constituents whose ticker is not already in companies. Use "
+            "--fetch-ishares-holdings to download it automatically."
+        ),
+    )
+    parser.add_argument(
+        "--fetch-ishares-holdings", metavar="INDEX", nargs="?", const="russell_1000",
+        default=None,
+        help=(
+            "Download the current iShares holdings CSV for INDEX (default "
+            "russell_1000) into data/universe_index via a headless browser "
+            "(needs Playwright + Chrome). Prints the saved path."
+        ),
+    )
+    parser.add_argument(
+        "--check-reconstitution", metavar="INDEX", nargs="?", const="russell_1000",
+        default=None,
+        help=(
+            "Report INDEX members (default russell_1000) on the latest snapshot "
+            "missing from companies — the reconstitution/onboarding trigger."
+        ),
+    )
+    parser.add_argument(
+        "--backfill-simfin-classification", action="store_true",
+        help=(
+            "Fill companies.simfin_sector/simfin_industry from the local SimFin bulk "
+            "(by CIK) for rows the N-PORT onboarding path left NULL. One-off repair; "
+            "onboarding now populates these automatically."
+        ),
+    )
+    parser.add_argument(
+        "--onboard-new-constituents", metavar="INDEX", nargs="?", const="russell_1000",
+        default=None,
+        help=(
+            "Unattended end-to-end onboarding of new INDEX constituents (default "
+            "russell_1000): detect -> fetch iShares CSV -> resolve -> promote -> "
+            "fundamentals -> returns. Self-gating no-op when nothing new. Run in "
+            "the weekly pipeline after --ensure-snapshot and before factors."
+        ),
+    )
+    parser.add_argument(
         "--limit", type=int, default=None,
         help="Cap the number of names processed (debug; applies to --recover-delisted)",
     )
@@ -3323,6 +3909,33 @@ def main() -> None:
         recover_delisted_securities(limit=args.limit)
         return
 
+    if args.fetch_ishares_holdings:
+        log.info("=== FETCH iSHARES HOLDINGS CSV ===")
+        path = fetch_ishares_holdings(args.fetch_ishares_holdings)
+        log.info("Holdings CSV ready: %s", path)
+        return
+
+    if args.check_reconstitution:
+        log.info("=== CHECK RECONSTITUTION ===")
+        result = detect_reconstitution(args.check_reconstitution)
+        log.info("Unmapped on %s: %d name(s).",
+                 result["snapshot_date"], result["unmapped_count"])
+        return
+
+    if args.backfill_simfin_classification:
+        log.info("=== BACKFILL SIMFIN CLASSIFICATION FROM BULK ===")
+        n = backfill_simfin_classification()
+        log.info("Done — %d compan(ies) updated.", n)
+        return
+
+    if args.onboard_new_constituents:
+        log.info("=== ONBOARD NEW CONSTITUENTS ===")
+        result = onboard_new_constituents(args.onboard_new_constituents)
+        log.info("Onboarding summary: detected=%d resolvable=%d onboarded=%d %s",
+                 result["detected"], result["resolvable"], result["onboarded"],
+                 ", ".join(result["new_tickers"]))
+        return
+
     if args.refresh_nport_metadata:
         log.info("=== REFRESH N-PORT SECURITY METADATA ===")
         refresh_nport_security_metadata(
@@ -3353,7 +3966,10 @@ def main() -> None:
 
     if args.promote_nport_company_candidates:
         log.info("=== PROMOTE N-PORT COMPANY CANDIDATES ===")
-        promote_nport_company_candidates(min_confidence=args.promote_min_confidence)
+        promote_nport_company_candidates(
+            min_confidence=args.promote_min_confidence,
+            ishares_csv=args.ishares_csv,
+        )
         return
 
     if not args.legacy_rebuild_companies:

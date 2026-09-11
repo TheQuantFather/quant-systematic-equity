@@ -1,6 +1,11 @@
 import pandas as pd
 
-from pipeline.create_universe import build_companies, _parse_nport_ec_holdings
+from pipeline.create_universe import (
+    build_companies,
+    _parse_nport_ec_holdings,
+    _same_issuer,
+    _fill_simfin_from_bulk,
+)
 
 
 def _ishares_frame() -> pd.DataFrame:
@@ -66,6 +71,49 @@ def test_build_companies_uses_simfin_when_ticker_not_excluded():
     assert row["company_name"] == "LINN ENERGY, INC."
     assert row["cik"] == "1326428"
     assert row["simfin_id"] == 640898
+
+
+def test_same_issuer_matches_ticker_renames_but_not_reuse():
+    # Genuine ticker renames (stable ISIN, new ticker) share a meaningful token.
+    assert _same_issuer("BLOCK INC CLASS A", "Block, Inc.")
+    assert _same_issuer("HF Sinclair Corporation", "HOLLYFRONTIER CORP") is False  # no shared word
+    assert _same_issuer("MEDICAL PROPERTIES TRUST REIT INC", "Medical Properties Trust, Inc.")
+    # SPAC/ISIN reuse: bulk still names the prior shell — must not match.
+    assert _same_issuer("Oklo Inc.", "AltC Acquisition Corp.") is False
+    # Boilerplate-only overlap (Inc/Corp/Holdings) is not identity.
+    assert _same_issuer("Acme Holdings Inc", "Beta Holdings Inc") is False
+
+
+def test_fill_simfin_from_bulk_isin_match_with_issuer_guard():
+    bulk = {
+        "US53566V1061": {
+            "company_name": "Lineage, Inc.",
+            "simfin_sector": "Real Estate",
+            "simfin_industry": "REITs",
+            "simfin_id": 111,
+        },
+        "USOKLOREUSE01": {  # ISIN reused: bulk still describes the SPAC shell
+            "company_name": "AltC Acquisition Corp.",
+            "simfin_sector": "Financial Services",
+            "simfin_industry": "Banks",
+            "simfin_id": 222,
+        },
+    }
+    # Same issuer, ISIN present -> filled.
+    row = {"isin": "US53566V1061", "company_name": "LINEAGE INC", "simfin_sector": None}
+    _fill_simfin_from_bulk(row, bulk)
+    assert row["simfin_sector"] == "Real Estate"
+    assert row["simfin_id"] == 111
+
+    # ISIN reuse across a SPAC -> refused (would misclassify Oklo as a bank).
+    reuse = {"isin": "USOKLOREUSE01", "company_name": "Oklo Inc.", "simfin_sector": None}
+    _fill_simfin_from_bulk(reuse, bulk)
+    assert reuse["simfin_sector"] is None
+
+    # Already classified -> untouched.
+    filled = {"isin": "US53566V1061", "company_name": "LINEAGE INC", "simfin_sector": "Energy"}
+    _fill_simfin_from_bulk(filled, bulk)
+    assert filled["simfin_sector"] == "Energy"
 
 
 def test_parse_nport_ec_holdings_extracts_security_metadata():

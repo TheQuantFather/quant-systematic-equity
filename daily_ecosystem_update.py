@@ -55,6 +55,7 @@ TIMEOUTS: dict[str, int] = {
     "macro":      300,   # 5m  — FRED/Yahoo: 8 series, 3 retries each
     "fillgaps_annual":    5400,  # 90m — monthly full-universe annual fill-gaps
     "fillgaps_quarterly": 5400,  # 90m — monthly full-universe quarterly fill-gaps
+    "onboard":   5400,   # 90m — reconstitution onboarding (no-op most weeks; fetch+fundamentals+returns on a real one)
     "factors":   2700,   # 45m
     "models":     900,   # 15m
     "risk":      2700,   # 45m
@@ -331,6 +332,18 @@ def main() -> None:
         # refresh universe_snapshots. Required for Barra's PIT R1000 filter.
         step("universe", "create_universe.py", "--ensure-snapshot", snap_date,
              depends_on=("filings",))
+
+        # Onboard any new constituents a reconstitution brought in (membership-only
+        # ISINs with no company row). Self-gating: a fast no-op unless the snapshot
+        # has members missing from companies that resolve to a new equity, in which
+        # case it fetches the authoritative iShares GICS (browser), promotes the
+        # names, and backfills their fundamentals + returns — so the factor build
+        # below includes them. Runs BEFORE factors; deliberately NOT a factors
+        # dependency, so a best-effort onboarding hiccup never blocks the weekly
+        # rebuild (order is guaranteed by sequential execution). See GOTCHAS.md.
+        step("onboard", "create_universe.py", "--onboard-new-constituents",
+             depends_on=("universe",))
+
         step("factors", "create_factors.py", "--date", snap_date,
              depends_on=("returns", "filings"))
         step("models",  "create_models.py",  "--date", snap_date,

@@ -26,6 +26,13 @@ yfinance==0.2.40
 requests==2.34.0
 httpx==0.28.1
 
+# Browser-driven iShares holdings fetch (create_universe --fetch-ishares-holdings /
+# --onboard-new-constituents). Optional: lazy-imported, so the rest of the pipeline
+# runs without it. Drives the system-installed Google Chrome via channel="chrome" —
+# do NOT run `playwright install` (its bundled Chromium/WebKit don't support macOS 12,
+# and are not used). Requires Google Chrome present on the machine.
+playwright==1.62.0
+
 # MCP sqlite server (scripts/mcp_sqlite_server.py)
 mcp==1.27.2
 
