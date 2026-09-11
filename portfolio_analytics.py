@@ -198,6 +198,107 @@ def weighted_factor_exposures(
     return out.sort_values("abs_exposure", ascending=False), float(coverage)
 
 
+def active_weight_table(
+    positions: pd.DataFrame, benchmark: pd.DataFrame
+) -> pd.DataFrame:
+    """Combine portfolio and benchmark weights into a per-name active-weight table.
+
+    ``positions`` holds portfolio ``POSITION`` rows with ``[isin, weight,
+    display_name, sector, symbol]`` (``weight`` = fraction of net-liq). ``benchmark``
+    holds benchmark constituents with ``[isin, weight, name, sector, ticker]``. Both
+    sides are joined on ISIN with an outer join so names held only in the portfolio
+    (pure off-benchmark bets) and names held only in the benchmark (implicit
+    underweights) both appear. Returns one row per union ISIN with ``port_weight``
+    and ``bench_weight`` (filled ``0`` where absent), ``active_weight =
+    port_weight - bench_weight``, and ``name``/``sector``/``ticker`` coalesced
+    across the two sides, sorted by descending active weight.
+    """
+    cols = ["isin", "name", "ticker", "sector", "industry",
+            "port_weight", "bench_weight", "active_weight", "in_benchmark"]
+    if positions.empty and benchmark.empty:
+        return pd.DataFrame(columns=cols)
+
+    port = positions.dropna(subset=["isin"]).copy()
+    for col in ["weight", "display_name", "sector", "symbol", "industry"]:
+        if col not in port.columns:
+            port[col] = pd.NA
+    port = (
+        port.assign(weight=pd.to_numeric(port["weight"], errors="coerce").fillna(0.0))
+        .groupby("isin", as_index=False)
+        .agg(
+            port_weight=("weight", "sum"),
+            name_port=("display_name", "first"),
+            sector_port=("sector", "first"),
+            industry_port=("industry", "first"),
+            ticker_port=("symbol", "first"),
+        )
+    ) if not port.empty else pd.DataFrame(
+        columns=["isin", "port_weight", "name_port", "sector_port", "industry_port", "ticker_port"]
+    )
+
+    bench = benchmark.dropna(subset=["isin"]).copy()
+    for col in ["weight", "name", "sector", "ticker", "industry"]:
+        if col not in bench.columns:
+            bench[col] = pd.NA
+    bench = (
+        bench.assign(weight=pd.to_numeric(bench["weight"], errors="coerce").fillna(0.0))
+        .groupby("isin", as_index=False)
+        .agg(
+            bench_weight=("weight", "sum"),
+            name_bench=("name", "first"),
+            sector_bench=("sector", "first"),
+            industry_bench=("industry", "first"),
+            ticker_bench=("ticker", "first"),
+        )
+    ) if not bench.empty else pd.DataFrame(
+        columns=["isin", "bench_weight", "name_bench", "sector_bench", "industry_bench", "ticker_bench"]
+    )
+
+    merged = port.merge(bench, on="isin", how="outer")
+    merged["port_weight"] = merged["port_weight"].fillna(0.0)
+    merged["bench_weight"] = merged["bench_weight"].fillna(0.0)
+    merged["active_weight"] = merged["port_weight"] - merged["bench_weight"]
+    merged["in_benchmark"] = merged["bench_weight"] > 0
+    merged["name"] = merged["name_port"].fillna(merged["name_bench"]).fillna(merged["isin"])
+    merged["sector"] = merged["sector_port"].fillna(merged["sector_bench"]).fillna("Unknown")
+    merged["industry"] = merged["industry_port"].fillna(merged["industry_bench"]).fillna("Unknown")
+    merged["ticker"] = merged["ticker_port"].fillna(merged["ticker_bench"])
+    return merged[cols].sort_values("active_weight", ascending=False).reset_index(drop=True)
+
+
+def active_group_table(active_df: pd.DataFrame, group_col: str) -> pd.DataFrame:
+    """Aggregate an ``active_weight_table`` to portfolio-vs-benchmark weights by
+    an arbitrary grouping column (e.g. ``sector`` or ``industry``)."""
+    if active_df.empty:
+        return pd.DataFrame(
+            columns=[group_col, "port_weight", "bench_weight", "active_weight"]
+        )
+    out = (
+        active_df.groupby(group_col, dropna=False)
+        .agg(
+            port_weight=("port_weight", "sum"),
+            bench_weight=("bench_weight", "sum"),
+        )
+        .reset_index()
+    )
+    out["active_weight"] = out["port_weight"] - out["bench_weight"]
+    return out.sort_values("active_weight", ascending=False).reset_index(drop=True)
+
+
+def active_sector_table(active_df: pd.DataFrame) -> pd.DataFrame:
+    """Portfolio-vs-benchmark active weights by sector (thin wrapper over
+    :func:`active_group_table`)."""
+    return active_group_table(active_df, "sector")
+
+
+def active_share(active_df: pd.DataFrame) -> float:
+    """Active share = ½·Σ|active weight| — the fraction of the portfolio that
+    differs from the benchmark (0 = index clone, 1 = fully off-benchmark)."""
+    if active_df.empty:
+        return 0.0
+    return float(0.5 * active_df["active_weight"].abs().sum())
+
+
 def _performance_frame(positions: pd.DataFrame, suffix: str) -> pd.DataFrame:
     out = positions.copy()
     out["perf_key"] = out.apply(_performance_key, axis=1)

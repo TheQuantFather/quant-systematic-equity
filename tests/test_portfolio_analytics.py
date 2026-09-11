@@ -4,6 +4,10 @@ import pandas as pd
 import pytest
 
 from portfolio_analytics import (
+    active_group_table,
+    active_sector_table,
+    active_share,
+    active_weight_table,
     daily_price_performance,
     enrich_snapshot_items,
     nearest_risk_date,
@@ -99,6 +103,78 @@ def test_daily_price_performance_matches_by_isin_and_symbol_fallback():
     assert summary["unmatched_names"] == 1
     assert summary["changed_quantity_names"] == 2
     assert summary["coverage_weight"] == pytest.approx(550.0 / 600.0)
+
+
+def _active_positions() -> pd.DataFrame:
+    # AAPL overweight, MSFT off-benchmark bet, and JNJ (in bench) not held.
+    return pd.DataFrame({
+        "isin": ["US0378331005", "US5949181045"],
+        "symbol": ["AAPL", "MSFT"],
+        "display_name": ["Apple Inc", "Microsoft Corp"],
+        "sector": ["Information Technology", "Information Technology"],
+        "industry": ["Technology Hardware", "Software"],
+        "weight": [0.30, 0.10],
+    })
+
+
+def _active_benchmark() -> pd.DataFrame:
+    return pd.DataFrame({
+        "isin": ["US0378331005", "US4781601046"],
+        "ticker": ["AAPL", "JNJ"],
+        "name": ["Apple Inc", "Johnson & Johnson"],
+        "sector": ["Information Technology", "Health Care"],
+        "industry": ["Technology Hardware", "Pharmaceuticals"],
+        "weight": [0.20, 0.05],
+    })
+
+
+def test_active_weight_table_outer_joins_and_computes_active_weight():
+    out = active_weight_table(_active_positions(), _active_benchmark()).set_index("isin")
+
+    # Held name also in benchmark → active = port - bench.
+    assert out.loc["US0378331005", "active_weight"] == pytest.approx(0.10)
+    assert out.loc["US0378331005", "in_benchmark"]
+    # Off-benchmark bet → full portfolio weight is active, bench weight 0.
+    assert out.loc["US5949181045", "active_weight"] == pytest.approx(0.10)
+    assert not out.loc["US5949181045", "in_benchmark"]
+    # Benchmark name not held → implicit underweight of its full benchmark weight.
+    assert out.loc["US4781601046", "port_weight"] == 0.0
+    assert out.loc["US4781601046", "active_weight"] == pytest.approx(-0.05)
+    assert out.loc["US4781601046", "name"] == "Johnson & Johnson"
+    assert out.loc["US4781601046", "sector"] == "Health Care"
+
+
+def test_active_share_is_half_sum_abs_active_weight():
+    out = active_weight_table(_active_positions(), _active_benchmark())
+    # |0.10| + |0.10| + |-0.05| = 0.25 → active share 0.125.
+    assert active_share(out) == pytest.approx(0.125)
+    assert active_share(active_weight_table(pd.DataFrame(), pd.DataFrame())) == 0.0
+
+
+def test_active_weight_table_coalesces_industry_across_sides():
+    out = active_weight_table(_active_positions(), _active_benchmark()).set_index("isin")
+    assert out.loc["US5949181045", "industry"] == "Software"          # portfolio-only name
+    assert out.loc["US4781601046", "industry"] == "Pharmaceuticals"   # benchmark-only name
+
+
+def test_active_sector_table_aggregates_and_nets_by_sector():
+    out = active_sector_table(active_weight_table(_active_positions(), _active_benchmark()))
+    by_sector = out.set_index("sector")
+
+    assert by_sector.loc["Information Technology", "port_weight"] == pytest.approx(0.40)
+    assert by_sector.loc["Information Technology", "bench_weight"] == pytest.approx(0.20)
+    assert by_sector.loc["Information Technology", "active_weight"] == pytest.approx(0.20)
+    assert by_sector.loc["Health Care", "active_weight"] == pytest.approx(-0.05)
+
+
+def test_active_group_table_generalises_to_industry():
+    out = active_group_table(
+        active_weight_table(_active_positions(), _active_benchmark()), "industry"
+    ).set_index("industry")
+
+    assert out.loc["Technology Hardware", "active_weight"] == pytest.approx(0.10)   # 0.30 - 0.20
+    assert out.loc["Software", "active_weight"] == pytest.approx(0.10)              # off-benchmark
+    assert out.loc["Pharmaceuticals", "active_weight"] == pytest.approx(-0.05)      # not held
 
 
 def test_weighted_factor_exposures_sums_security_exposures_and_reports_coverage():
