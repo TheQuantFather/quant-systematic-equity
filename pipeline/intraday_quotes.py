@@ -46,14 +46,22 @@ _CHART_URL = (
 # style / factor ETFs, by contrast, ARE mapped (index_registry) and are pulled
 # live via get_style_etfs().  Order here is the display order top-to-bottom.
 # ---------------------------------------------------------------------------
+# ETF proxies, NOT cash indices (^GSPC/^IXIC/…): cash indices don't trade
+# pre/post-market, so their chart has no extended-hours bar and Yahoo returns
+# yesterday's close — which would read as stale under a PRE banner. The liquid
+# ETFs print pre-market, so their move IS the implied-open gauge. VIX has no
+# tradable proxy here; _is_stale flags it as "prev close" when it isn't live.
 INDEX_TICKERS: list[tuple[str, str]] = [
-    ("^GSPC", "S&P 500"),
-    ("^IXIC", "Nasdaq"),
-    ("^DJI", "Dow Jones"),
-    ("^RUI", "Russell 1000"),
-    ("^RUT", "Russell 2000"),
+    ("SPY", "S&P 500"),
+    ("QQQ", "Nasdaq 100"),
+    ("DIA", "Dow Jones"),
+    ("IWB", "Russell 1000"),
+    ("IWM", "Russell 2000"),
     ("^VIX", "VIX"),
 ]
+
+# Symbol used to read overall market state / the S&P reference move.
+MARKET_PROBE = "SPY"
 
 # 11 GICS sectors via the State Street sector SPDR ETFs.
 SECTOR_ETFS: list[tuple[str, str]] = [
@@ -90,6 +98,7 @@ class Quote:
     currency: str | None
     name: str | None
     session_hint: str | None = None  # e.g. "pre-market opens 04:00 EDT" when CLOSED
+    stale: bool = False  # price is a prior-session close, not a live PRE/POST print
 
 
 def get_style_etfs() -> list[tuple[str, str]]:
@@ -173,24 +182,43 @@ def _parse(symbol: str, data: dict) -> Quote | None:
 
     # Latest print = last non-null close in the intraday series. With
     # includePrePost=true this series carries pre- and post-market bars, so this
-    # captures the extended-hours price without any special-casing.
+    # captures the extended-hours price without special-casing. We also keep the
+    # bar's timestamp to tell a live PRE/POST print from a stale prior-session
+    # close (cash indices/VIX don't trade pre/post → the series has no new bar).
     price: float | None = None
+    last_bar_ts: int | None = None
     try:
+        stamps = result["timestamp"]
         closes = result["indicators"]["quote"][0]["close"]
-        for c in reversed(closes):
+        for t, c in zip(reversed(stamps), reversed(closes)):
             if c is not None:
                 price = float(c)
+                last_bar_ts = int(t)
                 break
     except (KeyError, IndexError, TypeError):
         pass
-    if price is None:
+    if price is None:  # no intraday bars at all (e.g. a cash index in pre-market)
         price = meta.get("regularMarketPrice")
+        last_bar_ts = meta.get("regularMarketTime")
 
     pct = (price / prev_close - 1.0) if (price and prev_close) else None
     name = meta.get("shortName") or meta.get("longName")
     state = _derive_state(meta)
-    return Quote(symbol, price, prev_close, pct, state,
-                 meta.get("currency"), name, _session_hint(state, meta))
+    return Quote(symbol, price, prev_close, pct, state, meta.get("currency"),
+                 name, _session_hint(state, meta), _is_stale(state, last_bar_ts, meta))
+
+
+def _is_stale(state: str, last_bar_ts: int | None, meta: dict) -> bool:
+    """True when, during PRE/POST, the price is a prior-session close rather than
+    a live extended-hours print — i.e. this symbol has no bar in the current
+    window (cash indices and VIX don't trade pre/post). REGULAR is always live;
+    CLOSED already reads as 'last close', so neither is ever flagged."""
+    if state not in ("PRE", "POST"):
+        return False
+    win = (meta.get("currentTradingPeriod") or {}).get(state.lower())
+    if not win or last_bar_ts is None:
+        return True
+    return last_bar_ts < win["start"]
 
 
 def fetch_quote(symbol: str) -> Quote | None:
@@ -231,7 +259,7 @@ def fetch_quotes(symbols: list[str], max_workers: int = 8) -> dict[str, Quote]:
     return out
 
 
-def market_state(quotes: dict[str, Quote], probe: str = "^GSPC") -> str:
+def market_state(quotes: dict[str, Quote], probe: str = MARKET_PROBE) -> str:
     """Overall market state, taken from the S&P 500 probe (fallback: any quote)."""
     q = quotes.get(probe)
     if q is not None:
@@ -265,6 +293,7 @@ def quotes_to_frame(
                 "prev_close": q.prev_close if q else None,
                 "pct": q.pct if q else None,
                 "state": q.state if q else None,
+                "stale": q.stale if q else False,
             }
         )
     return pd.DataFrame(rows)
