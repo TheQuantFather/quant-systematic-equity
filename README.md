@@ -1,6 +1,6 @@
 # Systematic Equity Investment Framework
 
-[![CI](https://github.com/TheQuantFather/quant-systematic-equity/actions/workflows/ci.yml/badge.svg)](https://github.com/TheQuantFather/quant-systematic-equity/actions/workflows/ci.yml)&nbsp;![Python](https://img.shields.io/badge/Python-3.13-3776AB?logo=python&logoColor=white)&nbsp;![Streamlit](https://img.shields.io/badge/Streamlit-dashboard-FF4B4B?logo=streamlit&logoColor=white)&nbsp;![SQLite](https://img.shields.io/badge/7_databases-SQLite-003B57?logo=sqlite&logoColor=white)&nbsp;![Tests](https://img.shields.io/badge/tests-106-2ea44f?logo=pytest&logoColor=white)
+[![CI](https://github.com/TheQuantFather/quant-systematic-equity/actions/workflows/ci.yml/badge.svg)](https://github.com/TheQuantFather/quant-systematic-equity/actions/workflows/ci.yml)&nbsp;![Python](https://img.shields.io/badge/Python-3.13-3776AB?logo=python&logoColor=white)&nbsp;![Streamlit](https://img.shields.io/badge/Streamlit-dashboard-FF4B4B?logo=streamlit&logoColor=white)&nbsp;![SQLite](https://img.shields.io/badge/7_databases-SQLite-003B57?logo=sqlite&logoColor=white)&nbsp;![Tests](https://img.shields.io/badge/tests-115-2ea44f?logo=pytest&logoColor=white)
 
 A systematic quantitative investing framework covering ~994 US equities from the **iShares Russell 1000 ETF** universe. Includes 30+ factors aggregated into research models, a Barra-style factor risk model built from first principles, and a CVXPY portfolio optimiser driven entirely by a config spreadsheet.
 
@@ -278,12 +278,14 @@ All strategy settings live in `data/strategy_params.xlsx`:
 |------|--------------|
 | Home | Universe overview — factor/model coverage, data freshness |
 | Deep Dive | Single-stock deep dive — factor scores, model attribution, fundamentals, peer comparison |
+| Opportunities | Opportunistic-buying scanner — surfaces names on the strategy's radar |
 | Backtester | Point-in-time strategy simulation with no look-ahead bias — rebalances, returns, risk attribution; plus single-factor signal backtesting and diagnostics |
 | Database | Raw database explorer — any table, read-only SQL query interface |
 | Portfolio Optimiser | Strategy weights, sector/industry tilts, factor exposures, risk attribution |
 | Risk Explorer | Barra / Ledoit-Wolf drill-down — factor correlations, vols, per-stock variance decomposition |
 | Data Quality | Pipeline health — factor coverage rates, constituent fill, DB sync status, anomaly flags |
 | Macro | 14 US macro signals — yields, credit spreads, commodities, economic indicators (FRED) |
+| Model Architecture | Model composition and factor wiring, sourced from `models_reference.csv` |
 
 ---
 
@@ -371,15 +373,18 @@ flowchart LR
 │   ├── create_risk.py              # risk.db — Ledoit-Wolf covariance
 │   ├── create_barra.py             # risk.db — Barra factor risk model
 │   ├── create_macro_signals.py     # macro.db — FRED macro signals
-│   └── create_strategy_params.py   # Reset strategy_params.xlsx to defaults
+│   ├── create_strategy_params.py   # Reset strategy_params.xlsx to defaults
+│   └── intraday_quotes.py          # On-the-fly intraday index/sector quotes
 ├── pages/
 │   ├── 4_Deep_Dive.py
+│   ├── 5_Opportunities.py
 │   ├── 6_Backtester.py
 │   ├── 7_Database.py
 │   ├── 8_Portfolio_Optimiser.py
 │   ├── 9_Risk_Explorer.py
 │   ├── 10_Data_Quality.py
-│   └── 11_Macro.py
+│   ├── 11_Macro.py
+│   └── 13_Model_Architecture.py
 ├── scripts/
 │   ├── backtest_engine.py          # Headless walk-forward backtest engine (shared with the page)
 │   ├── backtest_report.py          # Strategy backtest → standalone HTML showcase
@@ -405,7 +410,7 @@ flowchart LR
 
 ## Tests
 
-150 tests covering the layers where correctness is subtle — financial-statement parsing, factor math, the optimiser, and pipeline orchestration. The 121-test core suite runs entirely offline; the remaining 29 EDGAR-parsing tests exercise live SEC fixtures and are skipped by the `--ignore` flag below.
+115 tests covering the layers where correctness is subtle — financial-statement parsing, factor math, the optimiser, and pipeline orchestration. The core suite runs entirely offline; `test_edgar_parsing.py` additionally exercises live SEC fixtures and is skipped by the `--ignore` flag below when they aren't available.
 
 ```bash
 pytest tests/ -q                                          # full suite
@@ -438,7 +443,7 @@ All pipeline scripts use `get_logger(name)` from `utils.py` — no bare `print()
 ## Dependencies
 
 ```bash
-pip install streamlit pandas numpy plotly openpyxl cvxpy scikit-learn clarabel
+pip install -r requirements.txt
 # MOSEK (optional — integer/cardinality constraints): https://mosek.com/
 ```
 
