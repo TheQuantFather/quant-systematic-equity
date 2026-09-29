@@ -11,7 +11,10 @@ from pathlib import Path
 # Directory layout
 # ---------------------------------------------------------------------------
 
-DATA_DIR = Path("data")
+# Anchor both to the repo root (this file's dir) so paths resolve regardless of
+# the current working directory — a wrong cwd otherwise writes/reads DBs in the
+# wrong place (and can leave stray empty *.db files behind).
+DATA_DIR = Path(__file__).parent / "data"
 LOG_DIR  = Path(__file__).parent / "logs"
 
 # ---------------------------------------------------------------------------

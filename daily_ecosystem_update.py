@@ -28,12 +28,14 @@ Usage:
 import argparse
 import os
 import select
+import sqlite3
 import subprocess
 import sys
 import time
 from datetime import date, datetime
 from pathlib import Path
 
+from config import CONSTITUENTS_DB
 from utils import get_logger
 
 # ---------------------------------------------------------------------------
@@ -67,6 +69,38 @@ TIMEOUTS: dict[str, int] = {
 # ---------------------------------------------------------------------------
 
 log = get_logger("daily_ecosystem_update")
+
+# EDGAR index-scan lookback (calendar days). The daily default is 8; after a
+# multi-day outage (laptop asleep on travel, Yahoo rate-limit stall) a gap
+# wider than 8d between successful runs slips filings, so we size the window
+# to cover the time since the last successful index pull, plus a buffer.
+FILINGS_LOOKBACK_MIN  = 8    # never scan fewer than the historical default
+FILINGS_LOOKBACK_MAX  = 90   # cap: a longer gap is a job for --fill-gaps
+FILINGS_LOOKBACK_BUFFER = 3   # slack for weekends / a partial last run
+
+
+def _filings_lookback_days() -> int:
+    """Days to look back for the daily EDGAR index scan, sized to cover the
+    gap since the last successful index-mode ``update_constituents`` run.
+
+    Reads the ``pull_log`` written by update_constituents. Falls back to a safe
+    2-week window if the log is unavailable so we still over-cover a typical
+    missed stretch rather than silently under-scanning.
+    """
+    try:
+        with sqlite3.connect(f"file:{CONSTITUENTS_DB}?mode=ro", uri=True) as conn:
+            row = conn.execute(
+                "SELECT MAX(run_timestamp) FROM pull_log WHERE mode = 'index'"
+            ).fetchone()
+        last = row[0] if row else None
+        if not last:
+            return 14
+        gap = (date.today() - datetime.fromisoformat(last).date()).days
+        return max(FILINGS_LOOKBACK_MIN,
+                   min(FILINGS_LOOKBACK_MAX, gap + FILINGS_LOOKBACK_BUFFER))
+    except Exception as exc:  # pragma: no cover - defensive
+        log.warning("filings lookback sizing failed (%s) — defaulting to 14d", exc)
+        return 14
 
 
 # ---------------------------------------------------------------------------
@@ -303,7 +337,10 @@ def main() -> None:
         log.info("SKIP    filings (--skip-filings; downstream uses existing DB)")
         results["filings"] = True
     else:
-        step("filings", "update_constituents.py")
+        lookback = _filings_lookback_days()
+        if lookback > FILINGS_LOOKBACK_MIN:
+            log.info("filings: widening index scan to %dd to cover gap since last run", lookback)
+        step("filings", "update_constituents.py", "--days", str(lookback))
 
     # Macro signals are independent of the rest of the pipeline — FRED/Yahoo only.
     if args.skip_macro:

@@ -74,7 +74,7 @@ from config import (
     BARRA_SECTORS as SECTORS,
 )
 from utils import (
-    get_db, get_logger, get_snapshot_schedule, get_barra_layout,
+    get_db, get_logger, get_computed_snapshot_dates, get_barra_layout,
 )
 
 log = get_logger("create_barra")
@@ -106,35 +106,9 @@ MODEL_START   = _ANCHORS["model_start"]
 LMC_FACTOR_ID = "LMC11234"
 
 
-def _get_snapshot_dates() -> list[str]:
-    """
-    Snapshot dates from the single source of truth — universe.db snapshot_schedule,
-    restricted to dates whose factors have been computed (Barra needs factors first).
-    Falls back to factors.db (snapshot_dates, then the factors table) for robustness.
-    """
-    try:
-        dates = get_snapshot_schedule(computed_only=True)
-        if dates:
-            return dates
-    except Exception:
-        pass
-    try:
-        with get_db(FACTORS_DB) as conn:
-            rows = conn.execute(
-                "SELECT data_date FROM snapshot_dates ORDER BY data_date"
-            ).fetchall()
-            if rows:
-                return [r[0] for r in rows]
-            rows = conn.execute(
-                "SELECT DISTINCT data_date FROM factors ORDER BY data_date"
-            ).fetchall()
-            if rows:
-                return [r[0] for r in rows]
-    except Exception:
-        pass
-    raise RuntimeError(
-        "No snapshot dates found. Run create_universe.py --rebuild-schedule and create_factors.py first."
-    )
+# Snapshot dates from the single source of truth (universe.db snapshot_schedule,
+# factors-computed only). Shared with create_risk via utils.
+_get_snapshot_dates = get_computed_snapshot_dates
 
 _SECTOR_IDX = {s: i for i, s in enumerate(SECTORS)}
 

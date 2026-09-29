@@ -168,6 +168,43 @@ def mark_snapshot_computed(data_date: str) -> None:
         conn.commit()
 
 
+def get_computed_snapshot_dates() -> list[str]:
+    """
+    Snapshot dates for the risk models — the single source of truth is universe.db
+    `snapshot_schedule`, restricted to dates whose factors have been computed
+    (create_risk / create_barra need factors first).  Falls back to factors.db
+    (snapshot_dates table, then the factors table) for robustness.
+
+    Raises RuntimeError if no dates can be found anywhere.
+    """
+    from config import FACTORS_DB   # lazy import to avoid import-time coupling
+
+    try:
+        dates = get_snapshot_schedule(computed_only=True)
+        if dates:
+            return dates
+    except Exception:
+        pass
+    try:
+        with get_db(FACTORS_DB) as conn:
+            rows = conn.execute(
+                "SELECT data_date FROM snapshot_dates ORDER BY data_date"
+            ).fetchall()
+            if rows:
+                return [r[0] for r in rows]
+            rows = conn.execute(
+                "SELECT DISTINCT data_date FROM factors ORDER BY data_date"
+            ).fetchall()
+            if rows:
+                return [r[0] for r in rows]
+    except Exception:
+        pass
+    raise RuntimeError(
+        "No snapshot dates found. Run create_universe.py --rebuild-schedule "
+        "and create_factors.py first."
+    )
+
+
 def get_barra_layout() -> dict:
     """Single source of truth for the Barra factor layout.
 
