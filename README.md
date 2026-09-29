@@ -13,7 +13,7 @@ A fully self-contained investment research system — built from scratch in Pyth
 - **Data ingestion** — pulls financial statements directly from SEC EDGAR (10-K/10-Q filings), plus Yahoo Finance / Tiingo prices, FINRA short-selling data, and FRED macro indicators
 - **Factor construction** — computes 30+ quantitative measures per stock per quarter, strictly point-in-time so no snapshot contains data that wasn't yet published; banks and REITs receive sector-native factors rather than generic ones that don't apply to their business models
 - **Scoring** — aggregates factors into research models (profitability, value, growth, momentum, and more) with coverage-floor logic that prevents thin data from inflating scores
-- **Risk modelling** — a Barra-style factor risk model built from first principles, decomposing portfolio risk into market, sector, style, and idiosyncratic components
+- **Risk modelling** — a Barra-style factor risk model built from first principles, decomposing portfolio risk into market, sector, model-factor, and idiosyncratic components
 - **Portfolio optimization** — CVXPY-powered optimizer supporting three objective types; strategies configured entirely through a spreadsheet
 - **Research & reporting** — Streamlit dashboard for interactive exploration, automated HTML reports for individual stocks and thematic baskets, and a `/model-review` diagnostic tool for auditing individual models
 
@@ -41,8 +41,11 @@ SimFin CSVs (legacy initial seed)
 EDGAR 10-K/10-Q filings (incremental)
   └─ pipeline/update_constituents.py  → constituents.db
 
-Yahoo / Tiingo + FINRA short volume
-  └─ pipeline/create_returns.py       → returns.db             (daily prices + short interest)
+Yahoo / Tiingo
+  └─ pipeline/create_returns.py       → returns.db             (daily split-adjusted prices + splits)
+
+FINRA short volume / consolidated short interest
+  └─ pipeline/create_svr.py           → returns.db             (short volume ratio + days-to-cover)
 
 constituents.db + returns.db + universe.db
   └─ pipeline/create_factors.py       → factors.db             (30+ factors × N snapshots)
@@ -165,22 +168,24 @@ Standard financial ratios lose meaning for banks and REITs — a bank's revenue 
 
 ### Models
 
+A model is a weighted blend of the factors above — this is the layer where the raw measures become an investable signal. A model is *not* the same as a factor category: the *Quality* factors, for instance, feed both Profitability and Balance Sheet Quality, and each model swaps in sector-native factors for banks and REITs where the generic ones don't apply.
+
 Model scores are coverage-renormalised: a stock only receives full conviction if it has data for ≥ 50% of the factors applicable to its sector. Below that threshold the score is shrunk toward neutral, rather than inflated by a thin data slice.
 
-| Model | ID | What it scores |
-|-------|----|---------------|
-| Profitability | PROF001 | Margins, return on capital (ROIC/ROE/ROA), FCF quality, gross-profit-to-assets; banks scored on NIM, Efficiency Ratio, PPOP RoA |
-| Balance Sheet Quality | DEF001 | Earnings stability, leverage safety, interest coverage, accruals, Altman Z-Score; banks on Credit Cost; REITs on FFO Payout |
-| Value | VAL001 | Earnings/FCF/cash/sales yields, book value, EV/EBITDA, dividend yield; banks on Tangible B/P + PPOP Yield; REITs on FFO Yield |
-| Growth | GRO001 | Revenue, earnings, operating income, cash flow, EBITDA — all multi-year OLS trend slopes |
-| Momentum | MOM001 | 12-month (60%) + 6-month (40%) risk-adjusted momentum |
-| Size | SIZ001 | Log Market Cap (positive = larger firms) |
-| Low Volatility | LVOL001 | Realized volatility (lower = better) |
-| Liquidity | LIQ001 | Amihud illiquidity ratio (lower = more liquid) |
-| Short Interest | SHI001 | FINRA consolidated short interest — Days to Cover (shares short ÷ average daily volume); backtestable to 2021, whereas FINRA short-volume (SVR) only retains ~13 months |
-| Long-term Reversal | LTR001 | 36–12M risk-adjusted reversal — standalone signal, not in Alpha |
-| Short-term Reversal | STR001 | 1M risk-adjusted reversal — standalone signal, not in Alpha |
-| **Alpha (composite)** | **ALP001** | **Conviction-weighted blend of the base models — led by Profitability and Value, then Momentum and Growth, with smaller Size, Balance Sheet Quality and Short Interest tilts; weights live in `models_reference.csv`. The reversal, low-volatility and liquidity models stay standalone.** |
+| Model | ID | What it captures | Sector-native handling |
+|-------|----|------------------|------------------------|
+| Profitability | PROF001 | Operating efficiency and return on capital | Banks: NIM, Efficiency Ratio, PPOP RoA |
+| Balance Sheet Quality | DEF001 | Balance-sheet and earnings safety | Banks: Credit Cost · REITs: FFO Payout |
+| Value | VAL001 | Cheapness across earnings, cash, book and sales multiples | Banks: Tangible B/P + PPOP Yield · REITs: FFO Yield |
+| Growth | GRO001 | Sustained multi-year growth (OLS trend slopes, robust to trough years) | — |
+| Momentum | MOM001 | Risk-adjusted price momentum — 12-month (60%) + 6-month (40%) | — |
+| Size | SIZ001 | Market-cap tilt (positive = larger firms) | — |
+| Low Volatility | LVOL001 | Preference for lower realized volatility | — |
+| Liquidity | LIQ001 | Preference for more-liquid names (lower Amihud illiquidity) | — |
+| Short Interest | SHI001 | Crowding / short-pressure — Days to Cover from FINRA consolidated short interest (backtestable to 2021; SVR retains only ~13 months) | — |
+| Long-term Reversal | LTR001 | 36–12M reversal — standalone signal, not in Alpha | — |
+| Short-term Reversal | STR001 | 1M reversal — standalone signal, not in Alpha | — |
+| **Alpha (composite)** | **ALP001** | **Conviction-weighted blend of the base models — led by Profitability and Value, then Momentum and Growth, with smaller Size, Balance Sheet Quality and Short Interest tilts; weights live in `models_reference.csv`. The reversal, low-volatility and liquidity models stay standalone.** | — |
 
 Direction is applied only at model score time (`z × weight × direction`); `factor_value_z` is always stored unsigned.
 
