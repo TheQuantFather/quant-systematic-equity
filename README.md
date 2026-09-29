@@ -118,7 +118,7 @@ Every factor is a number that measures one specific characteristic of a company 
 
 ### Snapshot schedule
 
-Snapshot dates are defined in a `snapshot_schedule` table in `universe.db` — no hardcoded date list. The full pipeline discovers dates automatically. The grid is month-end monthly with annual April-1 anchors (≥ 90-day lag after each December FY-end so all annual filers have reported).
+Snapshot dates are defined in a `snapshot_schedule` table in `universe.db` — no hardcoded date list. The full pipeline discovers dates automatically. The grid is month-end monthly with annual April-1 anchors (≥ 90-day lag after each December FY-end so all annual filers have reported), transitioning to a weekly cadence for recent periods.
 
 ### Point-in-time integrity
 
@@ -239,8 +239,8 @@ Barra is the default; setting `use_barra_risk = FALSE` for a strategy falls back
 | Strategy | Objective | Alpha signal | Benchmark / universe | Notes |
 |----------|-----------|--------------|----------------------|-------|
 | Core Active | maximize_alpha | ALP001 | S&P 500 | Live-sized — 55–60 names, whole-share sizing, 5% tracking-error cap |
-| Core Active (Strict) | maximize_alpha | ALP001 | S&P 500 3% Capped | Tighter risk budget — 2% TE, ±1% active bands, 4% issuer cap |
-| Absolute Return | maximize_alpha | ALP001 | S&P 500 universe | 35–45 names, benchmark-relative sector/industry bands, cap-bucket diversification, 12% active-risk cap |
+| Core Active (Strict) | maximize_alpha | ALP001 | S&P 500 3% Capped | Tighter risk budget — 45–55 names, 4% tracking-error cap, ±2% stock/sector/industry active bands, 4% issuer cap |
+| Absolute Return | maximize_alpha | ALP001 | Full universe (~994) · S&P 500 benchmark | 35–45 names, 12% active-risk cap, 17% portfolio-vol cap, up to 20% cash buffer, benchmark-relative sector/industry bands, cap-bucket diversification |
 
 > **Capped benchmark** — Core Active (Strict) is measured against an *S&P 500 3% Capped* index, which caps any single constituent at 3%. That keeps the benchmark itself diversified, so the strategy isn't forced to chase mega-cap concentration to control tracking error.
 
