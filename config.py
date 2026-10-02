@@ -53,6 +53,13 @@ BENCHMARK_DIR = DATA_DIR / "universe_index"
 # view — i.e. "what am I holding now" for both features.
 INCUBATION_PORTFOLIO_ID = "ibkr_us_quant"
 
+# Per-order transaction cost assumption (flat fee, €; DeGiro US stocks ≈ €2/order).
+# An order is only counted when its EUR value clears a minimum size (≈ fee / 1%),
+# so tiny weight tweaks that wouldn't be executed in practice are ignored. Single
+# source for both the backtester cost model (backtest.py) and the live-book
+# pre/post transaction-cost estimate (pages/8_Portfolio_Optimiser.py).
+TC_PER_TRADE_EUR = 2.0
+
 # ---------------------------------------------------------------------------
 # SimFin source data
 # ---------------------------------------------------------------------------

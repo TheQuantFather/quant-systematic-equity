@@ -29,6 +29,7 @@ from config import (
     PARAMS_FILE,
     RETURNS_DB,
     RISK_DB,
+    TC_PER_TRADE_EUR,
     UNIVERSE_DB,
 )
 from backtest import (
@@ -44,7 +45,7 @@ st.title("Backtester")
 
 RISK_FREE   = 0.04  # annualised, used for Sharpe
 N_QUINTILES = 5
-TC_EUR      = 2.0   # €2 per trade (DeGiro US stocks)
+TC_EUR      = TC_PER_TRADE_EUR   # €/trade — single source in config.py
 SIGNAL_BACKTEST_START = "2021-05-31"
 
 

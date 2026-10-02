@@ -17,7 +17,8 @@ def load_latest_positions(
     ``[isin, ticker, name, weight, market_value_base, quantity]`` — ``weight`` is
     the stored fraction of net-liq (so deploying held cash into the target counts
     as genuine turnover). ``meta`` carries ``{snapshot_id, data_date,
-    net_liq_value}``. Both are empty when the portfolio has no snapshot.
+    net_liq_value, base_currency}``. Both are empty when the portfolio has no
+    snapshot.
 
     ``as_of`` optionally caps the snapshot date (``data_date <= as_of``); default
     uses the most recent snapshot.
@@ -33,7 +34,7 @@ def load_latest_positions(
     with get_db(PORTFOLIO_ANALYTICS_DB) as conn:
         snap = conn.execute(
             f"""
-            SELECT snapshot_id, data_date, net_liq_value
+            SELECT snapshot_id, data_date, net_liq_value, base_currency
             FROM portfolio_snapshots
             WHERE portfolio_id = ? {date_clause}
             ORDER BY data_date DESC, snapshot_at DESC
@@ -43,7 +44,7 @@ def load_latest_positions(
         ).fetchone()
         if snap is None:
             return empty, {}
-        snapshot_id, data_date, net_liq_value = snap
+        snapshot_id, data_date, net_liq_value, base_currency = snap
         positions = pd.read_sql(
             """
             SELECT isin, symbol AS ticker, name, weight, market_value_base, quantity
@@ -60,6 +61,7 @@ def load_latest_positions(
         "snapshot_id": snapshot_id,
         "data_date": data_date,
         "net_liq_value": net_liq_value,
+        "base_currency": base_currency,
     }
     return positions, meta
 

@@ -104,14 +104,18 @@ def get_factors_long() -> pd.DataFrame:
 @st.cache_data
 def get_factors_wide() -> pd.DataFrame:
     """
-    Wide pivot using the latest data_date per security.
+    Wide pivot using the single global latest snapshot date.
     One row per security, one column per factor_name (raw values).
+
+    We filter to the global max data_date (not each security's own max) so that
+    superseded ISINs — e.g. a redomicile/share-class relabel that left a stale
+    legacy ISIN with frozen factors at an old snapshot — do not surface alongside
+    the current ISIN. Only securities present at the current snapshot appear.
     """
     long = get_factors_long()
-    # Keep only each security's most recent snapshot
-    latest = long.groupby("security_id")["data_date"].max().reset_index()
-    long = long.merge(latest.rename(columns={"data_date": "max_date"}), on="security_id")
-    long = long[long["data_date"] == long["max_date"]]
+    # Keep only the current cross-section (global latest snapshot)
+    global_max = long["data_date"].max()
+    long = long[long["data_date"] == global_max]
     wide = long.pivot_table(
         index="security_id", columns="factor_name", values="factor_value", aggfunc="first"
     )
@@ -135,10 +139,11 @@ def get_models_wide() -> pd.DataFrame:
     df["model_value"]   = pd.to_numeric(df["model_value"],   errors="coerce")
     df["model_value_z"] = pd.to_numeric(df["model_value_z"], errors="coerce")
     df["security_id"]   = df["security_id"].astype(str)
-    # Keep only each security's most recent snapshot
-    latest = df.groupby("security_id")["data_date"].max().reset_index()
-    df = df.merge(latest.rename(columns={"data_date": "max_date"}), on="security_id")
-    df = df[df["data_date"] == df["max_date"]]
+    # Keep only the current cross-section (global latest snapshot), so superseded
+    # ISINs with frozen model scores at an old snapshot don't surface alongside the
+    # current ISIN. Mirrors get_factors_wide().
+    global_max = df["data_date"].max()
+    df = df[df["data_date"] == global_max]
     # Use z-scored values as the canonical model score
     wide = df.pivot_table(
         index="security_id", columns="model_id", values="model_value_z", aggfunc="first"

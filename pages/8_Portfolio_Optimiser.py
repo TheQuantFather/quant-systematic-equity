@@ -20,10 +20,22 @@ import db
 from config import (
     OUTPUT_DIR, PARAMS_FILE, MODELS_DB, RISK_DB,
     UNIVERSE_DB as UNIV_DB, BENCHMARK_DIR,
-    MODELS_REF, INCUBATION_PORTFOLIO_ID,
+    MODELS_REF, INCUBATION_PORTFOLIO_ID, TC_PER_TRADE_EUR,
 )
 from portfolio_analytics import load_latest_positions
 from utils import get_db, inject_css, get_barra_layout
+
+def _render(fig) -> None:
+    """Pin a horizontal legend above the plot and reserve top margin so it never
+    overlaps the bars, then render."""
+    if fig.layout.legend.orientation == "h" and fig.layout.showlegend is not False:
+        fig.update_layout(
+            legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                        xanchor="left", x=0),
+            margin=dict(t=max(fig.layout.margin.t or 0, 48)),
+        )
+    st.plotly_chart(fig, use_container_width=True)
+
 
 # Barra factor-group slices — single source of truth in models_reference.csv via
 # utils.get_barra_layout(). Layout: [market | sectors | beta | models].
@@ -70,12 +82,22 @@ def load_latest(strategy_id: str) -> tuple[pd.DataFrame | None, dict | None]:
     return df, summary
 
 
-def build_prepost(df: pd.DataFrame, book: pd.DataFrame) -> pd.DataFrame:
+def build_prepost(df: pd.DataFrame, book: pd.DataFrame,
+                  aliases: dict[str, str] | None = None) -> pd.DataFrame:
     """Union of current live holdings and the target, with per-name deltas.
 
     Weights are fractions of net-liq on both sides (so deploying held cash counts
     as a real buy). Off-universe holdings (in the book but not investable) are kept
     as forced exits. Adds current_w / target_w / delta_w / action / gics_sector.
+
+    ``aliases`` is the optimizer's ``identity_aliases`` (``target_isin -> book_isin``)
+    for same-issuer ISIN changes (redomicile / share-class relisting). The live book
+    may hold a name under a different ISIN than the target snapshot uses; without
+    netting, the raw-ISIN merge splits it into a phantom EXIT(old) + NEW(new) that
+    double-counts turnover. Remapping the book onto the target's ISIN here nets it to
+    a single row — matching the optimizer, which already anchors on these aliases —
+    while the stale ISINs stay untouched in the source data (PIT-correct, no
+    look-ahead).
     """
     eps = 1e-4
     universe_isins = set(df["isin"])
@@ -93,7 +115,16 @@ def build_prepost(df: pd.DataFrame, book: pd.DataFrame) -> pd.DataFrame:
         book.rename(columns={"weight": "current_w", "name": "cur_name",
                              "ticker": "cur_ticker"})
         [["isin", "cur_ticker", "cur_name", "current_w"]]
+        .copy()
     )
+    # Net same-issuer ISIN changes onto the target's ISIN before merging (see docstring).
+    if aliases:
+        book_to_target = {v: k for k, v in aliases.items()}
+        cur["isin"] = cur["isin"].replace(book_to_target)
+        cur = (
+            cur.groupby("isin", as_index=False)
+            .agg({"current_w": "sum", "cur_ticker": "first", "cur_name": "first"})
+        )
     m = tgt.merge(cur, on="isin", how="outer")
     m["target_w"]     = m["target_w"].fillna(0.0)
     m["current_w"]    = m["current_w"].fillna(0.0)
@@ -545,7 +576,7 @@ if show_prepost:
             "then re-enable the compare toggle."
         )
     else:
-        prepost = build_prepost(df, _book)
+        prepost = build_prepost(df, _book, aliases=summary.get("identity_aliases"))
         prepost_nav = _book_meta.get("net_liq_value")
         _eps = 1e-4
         _two_way = float(prepost["delta_w"].abs().sum())
@@ -555,14 +586,39 @@ if show_prepost:
         _n_exit  = int(prepost["action"].str.startswith("EXIT").sum())
         _off_w   = float(prepost.loc[~prepost["in_universe"], "current_w"].sum())
 
+        _ccy = (_book_meta.get("base_currency") or "").upper()
+        _sym = {"EUR": "€", "USD": "$", "GBP": "£"}.get(_ccy, "")
+        def _val(w: float) -> str:
+            if not prepost_nav:
+                return f"{w:.1%}"
+            amt = w * prepost_nav
+            return f"{_sym}{amt:,.0f}" if _sym else f"{amt:,.0f} {_ccy}"
+
+        # Estimated transaction cost: flat per-order fee × the count of name-level
+        # trades whose value clears the minimum order size — mirrors the backtester
+        # cost model (backtest.py) so the live estimate and the backtest share one
+        # assumption. Fee is in EUR (DeGiro US-stock schedule); the book's NAV is EUR.
+        _cost_eur: float | None = None
+        _n_trades = 0
+        if prepost_nav:
+            _min_order_eur = max(TC_PER_TRADE_EUR / 0.01, 200.0)
+            _trade_thresh  = _min_order_eur / prepost_nav
+            _n_trades      = int((prepost["delta_w"].abs() >= _trade_thresh).sum())
+            _cost_eur      = _n_trades * TC_PER_TRADE_EUR
+
         st.markdown(f"**Rebalance vs live book** ({_book_meta.get('data_date')})")
-        t1, t2, t3, t4, t5, t6 = st.columns(6)
+        t1, t2, t3, t4, t5, t6, t7 = st.columns(7)
         t1.metric("One-way turnover", f"{_two_way / 2:.1%}")
         t2.metric("Two-way turnover", f"{_two_way:.1%}")
-        t3.metric("Buys",  f"${_buys_w * prepost_nav:,.0f}" if prepost_nav else f"{_buys_w:.1%}")
-        t4.metric("Sells", f"${_sells_w * prepost_nav:,.0f}" if prepost_nav else f"{_sells_w:.1%}")
+        t3.metric("Buys",  _val(_buys_w))
+        t4.metric("Sells", _val(_sells_w))
         t5.metric("New names", _n_new)
         t6.metric("Exits", _n_exit)
+        if _cost_eur is not None:
+            t7.metric("Est. txn cost", f"€{_cost_eur:,.0f}",
+                      f"{_cost_eur / prepost_nav:.2%} of NAV", delta_color="off")
+        else:
+            t7.metric("Est. txn cost", "—")
 
         _cap = summary.get("turnover_cap")
         if _cap is not None:
@@ -576,6 +632,12 @@ if show_prepost:
             st.caption(
                 "Last run had no turnover cap — this is the natural drift. Tick "
                 "**Cap turnover** in the sidebar and re-run to throttle it."
+            )
+        if _cost_eur is not None:
+            st.caption(
+                f"Est. txn cost = €{TC_PER_TRADE_EUR:.0f}/order × {_n_trades} orders "
+                f"(names trading ≥ €{max(TC_PER_TRADE_EUR / 0.01, 200.0):,.0f}; "
+                "smaller tweaks aren't executed) — same model as the backtester."
             )
         if _off_w > _eps:
             st.warning(
@@ -611,7 +673,7 @@ with tab1:
                           xaxis_title="Active Weight (%)",
                           yaxis=dict(autorange="reversed", automargin=True),
                           plot_bgcolor="rgba(0,0,0,0)")
-        st.plotly_chart(fig, use_container_width=True)
+        _render(fig)
 
     with col_right:
         st.markdown("**Top 20 Underweights**")
@@ -628,7 +690,7 @@ with tab1:
                           xaxis_title="Active Weight (%)",
                           yaxis=dict(autorange="reversed", automargin=True),
                           plot_bgcolor="rgba(0,0,0,0)")
-        st.plotly_chart(fig, use_container_width=True)
+        _render(fig)
 
     if has_mcap:
         held = df[df["portfolio_weight"] > 1e-5].copy()
@@ -662,7 +724,7 @@ with tab1:
                           yaxis_title="Weight (%)", showlegend=prepost is not None,
                           legend=dict(orientation="h", y=1.05),
                           plot_bgcolor="rgba(0,0,0,0)")
-        st.plotly_chart(fig, use_container_width=True)
+        _render(fig)
 
     if prepost is not None:
         st.markdown("---")
@@ -688,7 +750,7 @@ with tab1:
                           yaxis=dict(autorange="reversed", automargin=True),
                           legend=dict(orientation="h", y=1.04),
                           plot_bgcolor="rgba(0,0,0,0)")
-        st.plotly_chart(fig, use_container_width=True)
+        _render(fig)
 
         def _fmt_movers(frame: pd.DataFrame) -> pd.DataFrame:
             keep = ["ticker", "company_name", "current_w", "target_w",
@@ -750,7 +812,7 @@ with tab2:
     fig.update_layout(barmode="group", height=420, margin=dict(l=10, r=10, t=10, b=30),
                       xaxis_title="Weight (%)", legend=dict(orientation="h", y=1.05),
                       plot_bgcolor="rgba(0,0,0,0)")
-    st.plotly_chart(fig, use_container_width=True)
+    _render(fig)
 
     st.markdown("**Sector Active Weights**")
     if prepost is not None:
@@ -782,7 +844,7 @@ with tab2:
                           xaxis_title="Active Weight (%)", plot_bgcolor="rgba(0,0,0,0)",
                           shapes=[dict(type="line", x0=0, x1=0, y0=-0.5, y1=len(sec)-0.5,
                                        line=dict(color="black", width=1))])
-    st.plotly_chart(fig, use_container_width=True)
+    _render(fig)
 
     ind = (
         df.groupby("industry")
@@ -827,7 +889,7 @@ with tab2:
                           xaxis_title="Active Weight (%)", plot_bgcolor="rgba(0,0,0,0)",
                           shapes=[dict(type="line", x0=0, x1=0, y0=-0.5, y1=len(ind_top)-0.5,
                                        line=dict(color="black", width=1))])
-    st.plotly_chart(fig, use_container_width=True)
+    _render(fig)
 
 
 # ── Tab 3: Factor Tilts ───────────────────────────────────────────────────────
@@ -886,7 +948,7 @@ with tab3:
             fig.update_layout(height=340, margin=dict(l=10, r=80, t=10, b=30),
                               xaxis_title="Active Tilt (z-score units)",
                               plot_bgcolor="rgba(0,0,0,0)", showlegend=False)
-        st.plotly_chart(fig, use_container_width=True)
+        _render(fig)
 
         st.markdown(f"**Factor Scores — Portfolio vs {ref_lbl}**")
         fig = go.Figure()
@@ -900,7 +962,7 @@ with tab3:
         fig.update_layout(barmode="group", height=320, margin=dict(l=10, r=10, t=10, b=30),
                           yaxis_title="Weighted avg z-score",
                           legend=dict(orientation="h", y=1.05), plot_bgcolor="rgba(0,0,0,0)")
-        st.plotly_chart(fig, use_container_width=True)
+        _render(fig)
 
     st.markdown("---")
 
@@ -935,7 +997,7 @@ with tab3:
                       annotation_position="bottom right")
     fig.update_layout(height=280, margin=dict(l=10, r=10, t=30, b=30),
                       xaxis_title="Alpha Score (z-score)", plot_bgcolor="rgba(0,0,0,0)")
-    st.plotly_chart(fig, use_container_width=True)
+    _render(fig)
 
     df_contrib = df.copy()
     df_contrib["alpha_contribution"] = df_contrib["alpha_score"] * df_contrib["portfolio_weight"]
@@ -954,7 +1016,7 @@ with tab3:
                       xaxis_title="Alpha Contribution (weight × score, %)",
                       yaxis=dict(autorange="reversed", automargin=True),
                       plot_bgcolor="rgba(0,0,0,0)")
-    st.plotly_chart(fig, use_container_width=True)
+    _render(fig)
 
 
 # ── Tab 4: Risk Attribution ───────────────────────────────────────────────────
@@ -1052,7 +1114,7 @@ with tab4:
                                   xaxis_title="% of Total Portfolio Risk",
                                   yaxis=dict(autorange="reversed", automargin=True),
                                   plot_bgcolor="rgba(0,0,0,0)")
-                st.plotly_chart(fig, use_container_width=True)
+                _render(fig)
 
                 st.markdown("**Weight vs Risk Contribution**")
                 st.caption("Stocks above the diagonal contribute disproportionately to risk relative to their weight.")
@@ -1069,7 +1131,7 @@ with tab4:
                 fig.update_layout(height=420, margin=dict(l=10, r=10, t=10, b=40),
                                   xaxis_title="Portfolio Weight (%)",
                                   yaxis_title="% of Total Risk", plot_bgcolor="rgba(0,0,0,0)")
-                st.plotly_chart(fig, use_container_width=True)
+                _render(fig)
 
                 col_sec, col_ind = st.columns(2)
                 with col_sec:
@@ -1091,7 +1153,7 @@ with tab4:
                     ))
                     fig.update_layout(height=380, margin=dict(l=10, r=60, t=10, b=30),
                                       xaxis_title="% of Total Risk", plot_bgcolor="rgba(0,0,0,0)")
-                    st.plotly_chart(fig, use_container_width=True)
+                    _render(fig)
                     st.caption("Red = risk contribution > 15% above weight share; orange = slightly elevated.")
 
                 with col_ind:
@@ -1111,7 +1173,7 @@ with tab4:
                     ))
                     fig.update_layout(height=380, margin=dict(l=10, r=60, t=10, b=30),
                                       xaxis_title="% of Total Risk", plot_bgcolor="rgba(0,0,0,0)")
-                    st.plotly_chart(fig, use_container_width=True)
+                    _render(fig)
 
                 st.markdown("**Sector Risk vs Weight Summary**")
                 tbl = sec_rc[["gics_sector", "portfolio_weight", "pct_of_risk", "risk_per_weight"]].copy()
@@ -1220,7 +1282,7 @@ with tab4:
                                   xaxis_title="% of Total TE Variance",
                                   yaxis=dict(autorange="reversed", automargin=True),
                                   plot_bgcolor="rgba(0,0,0,0)")
-                st.plotly_chart(fig, use_container_width=True)
+                _render(fig)
 
                 # ── Active weight vs TE contribution scatter ─────────────────
                 st.markdown("**Active Weight vs TE Contribution**")
@@ -1241,7 +1303,7 @@ with tab4:
                 fig.update_layout(height=420, margin=dict(l=10, r=10, t=10, b=40),
                                   xaxis_title="Active Weight (%)",
                                   yaxis_title="% of Total TE Variance", plot_bgcolor="rgba(0,0,0,0)")
-                st.plotly_chart(fig, use_container_width=True)
+                _render(fig)
 
                 # ── Sector TE attribution ─────────────────────────────────────
                 st.markdown("**Sector TE Attribution**")
@@ -1261,7 +1323,7 @@ with tab4:
                 ))
                 fig.update_layout(height=380, margin=dict(l=10, r=60, t=10, b=30),
                                   xaxis_title="% of Total TE Variance", plot_bgcolor="rgba(0,0,0,0)")
-                st.plotly_chart(fig, use_container_width=True)
+                _render(fig)
 
                 st.markdown("**Sector TE Summary**")
                 sec_te_tbl = sec_te[["gics_sector", "active_w", "te_pct"]].copy()

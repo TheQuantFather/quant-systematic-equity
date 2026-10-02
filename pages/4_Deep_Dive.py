@@ -232,7 +232,7 @@ if model_scores:
             color="Score",
             color_continuous_scale="RdYlGn",
             color_continuous_midpoint=0,
-            text=bar_df["Score"].map(lambda x: f"{x:.3f}"),
+            text=bar_df["Score"].map(lambda x: f"{x:.2f}"),
         )
         fig_models.update_traces(textposition="outside")
         fig_models.update_layout(
@@ -655,7 +655,9 @@ def _diverging_rgb(z: float, vmax: float = 2.0) -> str:
         r, g, b = _lerp(red, yellow, t + 1.0)   # t=-1 → red, t=0 → yellow
     else:
         r, g, b = _lerp(yellow, green, t)       # t=0 → yellow, t=+1 → green
-    return f"background-color: rgb({r},{g},{b})"
+    # Contrast text against the cell fill (theme default is white → invisible on light fills)
+    fg = "#111" if (0.299 * r + 0.587 * g + 0.114 * b) > 150 else "#fff"
+    return f"background-color: rgb({r},{g},{b}); color: {fg}"
 
 
 def _column_diverging(series: pd.Series, direction: int = 1) -> list[str]:
@@ -712,19 +714,13 @@ if MODEL_SORT and industry != "N/A":
     # Direction lookup (factors only — models always direction-positive)
     direction_map = dict(zip(factor_meta["factor_name"], factor_meta["direction"]))
 
-    # Build Styler with column-wise gradients
     focal_flag = peers_styled["security_id"].astype(str).eq(security_id)
-    # Factor columns are stored as decimal fractions (e.g. 0.683 = 68.3% gross margin).
-    # Display as percentages with 1 decimal for legibility.
-    factor_fmt = {c: (lambda v: "—" if pd.isna(v) else f"{v*100:+.1f}%") for c in factor_cols}
-    model_fmt = {c: (lambda v: "—" if pd.isna(v) else f"{v:+.1f}") for c in model_display_cols}
+    # Factor columns are decimal fractions (0.683 = 68.3%); scale to % so the grid's
+    # column_config formats them correctly. Number formatting goes through
+    # column_config (st.dataframe does not reliably apply a Styler's .format()).
+    peers_styled[factor_cols] = peers_styled[factor_cols] * 100
 
-    styler = (
-        peers_styled.drop(columns=["security_id"])
-        .style
-        .format(model_fmt)
-        .format(factor_fmt)
-    )
+    styler = peers_styled.drop(columns=["security_id"]).style
 
     # Model z-scores: fixed scale centred on 0 (z ∈ [-2, +2])
     for col in model_display_cols:
@@ -746,7 +742,9 @@ if MODEL_SORT and industry != "N/A":
             **{"font-weight": "600", "border-left": "3px solid #C44E52"},
         )
 
-    st.dataframe(styler, use_container_width=True, hide_index=True)
+    col_cfg = {c: st.column_config.NumberColumn(format="%+.2f") for c in model_display_cols}
+    col_cfg.update({c: st.column_config.NumberColumn(format="%+.2f%%") for c in factor_cols})
+    st.dataframe(styler, use_container_width=True, hide_index=True, column_config=col_cfg)
 
     # Peer × model heatmap — visual companion to the table
     if model_cols_present:
