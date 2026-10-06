@@ -75,6 +75,7 @@ from config import (
 )
 from utils import (
     get_db, get_logger, get_computed_snapshot_dates, get_barra_layout,
+    winsorized_zscore,
 )
 
 log = get_logger("create_barra")
@@ -104,6 +105,17 @@ MODEL_START   = _ANCHORS["model_start"]
 # weights (√mktcap, canonical Barra USE4) and the sector cap-weighted sum-to-zero
 # constraint. Structural, not a risk factor, so it is referenced by id directly.
 LMC_FACTOR_ID = "LMC11234"
+
+# ---------------------------------------------------------------------------
+# Factor-momentum analysis signal (ANALYSIS-ONLY — see
+# _compute_and_save_factor_momentum). Written to models.db as FM_MODEL_ID; it is
+# NOT a Barra risk factor and NOT an ALP001 leg, so it never touches the K-factor
+# risk model or portfolio construction. Its models_reference.csv row is tagged
+# barra_risk_factor=False and Factors=EXTERNAL (create_models skips it).
+FM_MODEL_ID   = "FMOM001"
+FM_EXCLUDE    = {"MOM001"}                        # drop stock momentum to avoid double-count
+FM_STYLE      = [m for m in MODEL_IDS if m not in FM_EXCLUDE]   # derived from the layout
+FM_W6, FM_W12 = 126, 252                          # trailing windows (trading days)
 
 
 # Snapshot dates from the single source of truth (universe.db snapshot_schedule,
@@ -817,6 +829,114 @@ def _most_recent_friday() -> str:
 
 # ── Main entry point ───────────────────────────────────────────────────────────
 
+def _compute_and_save_factor_momentum(snapshot_dates: list[str]) -> None:
+    """Write the stock-level factor-momentum analysis signal to models.db.
+
+    For each security on each snapshot date:
+        signal = Σ_f  exposure_{security,f} × rbar_f
+    over the style factors ``FM_STYLE`` (Barra model factors excluding stock
+    momentum). ``rbar_f`` is factor f's Barra regressed pure-factor return,
+    trailing ``FM_W6``/``FM_W12`` days, compounded and vol-normalised
+    (cumret / (daily-vol·√n)), blended 50/50.
+
+    Reads the risk model this run just persisted, so the signal always refreshes
+    in lockstep with every Barra rebuild/restatement. Writes ``model_value`` (raw
+    signal) and ``model_value_z`` (cross-sectional winsorized z — the same
+    normalisation ``create_models.compute_model_zscores`` applies, so the value is
+    correct immediately and idempotent if re-z-scored later). ANALYSIS-ONLY: not a
+    Barra risk factor and not an ALP001 leg, so it never affects portfolio
+    construction.
+    """
+    if not snapshot_dates:
+        return
+    log.info("Computing factor-momentum analysis signal (%s) for %d snapshot(s)...",
+             FM_MODEL_ID, len(snapshot_dates))
+    ph = ",".join("?" * len(FM_STYLE))
+    with get_db(RISK_DB) as rconn:
+        fr = pd.read_sql_query(
+            f"SELECT trade_date, factor_id, factor_return FROM factor_returns "
+            f"WHERE factor_id IN ({ph})",
+            rconn, params=FM_STYLE,
+        )
+        if fr.empty:
+            log.warning("No factor returns in risk.db — skipping factor momentum.")
+            return
+        fr["trade_date"] = pd.to_datetime(fr["trade_date"])
+        F = fr.pivot(index="trade_date", columns="factor_id",
+                     values="factor_return").sort_index()
+
+        def _rbar(snap_ts: pd.Timestamp, win: int) -> pd.Series:
+            # STRICTLY before the snapshot: the snapshot day's factor return is
+            # built from that day's stock returns, which the backtest's holding
+            # window ([snap, next_snap)) also earns — using "< snap" removes that
+            # 1-day overlap and aligns the signal cutoff with the holding start.
+            sl = F[F.index < snap_ts].tail(win)
+            if len(sl) < 20:
+                return pd.Series(np.nan, index=F.columns)
+            return ((1.0 + sl).prod() - 1.0) / (sl.std(ddof=1) * np.sqrt(len(sl)) + 1e-12)
+
+        out_rows: list[tuple] = []
+        for snap in snapshot_dates:
+            snap_ts = pd.Timestamp(snap)
+            rb = (0.5 * _rbar(snap_ts, FM_W6).reindex(FM_STYLE)
+                  + 0.5 * _rbar(snap_ts, FM_W12).reindex(FM_STYLE))
+            if rb.isna().all():
+                log.warning("  %s: insufficient factor-return history — skipped.", snap)
+                continue
+            exp = pd.read_sql_query(
+                f"SELECT security_id, factor_id, exposure FROM factor_exposures "
+                f"WHERE snapshot_date = ? AND factor_id IN ({ph})",
+                rconn, params=[snap, *FM_STYLE],
+            )
+            if exp.empty:
+                log.warning("  %s: no Barra exposures — skipped.", snap)
+                continue
+            X = exp.pivot(index="security_id", columns="factor_id",
+                          values="exposure").reindex(columns=FM_STYLE)
+            signal = (X * rb).sum(axis=1, min_count=1).dropna()
+            if len(signal) < MIN_STOCKS:
+                log.warning("  %s: only %d names with a signal — skipped.", snap, len(signal))
+                continue
+            zed = winsorized_zscore(signal)
+            for sid, raw in signal.items():
+                zv = zed.get(sid)
+                out_rows.append((
+                    snap, FM_MODEL_ID, sid, float(raw),
+                    float(zv) if zv is not None and np.isfinite(zv) else None, 0,
+                ))
+
+    if not out_rows:
+        log.warning("Factor momentum produced no rows — nothing written.")
+        return
+    dates_written = sorted({r[0] for r in out_rows})
+    with get_db(MODELS_DB) as mconn:
+        # Defensive: models table is normally created by create_models (which runs
+        # earlier in the pipeline); create it if missing so a standalone
+        # --factor-momentum-only run cannot fail on a fresh DB.
+        mconn.execute(
+            "CREATE TABLE IF NOT EXISTS models ("
+            " data_date TEXT NOT NULL, model_id TEXT NOT NULL, security_id TEXT NOT NULL,"
+            " model_value REAL NOT NULL, model_value_z REAL,"
+            " is_composite INTEGER NOT NULL DEFAULT 0,"
+            " PRIMARY KEY (data_date, model_id, security_id))"
+        )
+        # Clear this model's rows for the rebuilt dates (drops names that left the
+        # universe), then insert fresh — one atomic transaction.
+        mconn.executemany(
+            "DELETE FROM models WHERE model_id = ? AND data_date = ?",
+            [(FM_MODEL_ID, d) for d in dates_written],
+        )
+        mconn.executemany(
+            "INSERT OR REPLACE INTO models "
+            "(data_date, model_id, security_id, model_value, model_value_z, is_composite) "
+            "VALUES (?,?,?,?,?,?)",
+            out_rows,
+        )
+        mconn.commit()
+    log.info("  %s factor-momentum rows written across %d snapshot(s).",
+             f"{len(out_rows):,}", len(dates_written))
+
+
 def main(snapshot_dates: list[str]) -> None:
     log.info("=== Barra Factor Risk Model ===")
 
@@ -896,6 +1016,11 @@ def main(snapshot_dates: list[str]) -> None:
         )
 
     conn.close()
+
+    # Factor-momentum analysis signal — computed after the risk model is persisted
+    # (reads it back), so it always refreshes with every Barra build/restatement.
+    _compute_and_save_factor_momentum(snap_dates_filtered)
+
     log.info("Done.")
 
 
@@ -912,7 +1037,23 @@ if __name__ == "__main__":
         "--date", metavar="YYYY-MM-DD", action="append", dest="dates",
         help="Compute a snapshot for the given date (repeatable: --date D1 --date D2).",
     )
+    grp.add_argument(
+        "--factor-momentum-only", action="store_true", dest="fm_only",
+        help="(Re)compute ONLY the factor-momentum analysis signal (FMOM001) from the "
+             "existing risk.db for all Barra snapshots, without rebuilding the risk model.",
+    )
     args = parser.parse_args()
+
+    if args.fm_only:
+        with get_db(RISK_DB) as rconn:
+            fm_dates = [r[0] for r in rconn.execute(
+                "SELECT DISTINCT snapshot_date FROM factor_exposures ORDER BY snapshot_date"
+            ).fetchall()]
+        if not fm_dates:
+            log.error("No Barra snapshots in risk.db — run --backfill first.")
+            sys.exit(1)
+        _compute_and_save_factor_momentum(fm_dates)
+        sys.exit(0)
 
     if args.backfill:
         dates = _get_snapshot_dates()

@@ -73,6 +73,10 @@ def load_models_reference() -> dict:
             name         = row['Model']
             model_id     = row['ModelID']
             factor_id    = row['Factors']
+            # Externally-computed models (e.g. FMOM001, built in create_barra from
+            # risk.db) carry the EXTERNAL sentinel — never build them here.
+            if factor_id == 'EXTERNAL':
+                continue
             weight       = float(row['Weights'])
             is_composite = bool(int(row['IsComposite']))
             override_raw = (row.get('sector_type') or '').strip()

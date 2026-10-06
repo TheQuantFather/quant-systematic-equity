@@ -1035,6 +1035,42 @@ def _window_control(snaps: list[str], prefix: str) -> tuple[str, str]:
     return selected[0], selected[1]
 
 
+def _month_end_snaps(dates) -> list[str]:
+    """Reduce snapshot dates to the last available date in each calendar month."""
+    last: dict[str, str] = {}
+    for d in dates:
+        d = str(d)[:10]
+        ym = d[:7]
+        if d > last.get(ym, ""):
+            last[ym] = d
+    return sorted(last.values())
+
+
+# Dark-surface categorical palette (validated, fixed order). Colour alone can't
+# separate >8 lines, so the charts plot a user-chosen subset and get distinct solid
+# colours; a dash is only a fallback if more than 8 are selected.
+_SIGNAL_PALETTE = ["#3987e5", "#d95926", "#199e70", "#c98500",
+                   "#d55181", "#008300", "#9085e9", "#e66767"]
+_SIGNAL_DASHES = ["solid", "dash", "dot", "dashdot"]
+
+
+def _signal_styles(labels: list[str]) -> dict[str, dict]:
+    """{label: line style} over the plotted subset. ALP001 is the white reference;
+    the rest get distinct solid colours in order (dash only past the 8th)."""
+    styles, i = {}, 0
+    for lab in labels:
+        if lab.endswith("(ALP001)"):
+            styles[lab] = dict(color="#ffffff", dash="solid", width=3.2)
+            continue
+        styles[lab] = dict(
+            color=_SIGNAL_PALETTE[i % len(_SIGNAL_PALETTE)],
+            dash=_SIGNAL_DASHES[(i // len(_SIGNAL_PALETTE)) % len(_SIGNAL_DASHES)],
+            width=2.0,
+        )
+        i += 1
+    return styles
+
+
 @st.cache_data(show_spinner="Computing signal diagnostics …")
 def compute_signal_diagnostics(
     date_lo: str, date_hi: str, sectors: tuple, source: str = "model"
@@ -1064,6 +1100,10 @@ def compute_signal_diagnostics(
     if sectors:
         keep = set(uni[uni["gics_sector"].isin(sectors)]["security_id"])
         scores = scores[scores["security_id"].isin(keep)]
+
+    # Rebalance on a monthly grid (month-end snapshots) so the diagnostics are a
+    # constant frequency even where the underlying snapshot grid is weekly.
+    scores = scores[scores["data_date"].isin(_month_end_snaps(scores["data_date"].unique()))]
 
     snaps = sorted(scores["data_date"].unique())
     if len(snaps) < 6:
@@ -1333,7 +1373,7 @@ with tab3:
 
     sel_sectors_diag = st.multiselect("Sector filter", all_sectors,
                                       placeholder="All sectors", key="diag_sectors")
-    all_snaps = sorted(_load_scores(diag_source)["data_date"].unique())
+    all_snaps = _month_end_snaps(_load_scores(diag_source)["data_date"].unique())
     _lo, _hi = _window_control(all_snaps, "diag")
 
     diag = compute_signal_diagnostics(
@@ -1349,6 +1389,21 @@ with tab3:
             f"{365.25 / ppy:.0f} days (annualisation ≈ ×{ppy:.0f})"
         )
 
+        # Signal picker — too many lines on one chart can't be told apart, so plot a
+        # legible subset (default: ALP001 + the strongest by |IC|). Each shown line
+        # gets a distinct solid colour; the same selection drives both line charts.
+        _labels = diag["summary"]["Signal"].tolist()
+        _alp = next((l for l in _labels if l.endswith("(ALP001)")), None)
+        _ranked = (diag["summary"].reindex(
+            diag["summary"]["IC"].abs().sort_values(ascending=False).index)["Signal"].tolist())
+        _default = ([_alp] if _alp else []) + [l for l in _ranked if l != _alp][:5]
+        sel_signals = st.multiselect(
+            "Signals to plot", _labels, default=_default, key="diag_signals",
+            help="Add or remove signals. Keep it to ~8 so colours stay distinct.",
+        )
+        _sig_styles = _signal_styles(sel_signals)
+        _sel_set = set(sel_signals)
+
         # ---- 0. Cumulative long-short performance (headline) -------------
         ls = diag["ls_curves"]
         if not ls.empty:
@@ -1360,16 +1415,15 @@ with tab3:
                 "re-based to 1.0 at the window start."
             )
             fig_ls = go.Figure()
-            for sig in ls.columns:
+            for sig in [c for c in ls.columns if c in _sel_set]:
                 s = ls[sig].dropna()
                 if s.empty:
                     continue
                 s = s / s.iloc[0]
-                emph = sig.endswith("(ALP001)")
+                stl = _sig_styles[sig]
                 fig_ls.add_trace(go.Scatter(
                     x=s.index, y=s.values, name=sig.split(" (")[0], mode="lines",
-                    line=dict(width=3 if emph else 1.2,
-                              color="#111827" if emph else None),
+                    line=dict(width=stl["width"], color=stl["color"], dash=stl["dash"]),
                 ))
             fig_ls.add_hline(y=1.0, line_dash="dot", line_color="#9ca3af")
             fig_ls.update_layout(
@@ -1429,14 +1483,14 @@ with tab3:
             )
             decay = diag["decay"].set_index("Signal")
             fig_d = go.Figure()
-            for sig in decay.index:
-                emph = sig.endswith("(ALP001)")
+            for sig in [s for s in decay.index if s in _sel_set]:
+                stl = _sig_styles[sig]
                 fig_d.add_trace(go.Scatter(
                     x=[h.replace("h=", "") for h in decay.columns],
                     y=decay.loc[sig].values, name=sig.split(" (")[0],
                     mode="lines+markers",
-                    line=dict(width=3 if emph else 1.3,
-                              color="#111827" if emph else None),
+                    line=dict(width=stl["width"], color=stl["color"], dash=stl["dash"]),
+                    marker=dict(size=6, color=stl["color"]),
                 ))
             fig_d.update_layout(
                 height=420, xaxis_title="forward horizon (snapshots)", yaxis_title="mean IC",
