@@ -11,8 +11,10 @@ Tab 3 — Signal Diagnostics : holistic predictive-power view across all signals
 All controls live in-page per tab (no sidebar).
 """
 
+import hashlib
 import io
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -37,7 +39,7 @@ from backtest import (
     load_returns_matrix as _load_returns_matrix_impl,
     run_optimised_backtest as _run_optimised_backtest_impl,
 )
-from utils import get_db, inject_css
+from utils import get_db, holding_period, inject_css
 
 st.set_page_config(page_title="Backtester", layout="wide")
 inject_css()
@@ -282,18 +284,23 @@ def _rolling_risk_chart(
     bench: pd.Series,
     window: int = 63,
     height: int = 320,
+    ex_ante_te: pd.Series | None = None,
 ) -> go.Figure | None:
     """
     Rolling annualised risk metrics for a portfolio vs its benchmark.
 
-      • Tracking error  = std(port − bench) · √252   (left %, blue)
+      • Tracking error (ex-post)  = std(port − bench) · √252   (left %, solid blue)
+      • Tracking error (ex-ante)  = optimiser's forecast active risk at each
+        rebalance, held constant over the period (left %, dashed blue step)
       • Absolute risk   = std(port)        · √252   (left %, slate)
       • Beta            = cov(port, bench) / var(bench)  (right axis, amber)
 
-    Tracking error and absolute risk are both annualised % and share the left
-    axis so their magnitudes are directly comparable. Beta is unitless (~1) and
-    sits on a secondary right axis, so the level differences don't crush the
-    % series — all three are readable on one chart.
+    The ex-post tracking error is realised from the return stream; the ex-ante
+    series is the active risk the Barra model predicted (and the optimiser
+    constrained to ``max_active_risk``) at each rebalance — overlaying them shows
+    how closely realised risk tracked the forecast the book was built to. All
+    % series share the left axis; beta (~1) sits on the right. ``ex_ante_te`` is
+    a step series indexed by rebalance date, in annualised %.
     """
     common = port.index.intersection(bench.index)
     p = port.loc[common]
@@ -314,9 +321,20 @@ def _rolling_risk_chart(
         line=dict(color="#94A3B8", width=1.5),
     ))
     fig.add_trace(go.Scatter(
-        x=roll_te.index, y=roll_te.values, name="Tracking error",
+        x=roll_te.index, y=roll_te.values, name="Tracking error (ex-post, realised)",
         line=dict(color="#2563EB", width=2),
     ))
+    if ex_ante_te is not None and len(ex_ante_te):
+        ea = ex_ante_te.sort_index()
+        xs, ys = list(ea.index), list(ea.values)
+        last = common.max()  # extend the final forecast step to the end of the window
+        if xs[-1] < last:
+            xs.append(last)
+            ys.append(ys[-1])
+        fig.add_trace(go.Scatter(
+            x=xs, y=ys, name="Tracking error (ex-ante, optimiser)",
+            line=dict(color="#2563EB", width=1.5, dash="dash"), line_shape="hv",
+        ))
     fig.add_trace(go.Scatter(
         x=roll_beta.index, y=roll_beta.values, name="Beta (vs benchmark)",
         yaxis="y2", line=dict(color="#F59E0B", width=2, dash="dot"),
@@ -637,10 +655,6 @@ def run_backtest(
 
     trading_index = ret_matrix.index
 
-    def next_td(d_str: str):
-        pos = trading_index.searchsorted(pd.Timestamp(d_str))
-        return trading_index[pos] if pos < len(trading_index) else None
-
     def holdings_df(isins: list, score_lkp: dict, price_cols: set) -> pd.DataFrame:
         return pd.DataFrame([{
             "Rank":       rank,
@@ -659,9 +673,10 @@ def run_backtest(
             snapshot_dates[i + 1] if i + 1 < len(snapshot_dates)
             else trading_index[-1].strftime("%Y-%m-%d")
         )
-        t_start = next_td(snap)
-        t_end   = next_td(next_snap)
-        if t_start is None or t_end is None or t_start >= t_end:
+        # Window starts the session AFTER the snapshot (signal uses the snapshot
+        # close), so the snapshot-day return is never booked — no look-ahead.
+        period = holding_period(ret_matrix, snap, next_snap)
+        if period is None:
             continue
 
         uni_snap = _find_nearest_before(snap, universe_dates)
@@ -687,7 +702,6 @@ def run_backtest(
             snap_df.nsmallest(bucket_n, "model_value_z")["security_id"].tolist()
             if include_short else []
         )
-        period     = ret_matrix.loc[(ret_matrix.index >= t_start) & (ret_matrix.index < t_end)]
         price_cols = set(period.columns)
 
         def ew(isins):
@@ -758,19 +772,15 @@ def run_quintile_analysis(
     snapshot_dates = sorted(model_df["data_date"].unique())
     trading_index  = ret_matrix.index
 
-    def next_td(d):
-        pos = trading_index.searchsorted(pd.Timestamp(d))
-        return trading_index[pos] if pos < len(trading_index) else None
-
     q_parts = [[] for _ in range(N_QUINTILES)]
     for i, snap in enumerate(snapshot_dates):
         next_snap = (
             snapshot_dates[i + 1] if i + 1 < len(snapshot_dates)
             else trading_index[-1].strftime("%Y-%m-%d")
         )
-        t_start = next_td(snap)
-        t_end   = next_td(next_snap)
-        if t_start is None or t_end is None or t_start >= t_end:
+        # Window starts the session AFTER the snapshot — no 1-day look-ahead.
+        period = holding_period(ret_matrix, snap, next_snap)
+        if period is None:
             continue
 
         snap_df = model_df[model_df["data_date"] == snap].sort_values(
@@ -784,7 +794,6 @@ def run_quintile_analysis(
         n      = len(snap_df)
         if n < N_QUINTILES:
             continue
-        period = ret_matrix.loc[(ret_matrix.index >= t_start) & (ret_matrix.index < t_end)]
         for q in range(N_QUINTILES):
             isins = snap_df.iloc[int(q * n / N_QUINTILES):int((q + 1) * n / N_QUINTILES)]["security_id"].tolist()
             cols  = [s for s in isins if s in period.columns]
@@ -1173,6 +1182,21 @@ def compute_signal_diagnostics(
 # Optimised backtest helpers
 # ---------------------------------------------------------------------------
 
+def _params_fingerprint() -> str:
+    """Content hash of strategy_params.xlsx.
+
+    The strategy's constraints and alpha weights are read from the workbook
+    *inside* the engine, not passed as arguments, so they are invisible to
+    st.cache_data's argument-based key. Feeding this hash into the cache key makes
+    the backtest re-run whenever the Excel changes (edited constraints, weights,
+    objective, …) and still serve instantly when nothing changed.
+    """
+    try:
+        return hashlib.sha256(PARAMS_FILE.read_bytes()).hexdigest()
+    except OSError:
+        return "missing"
+
+
 def _run_optimised_backtest(
     strategy_id: str,
     portfolio_eur: float,
@@ -1184,22 +1208,45 @@ def _run_optimised_backtest(
     min_pos_if_held: float | None = None,
     max_positions_override: int | None = None,
     solver: str = "CLARABEL",
+    _progress_cb=None,
 ) -> dict:
     """Streamlit-cached wrapper over backtest.run_optimised_backtest.
 
     The walk-forward simulation lives in the shared engine so the interactive page
     and the standalone HTML report (scripts/backtest_report.py) stay in lockstep.
-    Cached on the full parameter set: an identical configuration returns instantly.
+    Cached on the full parameter set *plus* the strategy_params.xlsx content hash,
+    so an identical configuration returns instantly while any Excel edit forces a
+    fresh run. ``_progress_cb`` is excluded from the cache key (leading underscore)
+    and fires only on a cache miss — i.e. during an actual re-run.
     """
     return _cached_optimised_backtest(
+        _params_fingerprint(),
         strategy_id, portfolio_eur, max_turnover, tc_per_trade_eur, benchmark_name,
         universe_name, rebal_freq, min_pos_if_held, max_positions_override, solver,
+        _progress_cb=_progress_cb,
     )
 
 
 @st.cache_data(show_spinner=False, max_entries=8)
-def _cached_optimised_backtest(*args) -> dict:
-    return _run_optimised_backtest_impl(*args)
+def _cached_optimised_backtest(
+    params_fp: str,
+    strategy_id: str,
+    portfolio_eur: float,
+    max_turnover: float,
+    tc_per_trade_eur: float,
+    benchmark_name: str,
+    universe_name: str,
+    rebal_freq: str,
+    min_pos_if_held: float | None,
+    max_positions_override: int | None,
+    solver: str,
+    _progress_cb=None,
+) -> dict:
+    return _run_optimised_backtest_impl(
+        strategy_id, portfolio_eur, max_turnover, tc_per_trade_eur, benchmark_name,
+        universe_name, rebal_freq, min_pos_if_held, max_positions_override, solver,
+        progress_cb=_progress_cb,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2075,7 +2122,24 @@ with tab2:
         for k in [k for k in st.session_state if k.startswith("opt_bt_") and k != result_key]:
             del st.session_state[k]
         est_time = "~30–60 s" if rebal_freq == "quarterly" else "~2–3 min"
-        with st.spinner(f"Running {rebal_freq} walk-forward backtest for '{sel_strat_name}'…  ({est_time})"):
+        # Live progress: the engine calls back once per rebalance date. The bar
+        # only advances on a cache miss (an actual re-run); a cache hit returns
+        # instantly and leaves ``done`` at 0, which we report as a cache serve.
+        prog     = st.progress(0.0)
+        status   = st.empty()
+        progress = {"done": 0, "total": 0}
+
+        def _progress_cb(i: int, n: int, snap: str) -> None:
+            progress["done"], progress["total"] = i + 1, n
+            try:  # a UI hiccup must never sink the backtest
+                prog.progress(min(1.0, (i + 1) / max(n, 1)))
+                status.caption(f"⚙️ Optimising rebalance {i + 1} / {n} — snapshot {snap[:10]}")
+            except Exception:
+                pass
+
+        status.caption(f"Running {rebal_freq} walk-forward backtest for '{sel_strat_name}'…  ({est_time})")
+        t0 = time.perf_counter()
+        try:
             st.session_state[result_key] = _run_optimised_backtest(
                 strategy_id            = sel_strat_id,
                 portfolio_eur          = float(portfolio_eur),
@@ -2087,6 +2151,22 @@ with tab2:
                 min_pos_if_held        = min_pos_if_held_override,
                 max_positions_override = max_positions_override,
                 solver                 = sel_solver,
+                _progress_cb           = _progress_cb,
+            )
+        except Exception as exc:  # never leak a raw traceback to the page
+            st.session_state[result_key] = {"error": f"Backtest failed: {exc}"}
+        finally:
+            elapsed = time.perf_counter() - t0
+            prog.empty()
+
+        if "error" in st.session_state[result_key]:
+            status.empty()
+        elif progress["done"] == 0:
+            status.caption(f"⚡ Served from cache — inputs unchanged ({elapsed:.1f} s).")
+        else:
+            status.caption(
+                f"✅ Completed {progress['done']} rebalances in {elapsed:.1f} s "
+                f"(fresh run — strategy_params.xlsx or settings changed)."
             )
 
     # ── Display results ───────────────────────────────────────────────────────
@@ -2217,11 +2297,25 @@ with tab2:
         st.divider()
         st.subheader("Rolling risk")
         st.caption(
-            "Tracking error and absolute risk are both annualised % on the left "
-            "axis (directly comparable); beta (~1) is on the right axis. "
-            "63-day rolling window."
+            "Ex-post tracking error (realised, solid) and absolute risk are "
+            "annualised % on the left axis (directly comparable); beta (~1) is on "
+            "the right axis. 63-day rolling window. For a benchmark-relative "
+            "strategy the dashed step is the ex-ante tracking error — the active "
+            "risk the Barra model forecast (and `max_active_risk` capped) at each "
+            "rebalance — so you can see how realised risk tracked the forecast."
         )
-        fig_rr = _rolling_risk_chart(eval_port_series, eval_bench_series, window=63)
+        ex_ante_te = None
+        if result.get("objective") == "maximize_alpha":
+            ea_pts = {
+                pd.Timestamp(p["snap_date"]): p["metrics"]["active_risk"] * 100.0
+                for p in period_log
+                if p.get("metrics") and p["metrics"].get("active_risk") is not None
+            }
+            if ea_pts:
+                ex_ante_te = pd.Series(ea_pts).sort_index()
+        fig_rr = _rolling_risk_chart(
+            eval_port_series, eval_bench_series, window=63, ex_ante_te=ex_ante_te
+        )
         if fig_rr is not None:
             st.plotly_chart(fig_rr, width="stretch")
         else:

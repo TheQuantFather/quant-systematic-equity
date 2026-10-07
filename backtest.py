@@ -18,7 +18,7 @@ import numpy as np
 import pandas as pd
 
 from config import MODELS_DB, PARAMS_FILE, RETURNS_DB, RISK_DB, UNIVERSE_DB
-from utils import get_db, get_snapshot_schedule
+from utils import get_db, get_snapshot_schedule, holding_period
 
 ProgressCB = Callable[[int, int, str], None]
 
@@ -171,10 +171,6 @@ def run_optimised_backtest(
     ret_matrix    = load_returns_matrix()
     trading_index = ret_matrix.index
 
-    def next_td(d_str: str):
-        pos = trading_index.searchsorted(pd.Timestamp(d_str))
-        return trading_index[pos] if pos < len(trading_index) else None
-
     # ── Build rebalancing schedule ────────────────────────────────────────────
     # Start from the first date with Barra coverage so all periods use consistent risk model.
     first_barra = barra_lookup_dates[0] if barra_lookup_dates else None
@@ -230,9 +226,11 @@ def run_optimised_backtest(
             rebal_dates[i + 1] if i + 1 < len(rebal_dates)
             else trading_index[-1].strftime("%Y-%m-%d")
         )
-        t_start = next_td(snap_date)
-        t_end   = next_td(next_snap)
-        if t_start is None or t_end is None or t_start >= t_end:
+        # Hold-period rows: window starts the session AFTER the snapshot, so the
+        # snapshot-day return (already embedded in the signal's close) is never
+        # credited to the book (no 1-day look-ahead). None → unusable period.
+        period = holding_period(ret_matrix, snap_date, next_snap)
+        if period is None:
             continue
 
         # Alpha, universe, and benchmark weights are carried forward from the
@@ -325,8 +323,7 @@ def run_optimised_backtest(
             )
         tc_pct = n_trades * tc_per_trade_eur / portfolio_eur
 
-        # Hold-period return simulation
-        period = ret_matrix.loc[(ret_matrix.index >= t_start) & (ret_matrix.index < t_end)]
+        # Hold-period return simulation (period computed above, look-ahead-safe)
         avail  = [isin for isin in new_weights if isin in period.columns]
         if avail:
             w_arr = np.array([new_weights[isin] for isin in avail])

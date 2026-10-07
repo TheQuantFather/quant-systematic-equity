@@ -67,7 +67,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config import (
-    RETURNS_DB, FACTORS_DB, MODELS_DB, UNIVERSE_DB, RISK_DB,
+    RETURNS_DB, FACTORS_DB, MODELS_DB, UNIVERSE_DB, RISK_DB, MODELS_REF,
     HL_FACTOR_VAR, HL_FACTOR_CORR, HL_IDIO, NW_LAGS, VRA_WINDOW,
     SHRINK_IDIO, EIGENFLOOR, VRA_MIN, VRA_MAX, MIN_STOCKS,
     BARRA_RETURN_CLIP,
@@ -116,6 +116,15 @@ FM_MODEL_ID   = "FMOM001"
 FM_EXCLUDE    = {"MOM001"}                        # drop stock momentum to avoid double-count
 FM_STYLE      = [m for m in MODEL_IDS if m not in FM_EXCLUDE]   # derived from the layout
 FM_W6, FM_W12 = 126, 252                          # trailing windows (trading days)
+
+# FMOM001 is now a LIVE leg of the ALP001 alpha composite. ALP001 must be finalised
+# here (not in create_models) because the FM leg needs the Barra factor returns this
+# run just persisted. FM has no base-scale model_value (its model_value is a raw
+# exposure·return dot-product), so it enters the composite scaled to FM_SCALE_REF's
+# per-date model_value dispersion — FM is funded out of that leg's weight, so matching
+# its dispersion makes the stated 0.10 weight the effective tilt.
+ALPHA_COMPOSITE_ID = "ALP001"
+FM_SCALE_REF       = "MOM001"
 
 
 # Snapshot dates from the single source of truth (universe.db snapshot_schedule,
@@ -937,6 +946,112 @@ def _compute_and_save_factor_momentum(snapshot_dates: list[str]) -> None:
              f"{len(out_rows):,}", len(dates_written))
 
 
+def _rebuild_alpha_with_fm(snapshot_dates: list[str]) -> None:
+    """Finalise the ALP001 alpha composite INCLUDING the factor-momentum leg.
+
+    ALP001 cannot be finalised in create_models because its FMOM001 leg is produced
+    by ``_compute_and_save_factor_momentum`` above, which needs the Barra factor
+    returns this run just persisted. create_models builds a provisional, FM-less
+    ALP001 (it strips EXTERNAL-sourced legs); this overwrites it with the
+    authoritative FM-inclusive composite for ``snapshot_dates``.
+
+    Recipe is identical to ``create_models.compute_alpha_models`` — blend base
+    ``model_value``, treat missing legs as neutral then shrink by coverage, then
+    winsorised z — with one special case: the FM leg has no base-scale model_value
+    (raw exposure·return dot-product), so it enters scaled to ``FM_SCALE_REF``'s
+    per-date model_value std (see the module constant note).
+    """
+    if not snapshot_dates:
+        return
+    ref  = pd.read_csv(MODELS_REF)
+    legs = ref[ref["ModelID"] == ALPHA_COMPOSITE_ID]
+    weights = {str(f): float(w) for f, w in zip(legs["Factors"], legs["Weights"])}
+    if not weights:
+        log.warning("No %s legs in models_reference.csv — alpha rebuild skipped.",
+                    ALPHA_COMPOSITE_ID)
+        return
+    total_w   = sum(weights.values())
+    base_legs = [m for m in weights if m != FM_MODEL_ID]
+    log.info("Finalising %s composite (incl %s leg) for %d snapshot(s)...",
+             ALPHA_COMPOSITE_ID, FM_MODEL_ID, len(snapshot_dates))
+
+    ph_dates = ",".join("?" * len(snapshot_dates))
+    with get_db(MODELS_DB) as conn:
+        ph_base = ",".join("?" * len(base_legs))
+        base = pd.read_sql_query(
+            f"SELECT data_date, model_id, security_id, model_value FROM models "
+            f"WHERE is_composite = 0 AND model_id IN ({ph_base}) "
+            f"AND data_date IN ({ph_dates})",
+            conn, params=[*base_legs, *snapshot_dates],
+        )
+        if base.empty:
+            log.warning("No base-model rows for the requested dates — alpha rebuild skipped.")
+            return
+        base = base[np.isfinite(base["model_value"])]
+
+        allrows = base[["data_date", "model_id", "security_id", "model_value"]]
+        if FM_MODEL_ID in weights:
+            fm = pd.read_sql_query(
+                f"SELECT data_date, security_id, model_value_z FROM models "
+                f"WHERE model_id = ? AND data_date IN ({ph_dates}) "
+                f"AND model_value_z IS NOT NULL",
+                conn, params=[FM_MODEL_ID, *snapshot_dates],
+            )
+            # FM scaled to the reference leg's per-date model_value dispersion.
+            ref_std = (base[base["model_id"] == FM_SCALE_REF]
+                       .groupby("data_date")["model_value"].std(ddof=1))
+            if fm.empty or ref_std.empty:
+                log.warning("No %s (or %s) rows for the dates — %s built WITHOUT the FM leg.",
+                            FM_MODEL_ID, FM_SCALE_REF, ALPHA_COMPOSITE_ID)
+            else:
+                fm = fm.assign(
+                    model_id=FM_MODEL_ID,
+                    model_value=fm["model_value_z"] * fm["data_date"].map(ref_std),
+                )[["data_date", "model_id", "security_id", "model_value"]]
+                fm = fm[np.isfinite(fm["model_value"])]
+                allrows = pd.concat([allrows, fm], ignore_index=True)
+
+        w = pd.Series(weights)
+        out_rows: list[tuple] = []
+        for d, g in allrows.groupby("data_date"):
+            wide = g.pivot_table(index="security_id", columns="model_id",
+                                 values="model_value", aggfunc="first")
+            for m in weights:
+                if m not in wide.columns:
+                    wide[m] = np.nan
+            wide = wide[list(weights)]
+            valid_w = wide.notna().mul(w, axis=1).sum(axis=1)     # Σ weights of present legs
+            score   = wide.mul(w, axis=1).sum(axis=1, min_count=1)  # Σ value·weight over present
+            mv      = ((score / total_w) * (valid_w / total_w))[valid_w > 0]
+            if mv.empty:
+                continue
+            zed = winsorized_zscore(mv)
+            for sid, raw in mv.items():
+                zv = zed.get(sid)
+                out_rows.append((
+                    d, ALPHA_COMPOSITE_ID, sid, float(raw),
+                    float(zv) if zv is not None and np.isfinite(zv) else None, 1,
+                ))
+
+        if not out_rows:
+            log.warning("Alpha rebuild produced no rows — %s left unchanged.", ALPHA_COMPOSITE_ID)
+            return
+        dates_written = sorted({r[0] for r in out_rows})
+        conn.executemany(
+            "DELETE FROM models WHERE model_id = ? AND data_date = ?",
+            [(ALPHA_COMPOSITE_ID, d) for d in dates_written],
+        )
+        conn.executemany(
+            "INSERT OR REPLACE INTO models "
+            "(data_date, model_id, security_id, model_value, model_value_z, is_composite) "
+            "VALUES (?,?,?,?,?,?)",
+            out_rows,
+        )
+        conn.commit()
+    log.info("  %s %s rows written across %d snapshot(s).",
+             f"{len(out_rows):,}", ALPHA_COMPOSITE_ID, len(dates_written))
+
+
 def main(snapshot_dates: list[str]) -> None:
     log.info("=== Barra Factor Risk Model ===")
 
@@ -1017,9 +1132,11 @@ def main(snapshot_dates: list[str]) -> None:
 
     conn.close()
 
-    # Factor-momentum analysis signal — computed after the risk model is persisted
-    # (reads it back), so it always refreshes with every Barra build/restatement.
+    # Factor-momentum signal — computed after the risk model is persisted (reads it
+    # back), so it always refreshes with every Barra build/restatement. Then finalise
+    # the ALP001 alpha composite with the FM leg (create_models built it FM-less).
     _compute_and_save_factor_momentum(snap_dates_filtered)
+    _rebuild_alpha_with_fm(snap_dates_filtered)
 
     log.info("Done.")
 
@@ -1053,6 +1170,7 @@ if __name__ == "__main__":
             log.error("No Barra snapshots in risk.db — run --backfill first.")
             sys.exit(1)
         _compute_and_save_factor_momentum(fm_dates)
+        _rebuild_alpha_with_fm(fm_dates)
         sys.exit(0)
 
     if args.backfill:

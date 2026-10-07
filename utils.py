@@ -205,6 +205,48 @@ def get_computed_snapshot_dates() -> list[str]:
     )
 
 
+def next_trading_day_after(trading_index: pd.DatetimeIndex, d) -> pd.Timestamp | None:
+    """First trading day strictly after ``d`` (``None`` if none exists).
+
+    Signals are computed as of a snapshot's close (``create_factors`` cuts
+    price/return factors off at the snapshot date), so a backtest must begin the
+    holding period on the *following* session. Crediting the book with the
+    snapshot day's own return would be a 1-day look-ahead, since the signal
+    already used that day's close.
+    """
+    pos = int(trading_index.searchsorted(pd.Timestamp(d), side="right"))
+    return trading_index[pos] if pos < len(trading_index) else None
+
+
+def holding_period(ret_matrix: pd.DataFrame, snap, next_snap) -> pd.DataFrame | None:
+    """Rows of ``ret_matrix`` a book formed at ``snap`` earns until ``next_snap``.
+
+    Half-open window ``[t_start, t_end)`` whose bounds each start the session
+    *after* their snapshot (see :func:`next_trading_day_after`), so the
+    snapshot-day return — already embedded in the signal — is never
+    double-counted. When no trading day follows ``next_snap`` (the final period,
+    where callers pass the last available date) the window runs through the last
+    row. Returns ``None`` when the window is empty.
+
+    Single source of truth for the backtest holding-period slice: the optimised
+    walk-forward (``backtest.run_optimised_backtest``) and the per-model signal
+    and quintile backtests (``pages/6_Backtester.py``) all call it, so the
+    look-ahead convention cannot drift between them.
+    """
+    idx = ret_matrix.index
+    t_start = next_trading_day_after(idx, snap)
+    if t_start is None:
+        return None
+    t_end = next_trading_day_after(idx, next_snap)
+    if t_end is None:
+        period = ret_matrix.loc[idx >= t_start]
+    elif t_start >= t_end:
+        return None
+    else:
+        period = ret_matrix.loc[(idx >= t_start) & (idx < t_end)]
+    return period if len(period) else None
+
+
 def get_barra_layout() -> dict:
     """Single source of truth for the Barra factor layout.
 

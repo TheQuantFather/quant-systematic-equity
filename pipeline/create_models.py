@@ -68,6 +68,7 @@ def load_models_reference() -> dict:
     sector gating from factors_reference.csv.
     """
     models: dict = {}
+    external_ids: set = set()
     with open(MODELS_CSV) as f:
         for row in csv.DictReader(f):
             name         = row['Model']
@@ -76,6 +77,7 @@ def load_models_reference() -> dict:
             # Externally-computed models (e.g. FMOM001, built in create_barra from
             # risk.db) carry the EXTERNAL sentinel — never build them here.
             if factor_id == 'EXTERNAL':
+                external_ids.add(model_id)
                 continue
             weight       = float(row['Weights'])
             is_composite = bool(int(row['IsComposite']))
@@ -86,6 +88,14 @@ def load_models_reference() -> dict:
                                 'weights': {}, 'sectors': {}}
             models[name]['weights'][factor_id] = weight
             models[name]['sectors'][factor_id] = override
+    # Strip EXTERNAL-sourced legs (e.g. FMOM001) from any composite: they are
+    # finalised in create_barra AFTER the Barra factor returns they depend on exist.
+    # create_models builds only a provisional FM-less composite, which create_barra
+    # ._rebuild_alpha_with_fm then overwrites with the authoritative version.
+    for info in models.values():
+        for ext in external_ids:
+            info['weights'].pop(ext, None)
+            info['sectors'].pop(ext, None)
     return models
 
 
