@@ -1,0 +1,22 @@
+# Lint/format configuration for the public showcase (CI runs ruff only).
+# The showcase files import modules that live only in the private repository,
+# so they are declared first-party here to keep import ordering consistent.
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+ignore = ["E501", "E741", "E402", "E731"]
+
+[tool.ruff.lint.per-file-ignores]
+"pipeline/create_factors.py" = ["E712"]  # pandas `== True` mask is element-wise
+"pipeline/create_barra.py" = ["F841"]
+"optimize_portfolio.py" = ["F841"]
+
+[tool.ruff.lint.isort]
+known-first-party = [
+    "backtest", "classification", "config", "db", "optimize_portfolio",
+    "pipeline", "portfolio_analytics", "securities", "utils",
+]
