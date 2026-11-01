@@ -33,9 +33,9 @@ Estimation pipeline:
 
 Optimizer integration (optimize_portfolio.py):
   Stacked-L: L_barra = vstack([L_F.T @ X.T, diag(√δ)]).T (shape N×(K+N))
-  Drop-in for Ledoit-Wolf L in  cp.norm(L_barra.T @ w, 2).
+  Drop-in L in  cp.norm(L_barra.T @ w, 2).
 
-Output  data/risk.db (Barra tables, alongside Ledoit-Wolf covariance_matrix):
+Output  data/risk.db (Barra tables):
   factor_returns     trade_date  × factor_id × factor_return  (all trading days)
   factor_covariance  snapshot_date × K×K blob
   idiosyncratic_vars snapshot_date × security_id × idio_var
@@ -53,12 +53,13 @@ Usage:
 """
 
 import argparse
-import io
 import json
 import sqlite3
 import sys
 import zlib
-from datetime import date, datetime, timedelta
+from bisect import bisect_right
+from collections.abc import Callable
+from datetime import date, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -66,15 +67,34 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from classification.register import UNCLASSIFIED, BusinessLabels
 from config import (
-    RETURNS_DB, FACTORS_DB, MODELS_DB, UNIVERSE_DB, RISK_DB, MODELS_REF,
-    HL_FACTOR_VAR, HL_FACTOR_CORR, HL_IDIO, NW_LAGS, VRA_WINDOW,
-    SHRINK_IDIO, EIGENFLOOR, VRA_MIN, VRA_MAX, MIN_STOCKS,
     BARRA_RETURN_CLIP,
-    BARRA_SECTORS as SECTORS,
+    EIGENFLOOR,
+    FACTORS_DB,
+    HL_FACTOR_CORR,
+    HL_FACTOR_VAR,
+    HL_IDIO,
+    MIN_STOCKS,
+    MODELS_DB,
+    MODELS_REF,
+    NW_LAGS,
+    RETURNS_DB,
+    RISK_DB,
+    SHRINK_IDIO,
+    UNIVERSE_DB,
+    VRA_MAX,
+    VRA_MIN,
+    VRA_WINDOW,
 )
+from pipeline.security_storage import ensure_analytical_schema, write_research_rows
+from securities.attributes import utc_today
+from securities.data import metadata_by_sid, returns_by_sid
 from utils import (
-    get_db, get_logger, get_computed_snapshot_dates, get_barra_layout,
+    get_barra_layout,
+    get_computed_snapshot_dates,
+    get_db,
+    get_logger,
     winsorized_zscore,
 )
 
@@ -87,19 +107,21 @@ PIT_MEMBERSHIP_INDEXES = ("russell_1000", "sp500")
 # Single source of truth: utils.get_barra_layout() reads the Barra risk-factor
 # tags from models_reference.csv (barra_risk_factor / barra_order /
 # barra_ortho_against). Layout: [market | sectors | beta | models].
-_LAYOUT       = get_barra_layout()
-FACTOR_NAMES  = _LAYOUT["factor_names"]                  # ordered K-length id vector
-MODEL_FACTORS = _LAYOUT["model_factors"]                 # [(model_id, name, ortho_against), ...]
-MODEL_IDS     = [mid for mid, _, _ in MODEL_FACTORS]
-K             = len(FACTOR_NAMES)
+_LAYOUT = get_barra_layout()
+FACTOR_NAMES = _LAYOUT["factor_names"]  # ordered K-length id vector
+MODEL_FACTORS = _LAYOUT["model_factors"]  # [(model_id, name, ortho_against), ...]
+MODEL_IDS = [mid for mid, _, _ in MODEL_FACTORS]
+K = len(FACTOR_NAMES)
+# GICS sectors, or in-house industry groups when CLASSIFICATION_SOURCE='inhouse'.
+SECTORS = _LAYOUT["sectors"]
 
 # Column-index anchors derived from the layout (no positional hardcoding).
-_ANCHORS      = _LAYOUT["anchors"]
-MARKET_IDX    = _ANCHORS["market_idx"]
-SECTOR_START  = _ANCHORS["sector_start"]
-SECTOR_END    = _ANCHORS["sector_end"]
-BETA_IDX      = _ANCHORS["beta_idx"]
-MODEL_START   = _ANCHORS["model_start"]
+_ANCHORS = _LAYOUT["anchors"]
+MARKET_IDX = _ANCHORS["market_idx"]
+SECTOR_START = _ANCHORS["sector_start"]
+SECTOR_END = _ANCHORS["sector_end"]
+BETA_IDX = _ANCHORS["beta_idx"]
+MODEL_START = _ANCHORS["model_start"]
 
 # Raw log-market-cap factor — the only non-model input: it supplies the WLS
 # weights (√mktcap, canonical Barra USE4) and the sector cap-weighted sum-to-zero
@@ -112,10 +134,10 @@ LMC_FACTOR_ID = "LMC11234"
 # NOT a Barra risk factor and NOT an ALP001 leg, so it never touches the K-factor
 # risk model or portfolio construction. Its models_reference.csv row is tagged
 # barra_risk_factor=False and Factors=EXTERNAL (create_models skips it).
-FM_MODEL_ID   = "FMOM001"
-FM_EXCLUDE    = {"MOM001"}                        # drop stock momentum to avoid double-count
-FM_STYLE      = [m for m in MODEL_IDS if m not in FM_EXCLUDE]   # derived from the layout
-FM_W6, FM_W12 = 126, 252                          # trailing windows (trading days)
+FM_MODEL_ID = "FMOM001"
+FM_EXCLUDE = {"MOM001"}  # drop stock momentum to avoid double-count
+FM_STYLE = [m for m in MODEL_IDS if m not in FM_EXCLUDE]  # derived from the layout
+FM_W6, FM_W12 = 126, 252  # trailing windows (trading days)
 
 # FMOM001 is now a LIVE leg of the ALP001 alpha composite. ALP001 must be finalised
 # here (not in create_models) because the FM leg needs the Barra factor returns this
@@ -124,11 +146,11 @@ FM_W6, FM_W12 = 126, 252                          # trailing windows (trading da
 # per-date model_value dispersion — FM is funded out of that leg's weight, so matching
 # its dispersion makes the stated 0.10 weight the effective tilt.
 ALPHA_COMPOSITE_ID = "ALP001"
-FM_SCALE_REF       = "MOM001"
+FM_SCALE_REF = "MOM001"
 
 
 # Snapshot dates from the single source of truth (universe.db snapshot_schedule,
-# factors-computed only). Shared with create_risk via utils.
+# factors-computed only). Shared via utils.
 _get_snapshot_dates = get_computed_snapshot_dates
 
 _SECTOR_IDX = {s: i for i, s in enumerate(SECTORS)}
@@ -136,53 +158,34 @@ _SECTOR_IDX = {s: i for i, s in enumerate(SECTORS)}
 
 # ── DB schema ──────────────────────────────────────────────────────────────────
 
+
 def _init_db() -> sqlite3.Connection:
     conn = sqlite3.connect(str(RISK_DB))
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS factor_returns (
-            trade_date    TEXT NOT NULL,
-            factor_id     TEXT NOT NULL,
-            factor_return REAL NOT NULL,
-            PRIMARY KEY (trade_date, factor_id)
-        );
-        CREATE TABLE IF NOT EXISTS factor_covariance (
-            snapshot_date TEXT PRIMARY KEY,
-            factor_names  TEXT NOT NULL,
-            cov_blob      BLOB NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS idiosyncratic_vars (
-            snapshot_date TEXT NOT NULL,
-            security_id   TEXT NOT NULL,
-            idio_var      REAL NOT NULL,
-            PRIMARY KEY (snapshot_date, security_id)
-        );
-        CREATE TABLE IF NOT EXISTS factor_exposures (
-            snapshot_date TEXT NOT NULL,
-            security_id   TEXT NOT NULL,
-            factor_id     TEXT NOT NULL,
-            exposure      REAL NOT NULL,
-            PRIMARY KEY (snapshot_date, security_id, factor_id)
-        );
-    """)
+    try:
+        ensure_analytical_schema(
+            conn, "factor_returns", "factor_covariance", "idiosyncratic_vars", "factor_exposures"
+        )
+    except BaseException:
+        conn.close()
+        raise
     conn.commit()
     return conn
 
 
 # ── Data loading ───────────────────────────────────────────────────────────────
 
+
 def _load_returns_wide() -> pd.DataFrame:
-    with get_db(RETURNS_DB) as conn:
-        df = pd.read_sql_query(
-            "SELECT date, isin, total_return FROM returns WHERE total_return IS NOT NULL",
-            conn, parse_dates=["date"],
-        )
+    with get_db(RETURNS_DB) as conn, get_db(UNIVERSE_DB) as master:
+        df = returns_by_sid(conn, master)
+    df["date"] = pd.to_datetime(df["date"])
     df["total_return"] = pd.to_numeric(df["total_return"], errors="coerce")
     if BARRA_RETURN_CLIP is not None and BARRA_RETURN_CLIP > 0:
         df["total_return"] = df["total_return"].clip(-BARRA_RETURN_CLIP, BARRA_RETURN_CLIP)
-    return df.pivot(index="date", columns="isin", values="total_return").sort_index()
+    return df.pivot(index="date", columns="sid", values="total_return").sort_index()
 
 
-_MKTCAP_KEY = "__mktcap__"   # reserved per-isin key carrying raw market cap
+_MKTCAP_KEY = "__mktcap__"  # reserved per-isin key carrying raw market cap
 
 
 def _load_factor_snapshots() -> dict:
@@ -199,14 +202,16 @@ def _load_factor_snapshots() -> dict:
     placeholders = ",".join("?" * len(MODEL_IDS))
     with get_db(MODELS_DB) as conn:
         mdf = pd.read_sql_query(
-            f"SELECT data_date, security_id, model_id, model_value_z "
+            f"SELECT data_date, sid AS security_id, model_id, model_value_z "
             f"FROM models WHERE model_id IN ({placeholders})",
-            conn, params=MODEL_IDS,
+            conn,
+            params=MODEL_IDS,
         )
     with get_db(FACTORS_DB) as conn:
         cap = pd.read_sql_query(
-            "SELECT data_date, security_id, factor_value FROM factors WHERE factor_id = ?",
-            conn, params=[LMC_FACTOR_ID],
+            "SELECT data_date, sid AS security_id, factor_value FROM factors WHERE factor_id = ?",
+            conn,
+            params=[LMC_FACTOR_ID],
         )
 
     # Orthogonalisation rules from the layout: {model_id: target_model_id}.
@@ -258,7 +263,7 @@ def _load_pit_membership() -> tuple[list[pd.Timestamp], dict[pd.Timestamp, set[s
     placeholders = ",".join("?" * len(PIT_MEMBERSHIP_INDEXES))
     with get_db(UNIVERSE_DB) as conn:
         df = pd.read_sql_query(
-            "SELECT snapshot_date, isin FROM universe_snapshots "
+            "SELECT snapshot_date, sid FROM universe_snapshots "
             f"WHERE index_name IN ({placeholders}) "
             "ORDER BY snapshot_date",
             conn,
@@ -271,7 +276,7 @@ def _load_pit_membership() -> tuple[list[pd.Timestamp], dict[pd.Timestamp, set[s
         )
     pit: dict[pd.Timestamp, set[str]] = {}
     for d, grp in df.groupby("snapshot_date"):
-        pit[pd.Timestamp(d)] = set(grp["isin"])
+        pit[pd.Timestamp(d)] = set(grp["sid"])
     return sorted(pit.keys()), pit
 
 
@@ -282,22 +287,82 @@ def _pit_lookup(pit_snap_dates: list[pd.Timestamp]):
     (mild look-ahead for pre-2021 dates, bounded and logged in main()).
     """
     arr = pd.DatetimeIndex(pit_snap_dates)
+
     def lookup(td: pd.Timestamp) -> pd.Timestamp:
         idx = arr.searchsorted(td, side="right") - 1
         return pit_snap_dates[max(int(idx), 0)]
+
     return lookup
 
 
-def _load_universe() -> dict:
-    """Returns {isin: gics_sector}."""
-    with get_db(UNIVERSE_DB) as conn:
-        df = pd.read_sql_query(
-            "SELECT isin, gics_sector FROM companies WHERE gics_sector IS NOT NULL", conn
+def _load_universe(*, as_of: str | None = None) -> dict:
+    """Return SID sectors in the supported GICS taxonomy, without filling gaps.
+
+    In-house mode returns industry groups; unresolved/missing SIDs are UNCLASSIFIED
+    (no sector dummy) rather than a gap.
+    """
+    with get_db(UNIVERSE_DB, read_only=True) as conn:
+        df = metadata_by_sid(conn, as_of=as_of)
+    if BusinessLabels.enabled():
+        labels = BusinessLabels().labels(as_of or utc_today(), df["sid"])
+        return dict(zip(labels["sid"], labels["industry_group"]))
+    valid = df["gics_sector"].isin(SECTORS)
+    if as_of is not None and not valid.all():
+        log.warning("%s: %d SIDs have missing/invalid PIT GICS sectors", as_of, int((~valid).sum()))
+    return dict(zip(df.loc[valid, "sid"], df.loc[valid, "gics_sector"]))
+
+
+def _require_sector_coverage(day: str, required: set, sectors: dict) -> None:
+    """Reject missing or unsupported sectors before calculations can drop names."""
+    valid = {*SECTORS, UNCLASSIFIED} if BusinessLabels.enabled() else set(SECTORS)
+    missing = {
+        sid
+        for sid in required
+        if not isinstance(sectors.get(sid), str) or sectors[sid] not in valid
+    }
+    if missing:
+        raise ValueError(
+            f"{day}: missing dated GICS sectors for {len(missing)} modeled members "
+            f"(SIDs {sorted(missing)[:10]}); missing or invalid GICS labels. "
+            "Import evidenced company_attributes_history first."
         )
-    return dict(zip(df["isin"], df["gics_sector"]))
+
+
+def _sector_lookup(
+    sectors: dict, sector_snapshots: dict[str, dict] | None
+) -> Callable[[str], dict]:
+    """Look up the sector clock independently; dated gaps never use a fallback."""
+    if sector_snapshots is None:
+        return lambda day: sectors
+    keys = sorted(sector_snapshots)
+
+    def lookup(day: str) -> dict:
+        position = bisect_right(keys, day) - 1
+        return sector_snapshots[keys[position]] if position >= 0 else {}
+
+    return lookup
+
+
+def _load_sector_timeline(start: str, end: str, seed: dict[str, dict]) -> dict[str, dict]:
+    """Load every attribute transition, including expiries and availability gaps."""
+    if BusinessLabels.enabled():
+        transitions = [(day,) for day in BusinessLabels().transition_dates(start, end)]
+    else:
+        with get_db(UNIVERSE_DB, read_only=True) as conn:
+            transitions = conn.execute(
+                "SELECT valid_from FROM company_attributes_history "
+                "UNION SELECT valid_to FROM company_attributes_history "
+                "UNION SELECT available_from FROM company_attributes_history"
+            ).fetchall()
+    dates = {start, *(day for (day,) in transitions if day is not None and start <= day <= end)}
+    timeline = dict(seed)
+    for day in sorted(dates - timeline.keys()):
+        timeline[day] = _load_universe(as_of=day)
+    return timeline
 
 
 # ── Beta computation ───────────────────────────────────────────────────────────
+
 
 def _compute_beta_60d(
     returns_wide: pd.DataFrame,
@@ -315,15 +380,14 @@ def _compute_beta_60d(
     lookup = _pit_lookup(pit_snap_dates)
     cols = list(returns_wide.columns)
     snap_masks = {
-        sd: np.fromiter((c in pit_membership[sd] for c in cols),
-                        dtype=bool, count=len(cols))
+        sd: np.fromiter((c in pit_membership[sd] for c in cols), dtype=bool, count=len(cols))
         for sd in pit_snap_dates
     }
     R = returns_wide.values
     mkt_arr = np.full(len(returns_wide), np.nan)
     for i, td in enumerate(returns_wide.index):
         mask = snap_masks[lookup(td)]
-        row  = R[i]
+        row = R[i]
         valid = mask & np.isfinite(row)
         if valid.any():
             mkt_arr[i] = float(row[valid].mean())
@@ -332,9 +396,7 @@ def _compute_beta_60d(
     betas = returns_wide.copy() * np.nan
 
     for col in returns_wide.columns:
-        combined = pd.concat(
-            [returns_wide[col].rename("s"), mkt.rename("m")], axis=1
-        ).dropna()
+        combined = pd.concat([returns_wide[col].rename("s"), mkt.rename("m")], axis=1).dropna()
         if len(combined) < 30:
             continue
         rc = combined["s"].rolling(60, min_periods=30).cov(combined["m"])
@@ -347,11 +409,12 @@ def _compute_beta_60d(
 
 # ── Exposure matrix ────────────────────────────────────────────────────────────
 
+
 def _build_day_exposure(
     isins: list,
     isin_sector: dict,
-    factor_snap: dict,   # {isin: {model_id: z_exposure, _MKTCAP_KEY: cap}}
-    beta_map: dict,      # {isin: beta_60d_value}
+    factor_snap: dict,  # {isin: {model_id: z_exposure, _MKTCAP_KEY: cap}}
+    beta_map: dict,  # {isin: beta_60d_value}
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Build exposure matrix X (N×K), WLS weight vector (N,), and per-sector
@@ -367,9 +430,10 @@ def _build_day_exposure(
       • Cap-per-sector accumulates mktcap by GICS sector → used to build the
         cap-weighted sum-to-zero constraint Σ_s w_s f_sec_s = 0.
     """
+    _require_sector_coverage("exposure matrix", set(isins), isin_sector)
     N = len(isins)
     X = np.zeros((N, K))
-    weights        = np.ones(N)
+    weights = np.ones(N)
     cap_per_sector = np.zeros(len(SECTORS))
 
     # Market intercept (every stock loads 1.0)
@@ -377,7 +441,7 @@ def _build_day_exposure(
 
     for i, isin in enumerate(isins):
         sector = isin_sector.get(isin)
-        fvals  = factor_snap.get(isin, {})
+        fvals = factor_snap.get(isin, {})
 
         # Sector dummy
         if sector in _SECTOR_IDX:
@@ -411,8 +475,12 @@ def _build_day_exposure(
 
 # ── Constrained WLS cross-sectional regression ───────────────────────────────
 
+
 def _wls_constrained(
-    r: np.ndarray, X: np.ndarray, w: np.ndarray, c: np.ndarray,
+    r: np.ndarray,
+    X: np.ndarray,
+    w: np.ndarray,
+    c: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     WLS regression r = X f + ε with weights w, subject to linear constraint c'f = 0.
@@ -444,18 +512,19 @@ def _wls_constrained(
 
     # Reduced design: substituting f[ref] = -Σ_{i in keep} (c[i]/c[ref]) f[i]
     # into Xf gives Σ_{i in keep} (X[:,i] - (c[i]/c[ref]) X[:,ref]) · f[i].
-    ratio = c[keep] / c[ref]                                      # (K-1,)
-    sw_X_red = sw_X[:, keep] - np.outer(sw_X[:, ref], ratio)      # (N, K-1)
+    ratio = c[keep] / c[ref]  # (K-1,)
+    sw_X_red = sw_X[:, keep] - np.outer(sw_X[:, ref], ratio)  # (N, K-1)
 
     f_red, _, _, _ = np.linalg.lstsq(sw_X_red, sw_r, rcond=None)
 
     f = np.empty(len(c))
     f[keep] = f_red
-    f[ref]  = -float(ratio @ f_red)
+    f[ref] = -float(ratio @ f_red)
     return f, r - X @ f
 
 
 # ── Factor covariance: split-half-life EWMA + Newey-West ────────────────────
+
 
 def _ewma_demean(F_hist: np.ndarray, hl: int) -> tuple[np.ndarray, np.ndarray]:
     """Compute EWMA weights (normalised) and weighted-demeaned residuals U."""
@@ -464,7 +533,7 @@ def _ewma_demean(F_hist: np.ndarray, hl: int) -> tuple[np.ndarray, np.ndarray]:
     w = alpha ** np.arange(T - 1, -1, -1, dtype=float)
     w /= w.sum()
     mu = w @ F_hist
-    U  = np.sqrt(w[:, None]) * (F_hist - mu)
+    U = np.sqrt(w[:, None]) * (F_hist - mu)
     return w, U
 
 
@@ -485,26 +554,26 @@ def _ewma_split_cov(F_hist: np.ndarray, hl_var: int, hl_corr: int, nw_lags: int)
     """
     # ── Variance block (short HL + NW) ──────────────────────────────────────
     _, U_v = _ewma_demean(F_hist, hl_var)
-    V_var  = U_v.T @ U_v                           # Γ₀
+    V_var = U_v.T @ U_v  # Γ₀
     for k in range(1, nw_lags + 1):
         Gk = U_v[:-k].T @ U_v[k:]
-        bf = 1.0 - k / (nw_lags + 1)               # Bartlett kernel weight
+        bf = 1.0 - k / (nw_lags + 1)  # Bartlett kernel weight
         V_var += bf * (Gk + Gk.T)
-    V_var    = (V_var + V_var.T) / 2.0
-    diag_var = np.maximum(np.diag(V_var), 1e-12)   # daily variances (NW-corrected)
+    V_var = (V_var + V_var.T) / 2.0
+    diag_var = np.maximum(np.diag(V_var), 1e-12)  # daily variances (NW-corrected)
 
     # ── Correlation block (long HL, no NW) ──────────────────────────────────
-    _, U_c    = _ewma_demean(F_hist, hl_corr)
-    V_cov_c   = U_c.T @ U_c
-    V_cov_c   = (V_cov_c + V_cov_c.T) / 2.0
-    std_c     = np.sqrt(np.maximum(np.diag(V_cov_c), 1e-12))
-    R         = V_cov_c / np.outer(std_c, std_c)
+    _, U_c = _ewma_demean(F_hist, hl_corr)
+    V_cov_c = U_c.T @ U_c
+    V_cov_c = (V_cov_c + V_cov_c.T) / 2.0
+    std_c = np.sqrt(np.maximum(np.diag(V_cov_c), 1e-12))
+    R = V_cov_c / np.outer(std_c, std_c)
     np.clip(R, -1.0, 1.0, out=R)
     np.fill_diagonal(R, 1.0)
 
     # ── Reassemble ──────────────────────────────────────────────────────────
     D_sqrt = np.sqrt(diag_var)
-    F      = R * np.outer(D_sqrt, D_sqrt)
+    F = R * np.outer(D_sqrt, D_sqrt)
     return (F + F.T) / 2.0
 
 
@@ -516,8 +585,9 @@ def _spectral_floor(M: np.ndarray) -> np.ndarray:
 
 # ── Idiosyncratic variance: EWMA + Bayesian shrinkage ─────────────────────────
 
+
 def _idio_variance(
-    eps_sq_df: pd.DataFrame,   # (T, N) DataFrame of squared residuals, NaN where missing
+    eps_sq_df: pd.DataFrame,  # (T, N) DataFrame of squared residuals, NaN where missing
     snap_ts: pd.Timestamp,
     hl: int,
     shrink: float,
@@ -558,11 +628,12 @@ def _idio_variance(
 
 # ── Volatility Regime Adjustment (split: factor B² + specific B²) ────────────
 
+
 def _vra_split(
-    f_df_pit: pd.DataFrame,       # (T_factor × K) factor returns (PIT, chronological)
-    eps_sq_pit: pd.DataFrame,     # (T_eps × N_eps) squared residuals
-    F_cov: np.ndarray,            # K×K annualised factor covariance (pre-VRA)
-    delta: dict,                  # {isin: annualised idio variance}
+    f_df_pit: pd.DataFrame,  # (T_factor × K) factor returns (PIT, chronological)
+    eps_sq_pit: pd.DataFrame,  # (T_eps × N_eps) squared residuals
+    F_cov: np.ndarray,  # K×K annualised factor covariance (pre-VRA)
+    delta: dict,  # {isin: annualised idio variance}
     window: int,
 ) -> tuple[float, float]:
     """
@@ -587,18 +658,16 @@ def _vra_split(
         B2_factor = 1.0
     else:
         f_recent = f_df_pit.iloc[-window:]
-        sigma_factor_daily = np.sqrt(np.maximum(np.diag(F_cov) / 252.0, 1e-12))   # (K,)
-        z_factor = f_recent.values / sigma_factor_daily[None, :]                  # (T, K)
-        B2_factor = float(np.nanmean(z_factor ** 2)) if np.isfinite(z_factor).any() else 1.0
+        sigma_factor_daily = np.sqrt(np.maximum(np.diag(F_cov) / 252.0, 1e-12))  # (K,)
+        z_factor = f_recent.values / sigma_factor_daily[None, :]  # (T, K)
+        B2_factor = float(np.nanmean(z_factor**2)) if np.isfinite(z_factor).any() else 1.0
 
     # ── Specific bias ───────────────────────────────────────────────────────
     if eps_sq_pit.empty or not delta:
         B2_specific = 1.0
     else:
         eps_sq_recent = eps_sq_pit.iloc[-window:]
-        delta_daily   = np.array(
-            [delta.get(c, np.nan) / 252.0 for c in eps_sq_recent.columns]
-        )
+        delta_daily = np.array([delta.get(c, np.nan) / 252.0 for c in eps_sq_recent.columns])
         with np.errstate(divide="ignore", invalid="ignore"):
             z2 = eps_sq_recent.values / delta_daily[None, :]
         B2_specific = float(np.nanmean(z2)) if np.isfinite(z2).any() else 1.0
@@ -609,12 +678,13 @@ def _vra_split(
         B2_specific = 1.0
 
     return (
-        float(np.clip(B2_factor,   VRA_MIN, VRA_MAX)),
+        float(np.clip(B2_factor, VRA_MIN, VRA_MAX)),
         float(np.clip(B2_specific, VRA_MIN, VRA_MAX)),
     )
 
 
 # ── Core computation ───────────────────────────────────────────────────────────
+
 
 def _compute_all_factor_returns(
     returns_wide: pd.DataFrame,
@@ -623,6 +693,7 @@ def _compute_all_factor_returns(
     factor_snapshots: dict,
     pit_snap_dates: list[pd.Timestamp],
     pit_membership: dict[pd.Timestamp, set[str]],
+    sector_snapshots: dict[str, dict] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Run daily WLS cross-sectional regressions for all trading days.
@@ -635,27 +706,34 @@ def _compute_all_factor_returns(
     snap_keys = sorted(factor_snapshots.keys())
     trading_days = returns_wide.index
 
-    f_data: dict   = {}   # {date_str: ndarray(K)}
+    f_data: dict = {}  # {date_str: ndarray(K)}
     eps_sq_data: dict = {}  # {date_str: {isin: eps²}}
 
     pit_lookup_fn = _pit_lookup(pit_snap_dates)
+    sectors_at = _sector_lookup(isin_sector, sector_snapshots)
 
-    log.info("Running regressions (%d trading days × %d factors) — PIT R1000 universe ...",
-             len(trading_days), K)
+    log.info(
+        "Running regressions (%d trading days × %d factors) — PIT R1000 universe ...",
+        len(trading_days),
+        K,
+    )
     for idx, td in enumerate(trading_days):
         td_str = td.strftime("%Y-%m-%d")
 
-        latest_snap = next(
-            (d for d in reversed(snap_keys) if d <= td_str), None
-        )
+        latest_snap = next((d for d in reversed(snap_keys) if d <= td_str), None)
         if latest_snap is None:
             continue
 
-        fsnap     = factor_snapshots[latest_snap]
-        day_rets  = returns_wide.loc[td].dropna()
+        fsnap = factor_snapshots[latest_snap]
+        day_sectors = sectors_at(td_str)
+        day_rets = returns_wide.loc[td].dropna()
         pit_isins = pit_membership[pit_lookup_fn(td)]
-        isins_day = [i for i in day_rets.index
-                     if i in isin_sector and i in fsnap and i in pit_isins]
+        _require_sector_coverage(
+            td_str, set(day_rets.index) & fsnap.keys() & pit_isins, day_sectors
+        )
+        isins_day = [
+            i for i in day_rets.index if i in day_sectors and i in fsnap and i in pit_isins
+        ]
 
         if len(isins_day) < MIN_STOCKS:
             continue
@@ -664,7 +742,7 @@ def _compute_all_factor_returns(
         beta_row = betas_wide.loc[td] if td in betas_wide.index else pd.Series(dtype=float)
         beta_map = beta_row.dropna().to_dict()
 
-        X_day, w_day, cap_sec = _build_day_exposure(isins_day, isin_sector, fsnap, beta_map)
+        X_day, w_day, cap_sec = _build_day_exposure(isins_day, day_sectors, fsnap, beta_map)
 
         # Build cap-weighted sum-to-zero constraint on sector factors only:
         # c is K-vector with cap weights at sector indices, 0 elsewhere.
@@ -672,8 +750,8 @@ def _compute_all_factor_returns(
         c[SECTOR_START:SECTOR_END] = cap_sec
         f_t, eps_t = _wls_constrained(r_day, X_day, w_day, c)
 
-        f_data[td_str]    = f_t
-        eps_sq_data[td_str] = {isin: e ** 2 for isin, e in zip(isins_day, eps_t)}
+        f_data[td_str] = f_t
+        eps_sq_data[td_str] = {isin: e**2 for isin, e in zip(isins_day, eps_t)}
 
         if (idx + 1) % 500 == 0:
             log.info("  ... %d/%d days", idx + 1, len(trading_days))
@@ -708,9 +786,20 @@ def _build_and_save_snapshot(
     conn: sqlite3.Connection,
     pit_snap_dates: list[pd.Timestamp],
     pit_membership: dict[pd.Timestamp, set[str]],
+    sector_snapshots: dict[str, dict] | None = None,
 ) -> None:
     """Compute full Barra model for one snapshot date and write to risk.db."""
     snap_ts = pd.Timestamp(snap_date_str)
+    snap_keys = sorted(factor_snapshots)
+    latest_snap = next((day for day in reversed(snap_keys) if day <= snap_date_str), None)
+    if latest_snap is None:
+        raise ValueError(
+            f"{snap_date_str}: no factor snapshot available on or before requested risk date"
+        )
+    fsnap_now = factor_snapshots[latest_snap]
+    isin_sector = _sector_lookup(isin_sector, sector_snapshots)(snap_date_str)
+    pit_now = pit_membership[_pit_lookup(pit_snap_dates)(snap_ts)]
+    _require_sector_coverage(snap_date_str, set(fsnap_now) & pit_now, isin_sector)
 
     def _clear_snapshot() -> None:
         conn.execute("DELETE FROM factor_covariance WHERE snapshot_date=?", (snap_date_str,))
@@ -721,10 +810,10 @@ def _build_and_save_snapshot(
     # the same-day returns are never used in the covariance estimate (look-ahead
     # bias). Historical --backfill runs respect this too, so all snapshots are
     # built consistently from T-1 data.
-    f_df_pit        = f_df[f_df.index             < snap_ts]
-    returns_pit     = returns_wide[returns_wide.index < snap_ts]
-    eps_sq_pit      = eps_sq_df[eps_sq_df.index   < snap_ts]
-    betas_pit       = betas_wide[betas_wide.index  < snap_ts]
+    f_df_pit = f_df[f_df.index < snap_ts]
+    returns_pit = returns_wide[returns_wide.index < snap_ts]
+    eps_sq_pit = eps_sq_df[eps_sq_df.index < snap_ts]
+    betas_pit = betas_wide[betas_wide.index < snap_ts]
 
     if len(f_df_pit) < 60:
         _clear_snapshot()
@@ -743,24 +832,12 @@ def _build_and_save_snapshot(
     # ── Idiosyncratic variance ───────────────────────────────────────────────
     delta = _idio_variance(eps_sq_pit, snap_ts, HL_IDIO, SHRINK_IDIO)
 
-    # ── Resolve factor snapshot and beta map for this date ───────────────────
-    snap_keys = sorted(factor_snapshots.keys())
-    latest_snap = next(
-        (d for d in reversed(snap_keys) if d <= snap_date_str), snap_keys[0]
-    )
-    fsnap_now = factor_snapshots[latest_snap]
-
     # Use the last available trading day strictly before snap_date for betas
-    beta_row = (
-        betas_pit.iloc[-1]
-        if not betas_pit.empty
-        else betas_wide.iloc[-1]
-    )
+    beta_row = betas_pit.iloc[-1] if not betas_pit.empty else betas_wide.iloc[-1]
     beta_map_now = beta_row.dropna().to_dict()
 
     # ── Split VRA: factor-bias and specific-bias ─────────────────────────────
     # PIT-filter the snapshot universe: include only stocks in R1000 at snap_date.
-    pit_now = pit_membership[_pit_lookup(pit_snap_dates)(snap_ts)]
     isins_snap = [i for i in fsnap_now if i in isin_sector and i in pit_now]
     B2_factor, B2_specific = _vra_split(f_df_pit, eps_sq_pit, F_cov, delta, VRA_WINDOW)
     if abs(B2_factor - 1.0) > 0.01 or abs(B2_specific - 1.0) > 0.01:
@@ -777,7 +854,8 @@ def _build_and_save_snapshot(
             log.warning(
                 "Assigned median idiosyncratic variance %.6f to %d exposed names "
                 "without residual history.",
-                delta_default, len(missing_delta),
+                delta_default,
+                len(missing_delta),
             )
 
     # ── Spectral floor ───────────────────────────────────────────────────────
@@ -796,8 +874,10 @@ def _build_and_save_snapshot(
 
     conn.execute("DELETE FROM idiosyncratic_vars WHERE snapshot_date=?", (snap_date_str,))
     if delta:
-        conn.executemany(
-            "INSERT INTO idiosyncratic_vars (snapshot_date, security_id, idio_var) VALUES (?,?,?)",
+        write_research_rows(
+            conn,
+            "idiosyncratic_vars",
+            ["snapshot_date", "sid", "idio_var"],
             [(snap_date_str, isin, float(v)) for isin, v in delta.items()],
         )
 
@@ -809,34 +889,40 @@ def _build_and_save_snapshot(
         if X_now[i, j] != 0.0
     ]
     if exp_rows:
-        conn.executemany(
-            "INSERT INTO factor_exposures "
-            "(snapshot_date, security_id, factor_id, exposure) VALUES (?,?,?,?)",
+        write_research_rows(
+            conn,
+            "factor_exposures",
+            ["snapshot_date", "sid", "factor_id", "exposure"],
             exp_rows,
         )
 
     conn.commit()
 
     log.info(
-        "Saved snapshot %s: F(%dx%d), δ(%d stocks), X(%dx%d), "
-        "VRA_factor=%.3f  VRA_specific=%.3f",
-        snap_date_str, K, K, len(delta), len(isins_snap), K,
-        B2_factor, B2_specific,
+        "Saved snapshot %s: F(%dx%d), δ(%d stocks), X(%dx%d), VRA_factor=%.3f  VRA_specific=%.3f",
+        snap_date_str,
+        K,
+        K,
+        len(delta),
+        len(isins_snap),
+        K,
+        B2_factor,
+        B2_specific,
     )
 
 
 # ── Snapshot date helpers ──────────────────────────────────────────────────────
 
+
 def _most_recent_friday() -> str:
     d = date.today()
-    while d.weekday() != 4:   # 4 = Friday
+    while d.weekday() != 4:  # 4 = Friday
         d -= timedelta(days=1)
     return d.strftime("%Y-%m-%d")
 
 
-
-
 # ── Main entry point ───────────────────────────────────────────────────────────
+
 
 def _compute_and_save_factor_momentum(snapshot_dates: list[str]) -> None:
     """Write the stock-level factor-momentum analysis signal to models.db.
@@ -858,21 +944,24 @@ def _compute_and_save_factor_momentum(snapshot_dates: list[str]) -> None:
     """
     if not snapshot_dates:
         return
-    log.info("Computing factor-momentum analysis signal (%s) for %d snapshot(s)...",
-             FM_MODEL_ID, len(snapshot_dates))
+    log.info(
+        "Computing factor-momentum analysis signal (%s) for %d snapshot(s)...",
+        FM_MODEL_ID,
+        len(snapshot_dates),
+    )
     ph = ",".join("?" * len(FM_STYLE))
     with get_db(RISK_DB) as rconn:
         fr = pd.read_sql_query(
             f"SELECT trade_date, factor_id, factor_return FROM factor_returns "
             f"WHERE factor_id IN ({ph})",
-            rconn, params=FM_STYLE,
+            rconn,
+            params=FM_STYLE,
         )
         if fr.empty:
             log.warning("No factor returns in risk.db — skipping factor momentum.")
             return
         fr["trade_date"] = pd.to_datetime(fr["trade_date"])
-        F = fr.pivot(index="trade_date", columns="factor_id",
-                     values="factor_return").sort_index()
+        F = fr.pivot(index="trade_date", columns="factor_id", values="factor_return").sort_index()
 
         def _rbar(snap_ts: pd.Timestamp, win: int) -> pd.Series:
             # STRICTLY before the snapshot: the snapshot day's factor return is
@@ -887,21 +976,24 @@ def _compute_and_save_factor_momentum(snapshot_dates: list[str]) -> None:
         out_rows: list[tuple] = []
         for snap in snapshot_dates:
             snap_ts = pd.Timestamp(snap)
-            rb = (0.5 * _rbar(snap_ts, FM_W6).reindex(FM_STYLE)
-                  + 0.5 * _rbar(snap_ts, FM_W12).reindex(FM_STYLE))
+            rb = 0.5 * _rbar(snap_ts, FM_W6).reindex(FM_STYLE) + 0.5 * _rbar(
+                snap_ts, FM_W12
+            ).reindex(FM_STYLE)
             if rb.isna().all():
                 log.warning("  %s: insufficient factor-return history — skipped.", snap)
                 continue
             exp = pd.read_sql_query(
-                f"SELECT security_id, factor_id, exposure FROM factor_exposures "
+                f"SELECT sid AS security_id, factor_id, exposure FROM factor_exposures "
                 f"WHERE snapshot_date = ? AND factor_id IN ({ph})",
-                rconn, params=[snap, *FM_STYLE],
+                rconn,
+                params=[snap, *FM_STYLE],
             )
             if exp.empty:
                 log.warning("  %s: no Barra exposures — skipped.", snap)
                 continue
-            X = exp.pivot(index="security_id", columns="factor_id",
-                          values="exposure").reindex(columns=FM_STYLE)
+            X = exp.pivot(index="security_id", columns="factor_id", values="exposure").reindex(
+                columns=FM_STYLE
+            )
             signal = (X * rb).sum(axis=1, min_count=1).dropna()
             if len(signal) < MIN_STOCKS:
                 log.warning("  %s: only %d names with a signal — skipped.", snap, len(signal))
@@ -909,41 +1001,48 @@ def _compute_and_save_factor_momentum(snapshot_dates: list[str]) -> None:
             zed = winsorized_zscore(signal)
             for sid, raw in signal.items():
                 zv = zed.get(sid)
-                out_rows.append((
-                    snap, FM_MODEL_ID, sid, float(raw),
-                    float(zv) if zv is not None and np.isfinite(zv) else None, 0,
-                ))
+                out_rows.append(
+                    (
+                        snap,
+                        FM_MODEL_ID,
+                        sid,
+                        float(raw),
+                        float(zv) if zv is not None and np.isfinite(zv) else None,
+                        0,
+                    )
+                )
 
     if not out_rows:
         log.warning("Factor momentum produced no rows — nothing written.")
         return
     dates_written = sorted({r[0] for r in out_rows})
     with get_db(MODELS_DB) as mconn:
-        # Defensive: models table is normally created by create_models (which runs
-        # earlier in the pipeline); create it if missing so a standalone
-        # --factor-momentum-only run cannot fail on a fresh DB.
-        mconn.execute(
-            "CREATE TABLE IF NOT EXISTS models ("
-            " data_date TEXT NOT NULL, model_id TEXT NOT NULL, security_id TEXT NOT NULL,"
-            " model_value REAL NOT NULL, model_value_z REAL,"
-            " is_composite INTEGER NOT NULL DEFAULT 0,"
-            " PRIMARY KEY (data_date, model_id, security_id))"
-        )
+        ensure_analytical_schema(mconn, "models")
         # Clear this model's rows for the rebuilt dates (drops names that left the
         # universe), then insert fresh — one atomic transaction.
         mconn.executemany(
             "DELETE FROM models WHERE model_id = ? AND data_date = ?",
             [(FM_MODEL_ID, d) for d in dates_written],
         )
-        mconn.executemany(
-            "INSERT OR REPLACE INTO models "
-            "(data_date, model_id, security_id, model_value, model_value_z, is_composite) "
-            "VALUES (?,?,?,?,?,?)",
+        write_research_rows(
+            mconn,
+            "models",
+            [
+                "data_date",
+                "model_id",
+                "sid",
+                "model_value",
+                "model_value_z",
+                "is_composite",
+            ],
             out_rows,
         )
         mconn.commit()
-    log.info("  %s factor-momentum rows written across %d snapshot(s).",
-             f"{len(out_rows):,}", len(dates_written))
+    log.info(
+        "  %s factor-momentum rows written across %d snapshot(s).",
+        f"{len(out_rows):,}",
+        len(dates_written),
+    )
 
 
 def _rebuild_alpha_with_fm(snapshot_dates: list[str]) -> None:
@@ -963,26 +1062,33 @@ def _rebuild_alpha_with_fm(snapshot_dates: list[str]) -> None:
     """
     if not snapshot_dates:
         return
-    ref  = pd.read_csv(MODELS_REF)
+    ref = pd.read_csv(MODELS_REF)
     legs = ref[ref["ModelID"] == ALPHA_COMPOSITE_ID]
     weights = {str(f): float(w) for f, w in zip(legs["Factors"], legs["Weights"])}
     if not weights:
-        log.warning("No %s legs in models_reference.csv — alpha rebuild skipped.",
-                    ALPHA_COMPOSITE_ID)
+        log.warning(
+            "No %s legs in models_reference.csv — alpha rebuild skipped.", ALPHA_COMPOSITE_ID
+        )
         return
-    total_w   = sum(weights.values())
+    total_w = sum(weights.values())
     base_legs = [m for m in weights if m != FM_MODEL_ID]
-    log.info("Finalising %s composite (incl %s leg) for %d snapshot(s)...",
-             ALPHA_COMPOSITE_ID, FM_MODEL_ID, len(snapshot_dates))
+    log.info(
+        "Finalising %s composite (incl %s leg) for %d snapshot(s)...",
+        ALPHA_COMPOSITE_ID,
+        FM_MODEL_ID,
+        len(snapshot_dates),
+    )
 
     ph_dates = ",".join("?" * len(snapshot_dates))
     with get_db(MODELS_DB) as conn:
+        ensure_analytical_schema(conn, "models")
         ph_base = ",".join("?" * len(base_legs))
         base = pd.read_sql_query(
-            f"SELECT data_date, model_id, security_id, model_value FROM models "
+            f"SELECT data_date, model_id, sid AS security_id, model_value FROM models "
             f"WHERE is_composite = 0 AND model_id IN ({ph_base}) "
             f"AND data_date IN ({ph_dates})",
-            conn, params=[*base_legs, *snapshot_dates],
+            conn,
+            params=[*base_legs, *snapshot_dates],
         )
         if base.empty:
             log.warning("No base-model rows for the requested dates — alpha rebuild skipped.")
@@ -992,17 +1098,25 @@ def _rebuild_alpha_with_fm(snapshot_dates: list[str]) -> None:
         allrows = base[["data_date", "model_id", "security_id", "model_value"]]
         if FM_MODEL_ID in weights:
             fm = pd.read_sql_query(
-                f"SELECT data_date, security_id, model_value_z FROM models "
+                f"SELECT data_date, sid AS security_id, model_value_z FROM models "
                 f"WHERE model_id = ? AND data_date IN ({ph_dates}) "
                 f"AND model_value_z IS NOT NULL",
-                conn, params=[FM_MODEL_ID, *snapshot_dates],
+                conn,
+                params=[FM_MODEL_ID, *snapshot_dates],
             )
             # FM scaled to the reference leg's per-date model_value dispersion.
-            ref_std = (base[base["model_id"] == FM_SCALE_REF]
-                       .groupby("data_date")["model_value"].std(ddof=1))
+            ref_std = (
+                base[base["model_id"] == FM_SCALE_REF]
+                .groupby("data_date")["model_value"]
+                .std(ddof=1)
+            )
             if fm.empty or ref_std.empty:
-                log.warning("No %s (or %s) rows for the dates — %s built WITHOUT the FM leg.",
-                            FM_MODEL_ID, FM_SCALE_REF, ALPHA_COMPOSITE_ID)
+                log.warning(
+                    "No %s (or %s) rows for the dates — %s built WITHOUT the FM leg.",
+                    FM_MODEL_ID,
+                    FM_SCALE_REF,
+                    ALPHA_COMPOSITE_ID,
+                )
             else:
                 fm = fm.assign(
                     model_id=FM_MODEL_ID,
@@ -1014,24 +1128,31 @@ def _rebuild_alpha_with_fm(snapshot_dates: list[str]) -> None:
         w = pd.Series(weights)
         out_rows: list[tuple] = []
         for d, g in allrows.groupby("data_date"):
-            wide = g.pivot_table(index="security_id", columns="model_id",
-                                 values="model_value", aggfunc="first")
+            wide = g.pivot_table(
+                index="security_id", columns="model_id", values="model_value", aggfunc="first"
+            )
             for m in weights:
                 if m not in wide.columns:
                     wide[m] = np.nan
             wide = wide[list(weights)]
-            valid_w = wide.notna().mul(w, axis=1).sum(axis=1)     # Σ weights of present legs
-            score   = wide.mul(w, axis=1).sum(axis=1, min_count=1)  # Σ value·weight over present
-            mv      = ((score / total_w) * (valid_w / total_w))[valid_w > 0]
+            valid_w = wide.notna().mul(w, axis=1).sum(axis=1)  # Σ weights of present legs
+            score = wide.mul(w, axis=1).sum(axis=1, min_count=1)  # Σ value·weight over present
+            mv = ((score / total_w) * (valid_w / total_w))[valid_w > 0]
             if mv.empty:
                 continue
             zed = winsorized_zscore(mv)
             for sid, raw in mv.items():
                 zv = zed.get(sid)
-                out_rows.append((
-                    d, ALPHA_COMPOSITE_ID, sid, float(raw),
-                    float(zv) if zv is not None and np.isfinite(zv) else None, 1,
-                ))
+                out_rows.append(
+                    (
+                        d,
+                        ALPHA_COMPOSITE_ID,
+                        sid,
+                        float(raw),
+                        float(zv) if zv is not None and np.isfinite(zv) else None,
+                        1,
+                    )
+                )
 
         if not out_rows:
             log.warning("Alpha rebuild produced no rows — %s left unchanged.", ALPHA_COMPOSITE_ID)
@@ -1041,35 +1162,85 @@ def _rebuild_alpha_with_fm(snapshot_dates: list[str]) -> None:
             "DELETE FROM models WHERE model_id = ? AND data_date = ?",
             [(ALPHA_COMPOSITE_ID, d) for d in dates_written],
         )
-        conn.executemany(
-            "INSERT OR REPLACE INTO models "
-            "(data_date, model_id, security_id, model_value, model_value_z, is_composite) "
-            "VALUES (?,?,?,?,?,?)",
+        write_research_rows(
+            conn,
+            "models",
+            [
+                "data_date",
+                "model_id",
+                "sid",
+                "model_value",
+                "model_value_z",
+                "is_composite",
+            ],
             out_rows,
         )
         conn.commit()
-    log.info("  %s %s rows written across %d snapshot(s).",
-             f"{len(out_rows):,}", ALPHA_COMPOSITE_ID, len(dates_written))
+    log.info(
+        "  %s %s rows written across %d snapshot(s).",
+        f"{len(out_rows):,}",
+        ALPHA_COMPOSITE_ID,
+        len(dates_written),
+    )
+
+
+def _require_single_layout(snapshot_dates: list[str]) -> None:
+    """Refuse a run that would leave risk.db with snapshots in two factor layouts.
+
+    Changing the layout (e.g. switching CLASSIFICATION_SOURCE) needs a run that
+    rebuilds every stored snapshot, i.e. --backfill over all stored dates.
+    """
+    if not Path(RISK_DB).is_file():
+        return
+    with get_db(RISK_DB, read_only=True) as conn:
+        if not conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='factor_covariance'"
+        ).fetchone():
+            return
+        stored = conn.execute(
+            "SELECT snapshot_date, factor_names FROM factor_covariance"
+        ).fetchall()
+    stale = sorted(d for d, names in stored if json.loads(names) != FACTOR_NAMES)
+    left = [d for d in stale if d not in set(snapshot_dates)]
+    if left:
+        raise ValueError(
+            f"risk.db has {len(stale)} snapshots in a different factor layout "
+            f"(e.g. {left[:3]}); this run would mix layouts. Rebuild all of them with "
+            "--backfill (and remove dates outside the schedule) or revert the layout change."
+        )
 
 
 def main(snapshot_dates: list[str]) -> None:
     log.info("=== Barra Factor Risk Model ===")
+    _require_single_layout(snapshot_dates)
 
-    log.info("Loading universe...")
-    isin_sector = _load_universe()
-    log.info("  %d companies", len(isin_sector))
+    # Production reads always use the dated sector timeline below.
+    isin_sector: dict = {}
 
     membership_label = "+".join(PIT_MEMBERSHIP_INDEXES)
     log.info("Loading PIT %s membership ...", membership_label)
     pit_snap_dates, pit_membership = _load_pit_membership()
-    log.info("  %d snapshots: %s → %s, %d unique ISINs ever in %s",
-             len(pit_snap_dates), pit_snap_dates[0].date(), pit_snap_dates[-1].date(),
-             len({i for s in pit_membership.values() for i in s}), membership_label)
+    log.info(
+        "  %d snapshots: %s → %s, %d unique ISINs ever in %s",
+        len(pit_snap_dates),
+        pit_snap_dates[0].date(),
+        pit_snap_dates[-1].date(),
+        len({i for s in pit_membership.values() for i in s}),
+        membership_label,
+    )
 
     log.info("Loading factor snapshots...")
     factor_snapshots = _load_factor_snapshots()
-    log.info("  %d snapshots, %d stock-snapshot rows",
-             len(factor_snapshots), sum(len(v) for v in factor_snapshots.values()))
+    sector_snapshots = {date: _load_universe(as_of=date) for date in factor_snapshots}
+    pit_lookup = _pit_lookup(pit_snap_dates)
+    for day, exposures in factor_snapshots.items():
+        required = set(exposures) & pit_membership[pit_lookup(pd.Timestamp(day))]
+        _require_sector_coverage(day, required, sector_snapshots[day])
+    log.info(
+        "  %d snapshots, %d stock-snapshot rows",
+        len(factor_snapshots),
+        sum(len(v) for v in factor_snapshots.values()),
+    )
 
     log.info("Loading returns...")
     returns_wide = _load_returns_wide()
@@ -1081,16 +1252,37 @@ def main(snapshot_dates: list[str]) -> None:
         log.warning(
             "Returns extend %d trading days before earliest PIT R1000 snapshot (%s); "
             "those dates use the earliest snapshot as fallback (mild look-ahead, bounded).",
-            n_pre, pit_snap_dates[0].date(),
+            n_pre,
+            pit_snap_dates[0].date(),
         )
+
+    dates = [*factor_snapshots, *snapshot_dates]
+    sector_snapshots = _load_sector_timeline(
+        min(dates), max([*dates, returns_wide.index[-1].strftime("%Y-%m-%d")]), sector_snapshots
+    )
+    sectors_at = _sector_lookup({}, sector_snapshots)
+    factor_dates = sorted(factor_snapshots)
+    for day in snapshot_dates:
+        factor_day = next((d for d in reversed(factor_dates) if d <= day), None)
+        if factor_day is None:
+            raise ValueError(
+                f"{day}: no factor snapshot available on or before requested risk date"
+            )
+        required = set(factor_snapshots[factor_day]) & pit_membership[pit_lookup(pd.Timestamp(day))]
+        _require_sector_coverage(day, required, sectors_at(day))
 
     log.info("Computing rolling 60-day betas (PIT R1000 market proxy)...")
     betas_wide = _compute_beta_60d(returns_wide, pit_snap_dates, pit_membership)
 
     log.info("Computing daily factor returns (PIT R1000 universe)...")
     f_df, eps_sq_df = _compute_all_factor_returns(
-        returns_wide, betas_wide, isin_sector, factor_snapshots,
-        pit_snap_dates, pit_membership,
+        returns_wide,
+        betas_wide,
+        isin_sector,
+        factor_snapshots,
+        pit_snap_dates,
+        pit_membership,
+        sector_snapshots,
     )
 
     conn = _init_db()
@@ -1119,15 +1311,22 @@ def main(snapshot_dates: list[str]) -> None:
     # days gap so a Friday snapshot builds when only Thursday returns are in DB.
     last_fr = f_df.index[-1].date()
     snap_dates_filtered = [
-        d for d in snapshot_dates
-        if date.fromisoformat(d) <= last_fr + timedelta(days=7)
+        d for d in snapshot_dates if date.fromisoformat(d) <= last_fr + timedelta(days=7)
     ]
     log.info("Building %d Barra snapshot(s)...", len(snap_dates_filtered))
     for snap_date_str in snap_dates_filtered:
         _build_and_save_snapshot(
-            snap_date_str, returns_wide, f_df, eps_sq_df,
-            factor_snapshots, isin_sector, betas_wide, conn,
-            pit_snap_dates, pit_membership,
+            snap_date_str,
+            returns_wide,
+            f_df,
+            eps_sq_df,
+            factor_snapshots,
+            isin_sector,
+            betas_wide,
+            conn,
+            pit_snap_dates,
+            pit_membership,
+            sector_snapshots,
         )
 
     conn.close()
@@ -1147,25 +1346,34 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Build Barra-equivalent factor risk model.")
     grp = parser.add_mutually_exclusive_group()
     grp.add_argument(
-        "--backfill", action="store_true",
+        "--backfill",
+        action="store_true",
         help="Compute snapshots for all dates in factors.db snapshot_dates table.",
     )
     grp.add_argument(
-        "--date", metavar="YYYY-MM-DD", action="append", dest="dates",
+        "--date",
+        metavar="YYYY-MM-DD",
+        action="append",
+        dest="dates",
         help="Compute a snapshot for the given date (repeatable: --date D1 --date D2).",
     )
     grp.add_argument(
-        "--factor-momentum-only", action="store_true", dest="fm_only",
+        "--factor-momentum-only",
+        action="store_true",
+        dest="fm_only",
         help="(Re)compute ONLY the factor-momentum analysis signal (FMOM001) from the "
-             "existing risk.db for all Barra snapshots, without rebuilding the risk model.",
+        "existing risk.db for all Barra snapshots, without rebuilding the risk model.",
     )
     args = parser.parse_args()
 
     if args.fm_only:
         with get_db(RISK_DB) as rconn:
-            fm_dates = [r[0] for r in rconn.execute(
-                "SELECT DISTINCT snapshot_date FROM factor_exposures ORDER BY snapshot_date"
-            ).fetchall()]
+            fm_dates = [
+                r[0]
+                for r in rconn.execute(
+                    "SELECT DISTINCT snapshot_date FROM factor_exposures ORDER BY snapshot_date"
+                ).fetchall()
+            ]
         if not fm_dates:
             log.error("No Barra snapshots in risk.db — run --backfill first.")
             sys.exit(1)

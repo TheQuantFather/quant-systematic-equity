@@ -23,31 +23,48 @@ Run order:
 """
 
 import argparse
+import binascii
 import sqlite3
 import sys
+import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import pandas as pd
 from dateutil.relativedelta import relativedelta
-from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config import (
-    UNIVERSE_DB, CONSTITUENTS_DB, RETURNS_DB, FACTORS_DB,
-    FACTORS_REF, CONSTITUENTS_REF,
+    CONCEPT_MAP_XLSX,
+    CONSTITUENTS_DB,
+    CONSTITUENTS_REF,
+    FACTORS_DB,
+    FACTORS_REF,
+    RETURNS_DB,
+    UNIVERSE_DB,
+)
+from pipeline.security_storage import atomic_write, ensure_analytical_schema, write_research_rows
+from securities.data import observations_by_sid, price_observations_by_sid
+from utils import (
+    ALLOWED_FACTOR_SECTORS as _ALLOWED_FACTOR_SECTORS,
 )
 from utils import (
-    classify_sector, get_db, get_logger, winsorized_zscore,
-    get_snapshot_schedule, mark_snapshot_computed,
-    ALLOWED_FACTOR_SECTORS as _ALLOWED_FACTOR_SECTORS,
+    get_db,
+    get_logger,
+    get_snapshot_schedule,
+    isin_to_sid_map,
+    mark_snapshot_computed,
+    winsorized_zscore,
 )
 
 log = get_logger("create_factors")
 
-_PERIOD_ORDER = {'Q1': 1, 'Q2': 2, 'Q3': 3, 'Q4': 4}
+_PERIOD_ORDER = {"Q1": 1, "Q2": 2, "Q3": 3, "Q4": 4}
 FACTOR_UNIVERSE_INDEXES = ("russell_1000", "sp500")
 
 
@@ -55,22 +72,22 @@ FACTOR_UNIVERSE_INDEXES = ("russell_1000", "sp500")
 # Data loading
 # ---------------------------------------------------------------------------
 
-def load_universe() -> dict:
-    """Returns {isin (str): {company_name, simfin_sector, simfin_industry, sector_type, ticker}} for all companies."""
+
+def load_universe(as_of: str | None = None) -> dict:
+    """Factor metadata from the authoritative history at the requested date."""
+    from securities.data import metadata_by_sid
+
     with get_db(UNIVERSE_DB) as conn:
-        rows = conn.execute(
-            "SELECT isin, company_name, simfin_sector, simfin_industry, ticker "
-            "FROM companies"
-        ).fetchall()
-    log.info("Universe: %s companies", f"{len(rows):,}")
+        frame = metadata_by_sid(conn, as_of=as_of)
     universe = {}
-    for isin, company_name, sector, industry, ticker in rows:
-        universe[isin] = {
-            'company_name': company_name,
-            'industry':     industry,
-            'sector':       sector,
-            'sector_type':  classify_sector(sector, industry),
-            'ticker':       ticker or '',
+    for row in frame.dropna(subset="isin").itertuples():
+        universe[int(row.sid)] = {
+            "isin": row.isin,
+            "company_name": row.company_name,
+            "industry": row.simfin_industry,
+            "sector": row.simfin_sector,
+            "sector_type": row.sector_type,
+            "ticker": row.ticker if pd.notna(row.ticker) else "",
         }
     return universe
 
@@ -78,7 +95,9 @@ def load_universe() -> dict:
 def load_ticker_map() -> dict:
     """Returns {isin (str): ticker (str)} from universe.db."""
     with get_db(UNIVERSE_DB) as conn:
-        rows = conn.execute("SELECT isin, ticker FROM companies WHERE ticker IS NOT NULL").fetchall()
+        rows = conn.execute(
+            "SELECT isin, ticker FROM companies WHERE ticker IS NOT NULL"
+        ).fetchall()
     return {isin: ticker for isin, ticker in rows if ticker}
 
 
@@ -88,7 +107,7 @@ def load_snapshot_isins(snapshot: date) -> set | None:
     universe_snapshots date on or before `snapshot`. Returns None if the table
     is empty (fallback: use all companies in the companies table).
     """
-    date_str = snapshot.strftime('%Y-%m-%d')
+    date_str = snapshot.strftime("%Y-%m-%d")
     out: set[str] = set()
     sources: dict[str, str] = {}
     with get_db(UNIVERSE_DB) as conn:
@@ -122,8 +141,12 @@ def load_snapshot_isins(snapshot: date) -> set | None:
 
     if any(src != date_str for src in sources.values()):
         src_txt = ", ".join(f"{idx}={src}" for idx, src in sorted(sources.items()))
-        log.info("No exact factor-universe snapshot for %s — using %s (%s companies)",
-                 date_str, src_txt, f"{len(out):,}")
+        log.info(
+            "No exact factor-universe snapshot for %s — using %s (%s companies)",
+            date_str,
+            src_txt,
+            f"{len(out):,}",
+        )
     return out
 
 
@@ -147,13 +170,13 @@ def _fix_ytd_quarters(data: dict, name_to_kind: dict[str, str]) -> int:
     for sid_data in data.values():
         years = {fy for (fy, _) in sid_data}
         for fy in years:
-            q1_dict = sid_data.get((fy, 'Q1'), {})
-            q2_dict = sid_data.get((fy, 'Q2'))
-            q3_dict = sid_data.get((fy, 'Q3'))
+            q1_dict = sid_data.get((fy, "Q1"), {})
+            q2_dict = sid_data.get((fy, "Q2"))
+            q3_dict = sid_data.get((fy, "Q3"))
             if not q2_dict:
                 continue
             for name in list(q2_dict):
-                if name.startswith('_') or name_to_kind.get(name) != 'Flow':
+                if name.startswith("_") or name_to_kind.get(name) != "Flow":
                     continue
                 v1 = q1_dict.get(name)
                 v2 = q2_dict.get(name)
@@ -173,20 +196,22 @@ def _fix_ytd_quarters(data: dict, name_to_kind: dict[str, str]) -> int:
 
 def _dedup_constituent_rows(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Keep one row per mapped PIT constituent key.
+    Keep one row per PIT constituent key (keyed by security_id = sid).
 
-    Native ISIN rows are preferred over legacy rows mapped from SimFin IDs; within
-    the same source priority, the EARLIEST publish_date wins — the original filing
-    date when a figure first became public. A 10-Q/10-K reprints prior-period
-    figures as comparative columns (e.g. Q2-2020 reappears in the Q2-2021 10-Q,
-    stamped a year later); keeping the latest date would wrongly defer that figure's
-    PIT availability by a year. We do not track restatements, so original-as-reported
-    is exactly the point-in-time value we want.
+    The EARLIEST publish_date wins — the original filing date when a figure first
+    became public. A 10-Q/10-K reprints prior-period figures as comparative columns
+    (e.g. Q2-2020 reappears in the Q2-2021 10-Q, stamped a year later); keeping the
+    latest date would wrongly defer that figure's PIT availability by a year. We do
+    not track restatements, so original-as-reported is the point-in-time value we
+    want. Among same-publish rows (the re-ISIN fan-out: one filing written under both
+    the old and new ISIN of one security) the latest update_date wins — the most
+    recent extraction of the same figure.
     """
-    return (df.sort_values(['source_priority', 'publish_date'], ascending=[True, False])
-              .groupby(['security_id', 'constituent_id', 'fiscal_year', 'fiscal_period'],
-                       as_index=False)
-              .last())
+    return (
+        df.sort_values(["publish_date", "update_date"], ascending=[False, True])
+        .groupby(["security_id", "constituent_id", "fiscal_year", "fiscal_period"], as_index=False)
+        .last()
+    )
 
 
 def _q4_inputs_available_before_annual(
@@ -197,10 +222,14 @@ def _q4_inputs_available_before_annual(
     annual_publish_date: pd.Timestamp,
 ) -> bool:
     """Return True when this constituent's Q1-Q3 values predate the annual."""
-    q1_pub = q1.get('_publish_by_name', {}).get(name, pd.Timestamp.max)
-    q2_pub = q2.get('_publish_by_name', {}).get(name, pd.Timestamp.max)
-    q3_pub = q3.get('_publish_by_name', {}).get(name, pd.Timestamp.max)
-    return q1_pub <= annual_publish_date and q2_pub <= annual_publish_date and q3_pub <= annual_publish_date
+    q1_pub = q1.get("_publish_by_name", {}).get(name, pd.Timestamp.max)
+    q2_pub = q2.get("_publish_by_name", {}).get(name, pd.Timestamp.max)
+    q3_pub = q3.get("_publish_by_name", {}).get(name, pd.Timestamp.max)
+    return (
+        q1_pub <= annual_publish_date
+        and q2_pub <= annual_publish_date
+        and q3_pub <= annual_publish_date
+    )
 
 
 def _load_security_data_starts(conn_u: sqlite3.Connection) -> dict[str, pd.Timestamp]:
@@ -228,10 +257,18 @@ def _apply_security_data_starts(
     """Drop rows before a security's current-issuer data start date."""
     if not data_starts or df.empty:
         return df
-    report_dates = pd.to_datetime(df['report_date'], errors='coerce')
-    min_dates = df['security_id'].map(data_starts)
+    report_dates = pd.to_datetime(df["report_date"], errors="coerce")
+    min_dates = df["security_id"].map(data_starts)
     keep = min_dates.isna() | (report_dates >= min_dates)
     return df[keep].copy()
+
+
+def _outstanding_share_source_ids() -> set[str]:
+    df = pd.read_excel(CONCEPT_MAP_XLSX, sheet_name="Balance Sheet")
+    if "share_basis" not in df:
+        return set()
+    names = df.loc[df.share_basis.eq("outstanding"), "standard_concept"].dropna()
+    return {format(binascii.crc32(str(name).encode()) & 0xFFFFFFFF, "08X") for name in names}
 
 
 def load_constituent_data() -> dict:
@@ -264,49 +301,40 @@ def load_constituent_data() -> dict:
     most-recent annual period as the full LTM rather than summing multiple years.
     """
     ref = pd.read_csv(CONSTITUENTS_REF)
-    id_to_name   = dict(zip(ref['constituent_id'], ref['constituent_name']))
-    id_to_kind   = dict(zip(ref['constituent_id'], ref['data_kind']))
-    name_to_kind = dict(zip(ref['constituent_name'], ref['data_kind']))
+    id_to_name = dict(zip(ref["constituent_id"], ref["constituent_name"]))
+    id_to_kind = dict(zip(ref["constituent_id"], ref["data_kind"]))
+    name_to_kind = dict(zip(ref["constituent_name"], ref["data_kind"]))
 
-    # Build simfin_id → isin mapping and universe ISIN set from universe.db
+    # constituents rows are keyed by sid; resolve each snapshot member ISIN to its
+    # stable security_id via the master. Both the old and new ISIN of a re-ISIN'd
+    # security share one sid, so reading by sid collapses the duplicate series.
     with get_db(UNIVERSE_DB) as conn_u:
-        id_map = pd.read_sql_query(
-            "SELECT CAST(simfin_id AS TEXT) AS simfin_id, isin FROM companies "
-            "WHERE simfin_id IS NOT NULL",
-            conn_u,
-        )
-        all_isins = set(
-            r[0] for r in conn_u.execute("SELECT isin FROM companies WHERE isin IS NOT NULL").fetchall()
-        )
-        data_starts = _load_security_data_starts(conn_u)
-    simfin_to_isin = dict(zip(id_map['simfin_id'], id_map['isin']))
-
-    def _map_sid(sid: str) -> Optional[str]:
-        return simfin_to_isin.get(sid) or (sid if sid in all_isins else None)
+        isin_sid = isin_to_sid_map(conn_u)
+        data_starts_isin = _load_security_data_starts(conn_u)
+    # data starts are keyed by ISIN; collapse to sid (earliest start across its ISINs).
+    data_starts: dict[int, pd.Timestamp] = {}
+    for isin, ts in data_starts_isin.items():
+        sid = isin_sid.get(isin)
+        if sid is not None and (sid not in data_starts or ts < data_starts[sid]):
+            data_starts[sid] = ts
 
     def _load_and_clean(query: str, conn) -> pd.DataFrame:
         df = pd.read_sql_query(query, conn)
-        df['original_security_id'] = df['security_id'].astype(str)
-        # Native ISIN rows are EDGAR/current-source rows. Legacy SimFin rows are
-        # mapped from simfin_id to ISIN below and can use different fiscal-year
-        # labels for Jan/Feb FYE companies. When both sources collide on the same
-        # mapped key, prefer native ISIN data; within a source, latest publish wins.
-        df['source_priority'] = df['original_security_id'].isin(all_isins).astype(int)
-        df['constituent_name'] = df['constituent_id'].map(id_to_name)
-        df['data_kind']        = df['constituent_id'].map(id_to_kind)
-        df = df.dropna(subset=['constituent_name'])
-        df['security_id'] = df['original_security_id'].apply(_map_sid)
-        df = df.dropna(subset=['security_id'])
-        df['fiscal_year']  = df['fiscal_year'].astype(int)
-        df['publish_date'] = pd.to_datetime(df['publish_date'])
+        df["constituent_name"] = df["constituent_id"].map(id_to_name)
+        df["data_kind"] = df["constituent_id"].map(id_to_kind)
+        df = df.dropna(subset=["constituent_name", "sid"])
+        df = df.rename(columns={"sid": "security_id"})
+        df["security_id"] = df["security_id"].astype(int)
+        df["fiscal_year"] = df["fiscal_year"].astype(int)
+        df["publish_date"] = pd.to_datetime(df["publish_date"])
         df = _apply_security_data_starts(df, data_starts)
         return df
 
     with get_db(CONSTITUENTS_DB) as conn:
-        # Primary: quarterly rows (Q1–Q4) — covers SimFin + EDGAR 10-Q
+        # Primary: quarterly rows (Q1–Q4) from EDGAR 10-Q
         df_q = _load_and_clean(
-            "SELECT security_id, constituent_id, constituent_value, "
-            "       fiscal_year, fiscal_period, publish_date, report_date "
+            "SELECT sid, constituent_id, constituent_value, "
+            "       fiscal_year, fiscal_period, publish_date, report_date, update_date, standard_concept_id "
             "FROM constituents "
             "WHERE fiscal_period IN ('Q1','Q2','Q3','Q4') "
             "  AND publish_date IS NOT NULL",
@@ -315,8 +343,8 @@ def load_constituent_data() -> dict:
         # Annual: income + cashflow stored as FY from EDGAR 10-K
         # Balance sheet rows from 10-K are already stored as Q4 — not needed here.
         df_fy = _load_and_clean(
-            "SELECT security_id, constituent_id, constituent_value, "
-            "       fiscal_year, fiscal_period, publish_date, report_date "
+            "SELECT sid, constituent_id, constituent_value, "
+            "       fiscal_year, fiscal_period, publish_date, report_date, update_date, standard_concept_id "
             "FROM constituents "
             "WHERE fiscal_period = 'FY' "
             "  AND statement_type IN ('Income Statement', 'Cash Flow Statement') "
@@ -324,29 +352,63 @@ def load_constituent_data() -> dict:
             conn,
         )
 
-    df_q  = _dedup_constituent_rows(df_q)
+    share_sources = _outstanding_share_source_ids()
+    verified_share_observations = {
+        (
+            int(row.security_id),
+            int(row.fiscal_year),
+            row.fiscal_period,
+            str(row.publish_date)[:10],
+            float(row.constituent_value),
+        ): row.report_date
+        for row in df_q.itertuples(index=False)
+        if row.constituent_name == "Shares (Basic)"
+        and row.standard_concept_id in share_sources
+        and pd.notna(row.report_date)
+        and pd.notna(row.constituent_value)
+    }
+
+    df_q = _dedup_constituent_rows(df_q)
     df_fy = _dedup_constituent_rows(df_fy)
 
-    df_q['sort_key'] = df_q['fiscal_year'] * 10 + df_q['fiscal_period'].map(_PERIOD_ORDER)
+    df_q["sort_key"] = df_q["fiscal_year"] * 10 + df_q["fiscal_period"].map(_PERIOD_ORDER)
 
     data: dict = {}
     for row in df_q.itertuples(index=False):
         sid = row.security_id
         key = (row.fiscal_year, row.fiscal_period)
-        bucket = data.setdefault(sid, {}).setdefault(key, {
-            '_publish_date': row.publish_date,
-            '_sort_key':     row.sort_key,
-            '_publish_by_name': {},
-        })
-        if row.publish_date > bucket['_publish_date']:
-            bucket['_publish_date'] = row.publish_date
+        bucket = data.setdefault(sid, {}).setdefault(
+            key,
+            {
+                "_publish_date": row.publish_date,
+                "_sort_key": row.sort_key,
+                "_publish_by_name": {},
+            },
+        )
+        if row.publish_date > bucket["_publish_date"]:
+            bucket["_publish_date"] = row.publish_date
         bucket[row.constituent_name] = row.constituent_value
-        bucket['_publish_by_name'][row.constituent_name] = row.publish_date
+        if row.constituent_name == "Shares (Basic)":
+            observed = verified_share_observations.get(
+                (
+                    int(row.security_id),
+                    int(row.fiscal_year),
+                    row.fiscal_period,
+                    str(row.publish_date)[:10],
+                    float(row.constituent_value),
+                )
+            )
+            if observed is not None:
+                bucket["_shares_observation_date"] = pd.Timestamp(observed)
+        bucket["_publish_by_name"][row.constituent_name] = row.publish_date
 
     # Fix YTD-cumulative quarterly values before Q4 derivation (order matters).
     ytd_fixed = _fix_ytd_quarters(data, name_to_kind)
     if ytd_fixed:
-        log.info("[YTD fix] decomposed %s Q2/Q3 Flow values from cumulative to standalone", f"{ytd_fixed:,}")
+        log.info(
+            "[YTD fix] decomposed %s Q2/Q3 Flow values from cumulative to standalone",
+            f"{ytd_fixed:,}",
+        )
 
     # Derive Q4 standalone for companies where Q4 income/cashflow is absent.
     # Q4 = FY − Q1 − Q2 − Q3 (exact accounting identity for Flow items).
@@ -354,19 +416,19 @@ def load_constituent_data() -> dict:
     derived_q4 = 0
     for row in df_fy.itertuples(index=False):
         sid = row.security_id
-        fy  = row.fiscal_year
+        fy = row.fiscal_year
         if sid not in data:
             continue
         sid_data = data[sid]
         name = row.constituent_name
-        if id_to_kind.get(row.constituent_id) != 'Flow':
+        if id_to_kind.get(row.constituent_id) != "Flow":
             continue  # Stock items not applicable
-        q4_key = (fy, 'Q4')
+        q4_key = (fy, "Q4")
         if name in sid_data.get(q4_key, {}):
             continue  # this specific Flow constituent already in Q4 bucket
-        q1 = sid_data.get((fy, 'Q1'), {})
-        q2 = sid_data.get((fy, 'Q2'), {})
-        q3 = sid_data.get((fy, 'Q3'), {})
+        q1 = sid_data.get((fy, "Q1"), {})
+        q2 = sid_data.get((fy, "Q2"), {})
+        q3 = sid_data.get((fy, "Q3"), {})
         if not (q1 and q2 and q3):
             continue  # can't derive Q4 without all three prior quarters
         v1 = q1.get(name)
@@ -389,20 +451,25 @@ def load_constituent_data() -> dict:
             continue
 
         q4_val = row.constituent_value - v1 - v2 - v3
-        q4_sort = fy * 10 + _PERIOD_ORDER['Q4']
-        bucket = sid_data.setdefault(q4_key, {
-            '_publish_date': row.publish_date,
-            '_sort_key':     q4_sort,
-            '_publish_by_name': {},
-        })
-        if row.publish_date > bucket['_publish_date']:
-            bucket['_publish_date'] = row.publish_date
+        q4_sort = fy * 10 + _PERIOD_ORDER["Q4"]
+        bucket = sid_data.setdefault(
+            q4_key,
+            {
+                "_publish_date": row.publish_date,
+                "_sort_key": q4_sort,
+                "_publish_by_name": {},
+            },
+        )
+        if row.publish_date > bucket["_publish_date"]:
+            bucket["_publish_date"] = row.publish_date
         bucket[name] = q4_val
-        bucket['_publish_by_name'][name] = row.publish_date
+        bucket["_publish_by_name"][name] = row.publish_date
         derived_q4 += 1
 
     if derived_q4:
-        log.info("[Q4 derivation] derived %s Q4 Flow values from FY − (Q1+Q2+Q3)", f"{derived_q4:,}")
+        log.info(
+            "[Q4 derivation] derived %s Q4 Flow values from FY − (Q1+Q2+Q3)", f"{derived_q4:,}"
+        )
 
     # Annual-only filers: companies whose income/cash-flow is stored only as
     # fiscal_period='FY' (no Q1/Q2/Q3 quarterly breakdown — e.g. SimFin
@@ -416,40 +483,40 @@ def load_constituent_data() -> dict:
     # only annual coverage for older years (mixing would overstate LTM by
     # summing an annual Q4 bucket together with quarterly periods).
     annual_only_sids = {
-        sid for sid, qdata in data.items()
-        if not any(fp in ('Q1', 'Q2', 'Q3') for (_, fp) in qdata)
+        sid for sid, qdata in data.items() if not any(fp in ("Q1", "Q2", "Q3") for (_, fp) in qdata)
     }
     annual_direct = 0
     for row in df_fy.itertuples(index=False):
-        sid  = row.security_id
-        fy   = row.fiscal_year
+        sid = row.security_id
+        fy = row.fiscal_year
         name = row.constituent_name
-        if id_to_kind.get(row.constituent_id) != 'Flow':
+        if id_to_kind.get(row.constituent_id) != "Flow":
             continue
         if sid not in annual_only_sids:
             continue
         sid_data = data[sid]
         # Skip if this specific Flow constituent already present in Q4
-        if sid_data.get((fy, 'Q4'), {}).get(name) is not None:
+        if sid_data.get((fy, "Q4"), {}).get(name) is not None:
             continue
-        q4_key = (fy, 'Q4')
+        q4_key = (fy, "Q4")
         if q4_key not in sid_data:
             continue  # no balance-sheet anchor year — skip
         bucket = sid_data[q4_key]
         bucket[name] = row.constituent_value
-        bucket.setdefault('_publish_by_name', {})[name] = row.publish_date
-        if row.publish_date > bucket['_publish_date']:
-            bucket['_publish_date'] = row.publish_date
+        bucket.setdefault("_publish_by_name", {})[name] = row.publish_date
+        if row.publish_date > bucket["_publish_date"]:
+            bucket["_publish_date"] = row.publish_date
         annual_direct += 1
 
     if annual_direct:
-        log.info("[annual-only] assigned %s FY Flow values to Q4 for annual-only filers", f"{annual_direct:,}")
+        log.info(
+            "[annual-only] assigned %s FY Flow values to Q4 for annual-only filers",
+            f"{annual_direct:,}",
+        )
 
-    # Price-anchor the share-unit check: split history keeps real splits (e.g.
-    # CMG's 50:1) from looking like unit errors; latest closes resolve which
-    # share scale yields a plausible market cap (handles reverse mergers like QXO).
+    # Source loaders resolve once; retain their established selection and split basis.
     _fix_shares_units(data, load_splits(), _load_latest_closes())
-    log.info("Loaded quarterly constituent data for %s companies", f"{len(data):,}")
+    log.info("Loaded quarterly constituent data for %s securities", f"{len(data):,}")
     return data
 
 
@@ -459,14 +526,14 @@ def load_constituent_data() -> dict:
 # $1–5B name lands in the same market-cap zone as a real mega-cap (NVDA ~$5T) —
 # the share-count ceiling disambiguates (real names never carry tens of billions
 # of shares the way an inflated count does).
-_MCAP_BAND_LO = 1e7       # $10M   — below any name in this universe
-_MCAP_BAND_HI = 1e13      # $10T   — above the largest mega-cap, with headroom
-_MAX_PLAUSIBLE_SHARES = 5e10   # 50B shares — NVDA ~24B is the realistic ceiling
+_MCAP_BAND_LO = 1e7  # $10M   — below any name in this universe
+_MCAP_BAND_HI = 1e13  # $10T   — above the largest mega-cap, with headroom
+_MAX_PLAUSIBLE_SHARES = 5e10  # 50B shares — NVDA ~24B is the realistic ceiling
 _SHARE_UNIT_POWERS = (-6, -3, 3, 6)
 
 
 def _load_latest_closes() -> dict:
-    """{isin: latest close} from returns.db — used to price-anchor share-unit checks."""
+    """{sid: latest close} from returns.db — used to price-anchor share-unit checks."""
     if not RETURNS_DB.exists():
         return {}
     with get_db(RETURNS_DB) as conn:
@@ -477,7 +544,10 @@ def _load_latest_closes() -> dict:
             "  FROM returns WHERE close > 0"
             ") WHERE rn = 1"
         ).fetchall()
-    return {isin: close for isin, close in rows}
+    # Preserve the existing source-alias precedence of this coarse unit check.
+    mapping = isin_to_sid_map()
+    raw = dict(rows)
+    return {mapping[isin]: close for isin, close in raw.items() if isin in mapping}
 
 
 def _fix_shares_units(
@@ -510,7 +580,7 @@ def _fix_shares_units(
     check, so a real split (e.g. CMG 50:1) is never seen as a unit error. The
     correction is applied to the raw stored value (the unit error lives there).
     """
-    shares_key = 'Shares (Basic)'
+    shares_key = "Shares (Basic)"
     splits = splits or {}
     latest_closes = latest_closes or {}
     center_log = float(np.log10(np.sqrt(_MCAP_BAND_LO * _MCAP_BAND_HI)))
@@ -521,28 +591,29 @@ def _fix_shares_units(
             continue
         sid_splits = splits.get(sid, ())
         for qdict in quarters.values():
+            if qdict.get("_shares_observation_date") is not None:
+                continue
             raw = qdict.get(shares_key)
             if not (raw and raw > 0):
                 continue
-            asof = qdict.get('_publish_date')
+            asof = qdict.get("_shares_observation_date") or qdict.get("_publish_date")
             norm_factor = 1.0
             for split_date, ratio in sid_splits:
                 if asof is not None and split_date > asof:
                     norm_factor *= ratio
             norm = raw * norm_factor
-            if (_MCAP_BAND_LO <= norm * price <= _MCAP_BAND_HI
-                    and norm <= _MAX_PLAUSIBLE_SHARES):
+            if _MCAP_BAND_LO <= norm * price <= _MCAP_BAND_HI and norm <= _MAX_PLAUSIBLE_SHARES:
                 continue  # already plausible — keep stored value
             inbounds = [
-                (p, norm * (10 ** p) * price)
+                (p, norm * (10**p) * price)
                 for p in _SHARE_UNIT_POWERS
-                if _MCAP_BAND_LO <= norm * (10 ** p) * price <= _MCAP_BAND_HI
-                and norm * (10 ** p) <= _MAX_PLAUSIBLE_SHARES
+                if _MCAP_BAND_LO <= norm * (10**p) * price <= _MCAP_BAND_HI
+                and norm * (10**p) <= _MAX_PLAUSIBLE_SHARES
             ]
             if not inbounds:
                 continue  # no clean factor fits — don't guess
             power = min(inbounds, key=lambda pm: abs(np.log10(pm[1]) - center_log))[0]
-            qdict[shares_key] = raw * (10 ** power)
+            qdict[shares_key] = raw * (10**power)
             fixed += 1
     if fixed:
         log.info("[shares fix] price-anchored correction of %d Shares (Basic) values", fixed)
@@ -551,21 +622,27 @@ def _fix_shares_units(
 def load_kind_map() -> dict:
     """Returns {constituent_name: data_kind} — 'Stock' (balance sheet) or 'Flow' (income/CF)."""
     ref = pd.read_csv(CONSTITUENTS_REF)
-    return dict(zip(ref['constituent_name'], ref['data_kind']))
+    return dict(zip(ref["constituent_name"], ref["data_kind"]))
 
 
 def load_svr_data() -> dict:
     """
-    Returns {isin: (dates_np, svr_np)} from svr_daily in returns.db.
+    Returns one selected daily SVR series per integer SID.
     dates_np is datetime64[ns], svr_np is float64. Both sorted ascending by date.
+    FINRA facilities are already aggregated in the raw source. Same-security
+    ISIN aliases are alternative observations, never additional volume or days.
+    Distinct share classes retain their own SIDs and series.
     Returns empty dict if table doesn't exist or returns.db is missing.
     """
     if not RETURNS_DB.exists():
         return {}
     with get_db(RETURNS_DB) as conn:
-        tables = [r[0] for r in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='svr_daily'"
-        ).fetchall()]
+        tables = [
+            r[0]
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='svr_daily'"
+            ).fetchall()
+        ]
         if not tables:
             return {}
         df = pd.read_sql_query(
@@ -574,28 +651,35 @@ def load_svr_data() -> dict:
         )
     if df.empty:
         return {}
+    with get_db(UNIVERSE_DB) as master:
+        df = observations_by_sid(df, master)
     df["date"] = pd.to_datetime(df["date"])
     result: dict = {}
-    for isin, grp in df.groupby("isin", sort=False):
+    for sid, grp in df.groupby("sid", sort=False):
         grp = grp.sort_values("date")
-        result[isin] = (grp["date"].values, grp["svr"].values.astype(np.float64))
-    log.info("Loaded SVR data for %s ISINs", f"{len(result):,}")
+        result[sid] = (grp["date"].values, grp["svr"].values.astype(np.float64))
+    log.info("Loaded SVR data for %s SIDs", f"{len(result):,}")
     return result
 
 
 def load_short_interest_data() -> dict:
     """
-    Returns {isin: (settlement_dates_np, days_to_cover_np)} from the semi-monthly
+    Returns {sid: (settlement_dates_np, days_to_cover_np)} from the semi-monthly
     short_interest table in returns.db. Both arrays sorted ascending by date.
     Distinct from load_svr_data: this is settlement-date short *interest* (shares
     short / ADV), not daily short *volume*. Empty dict if table/DB absent.
+    Select one source observation per SID/settlement; alias fan-out must never
+    sum positions, ADV or days-to-cover. Publication lag is applied at use time.
     """
     if not RETURNS_DB.exists():
         return {}
     with get_db(RETURNS_DB) as conn:
-        tables = [r[0] for r in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='short_interest'"
-        ).fetchall()]
+        tables = [
+            r[0]
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='short_interest'"
+            ).fetchall()
+        ]
         if not tables:
             return {}
         df = pd.read_sql_query(
@@ -605,44 +689,44 @@ def load_short_interest_data() -> dict:
         )
     if df.empty:
         return {}
+    with get_db(UNIVERSE_DB) as master:
+        df = observations_by_sid(df, master, date_column="settlement_date")
     df["settlement_date"] = pd.to_datetime(df["settlement_date"])
     result: dict = {}
-    for isin, grp in df.groupby("isin", sort=False):
+    for sid, grp in df.groupby("sid", sort=False):
         grp = grp.sort_values("settlement_date")
-        result[isin] = (grp["settlement_date"].values,
-                        grp["days_to_cover"].values.astype(np.float64))
-    log.info("Loaded short-interest data for %s ISINs", f"{len(result):,}")
+        result[sid] = (
+            grp["settlement_date"].values,
+            grp["days_to_cover"].values.astype(np.float64),
+        )
+    log.info("Loaded short-interest data for %s SIDs", f"{len(result):,}")
     return result
 
 
 def load_price_data() -> dict:
     """
-    Returns {isin: (dates_np, total_returns_np, closes_np, volumes_np)} from returns table.
+    Returns {sid: (dates_np, total_returns_np, closes_np, volumes_np)} from returns table.
     """
     if not RETURNS_DB.exists():
         log.warning("returns.db not found — price-based factors will be empty.")
         return {}
     log.info("Loading full price history from returns.db ...")
-    with get_db(RETURNS_DB) as conn:
-        df = pd.read_sql_query(
-            "SELECT isin, date, total_return, close, volume FROM returns "
-            "WHERE close IS NOT NULL AND close > 0 ORDER BY isin, date",
-            conn,
-        )
+    with get_db(RETURNS_DB) as conn, get_db(UNIVERSE_DB) as master:
+        df = price_observations_by_sid(conn, master)
     df["date"] = pd.to_datetime(df["date"])
     df["total_return"] = pd.to_numeric(df["total_return"], errors="coerce")
     df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0)
-    prices: dict = {}
-    for isin, grp in df.groupby("isin", sort=False):
+    by_sid = {}
+    for sid, grp in df.groupby("sid", sort=False):
         grp = grp.sort_values("date")
-        prices[isin] = (
+        by_sid[sid] = (
             grp["date"].values,
             grp["total_return"].values,
             grp["close"].values,
             grp["volume"].values.astype(np.float64),
         )
-    log.info("Loaded price data for %s ISINs", f"{len(prices):,}")
-    return prices
+    log.info("Loaded price data for %s SIDs", f"{len(by_sid):,}")
+    return by_sid
 
 
 def load_trading_calendar(prices: dict) -> np.ndarray:
@@ -707,9 +791,29 @@ def market_data_asof_date(
     return pd.Timestamp(trading_calendar[idx]).date()
 
 
+def svr_data_asof_date(
+    snapshot: date, market_asof: date, trading_calendar: np.ndarray
+) -> date | None:
+    """FINRA trade-date cutoff for a signal executable at the snapshot close.
+
+    Daily short volume is released after the trading close (by 6 p.m. ET).
+    A next-day close-to-close return still starts at today's close, so today's
+    short volume cannot inform that position. Weekend/holiday snapshots start
+    from the preceding session's close, so that session's SVR is also too late.
+    Keep earlier ad-hoc market cutoffs as an upper bound.
+    Without a known entry close, omit SVR rather than infer its availability.
+    """
+    ref_np = np.datetime64(snapshot, "D").astype("datetime64[ns]")
+    idx = int(np.searchsorted(trading_calendar, ref_np, side="right")) - 1
+    if idx < 0:
+        return None
+    entry_close = pd.Timestamp(trading_calendar[idx]).date()
+    return min(market_asof, entry_close - timedelta(days=1))
+
+
 def load_splits() -> dict:
     """
-    Returns {isin: [(split_date_ts, ratio), ...]} from returns.db `splits`, sorted by date.
+    Returns {sid: [(split_date_ts, ratio), ...]} from returns.db `splits`, sorted by date.
 
     returns.db prices are split-adjusted to the current basis, but constituents.db
     shares are actual point-in-time counts.  These ratios let the market-cap path
@@ -729,13 +833,22 @@ def load_splits() -> dict:
             "SELECT isin, date, ratio FROM splits WHERE ratio > 0 ORDER BY isin, date",
             conn,
         )
+    if df.empty:
+        return {}
+    with get_db(UNIVERSE_DB) as master:
+        aliases = isin_to_sid_map(master)
+        df["sid"] = df["isin"].map(aliases)
+        conflicts = df.groupby(["sid", "date"])["ratio"].nunique()
+        if conflicts.gt(1).any():
+            raise ValueError(
+                "Conflicting split ratios for a single SID/date; review source evidence"
+            )
+        df = observations_by_sid(df, master)
     splits: dict = {}
-    for isin, grp in df.groupby("isin", sort=False):
-        splits[isin] = [
-            (pd.Timestamp(d), float(r)) for d, r in zip(grp["date"], grp["ratio"])
-        ]
+    for sid, grp in df.groupby("sid", sort=False):
+        splits[sid] = [(pd.Timestamp(d), float(r)) for d, r in zip(grp["date"], grp["ratio"])]
     if splits:
-        log.info("Loaded split history for %s ISINs", f"{len(splits):,}")
+        log.info("Loaded split history for %s SIDs", f"{len(splits):,}")
     return splits
 
 
@@ -749,8 +862,8 @@ def _apply_split_adjustment(cdata: dict, isin: str, splits: dict) -> None:
     so market cap is continuous through splits.  No-op when shares, the as-of date, or
     split history are missing.
     """
-    shares = cdata.get('Shares (Basic)')
-    asof   = cdata.get('_shares_asof')
+    shares = cdata.get("Shares (Basic)")
+    asof = cdata.get("_shares_asof")
     sid_splits = splits.get(isin)
     if shares is None or asof is None or not sid_splits:
         return
@@ -760,13 +873,13 @@ def _apply_split_adjustment(cdata: dict, isin: str, splits: dict) -> None:
         if split_date > asof_ts:
             factor *= ratio
     if factor != 1.0:
-        cdata['Shares (Basic)'] = shares * factor
+        cdata["Shares (Basic)"] = shares * factor
 
 
 def load_factor_name_to_id() -> dict:
     """Returns {factor_name: factor_id} from factors_reference.csv."""
     df = pd.read_csv(FACTORS_REF)
-    return dict(zip(df['factor_name'], df['factor_id']))
+    return dict(zip(df["factor_name"], df["factor_id"]))
 
 
 def load_factor_sector_types() -> dict:
@@ -780,7 +893,7 @@ def load_factor_sector_types() -> dict:
       'financial' — only for financial services companies (reserved for future)
     """
     df = pd.read_csv(FACTORS_REF)
-    return dict(zip(df['factor_name'], df['sector_type']))
+    return dict(zip(df["factor_name"], df["sector_type"]))
 
 
 def load_log_transform_factor_ids() -> set[str]:
@@ -791,7 +904,7 @@ def load_log_transform_factor_ids() -> set[str]:
     Controlled via the log_transform column in factors_reference.csv.
     """
     df = pd.read_csv(FACTORS_REF)
-    return set(df.loc[df['log_transform'] == True, 'factor_id'])
+    return set(df.loc[df["log_transform"] == True, "factor_id"])
 
 
 # _ALLOWED_FACTOR_SECTORS is imported from utils (shared with create_models, the
@@ -802,6 +915,7 @@ def load_log_transform_factor_ids() -> set[str]:
 # ---------------------------------------------------------------------------
 # Point-in-time selection
 # ---------------------------------------------------------------------------
+
 
 def _build_ltm(quarters: list, kind_map: dict, min_flow_quarters: int) -> dict:
     """Sum Flow items / take latest Stock item across a window of quarters.
@@ -816,32 +930,35 @@ def _build_ltm(quarters: list, kind_map: dict, min_flow_quarters: int) -> dict:
         # Derive Gross Profit per-quarter when absent but Revenue and Cost of
         # Revenue are both available. Sign convention is normalised (both
         # positive) so GP = Revenue - CoR holds for SimFin and EDGAR alike.
-        if (q.get('Gross Profit') is None
-                and q.get('Revenue') is not None
-                and q.get('Cost of Revenue') is not None):
-            q = {**q, 'Gross Profit': q['Revenue'] - q['Cost of Revenue']}
+        if (
+            q.get("Gross Profit") is None
+            and q.get("Revenue") is not None
+            and q.get("Cost of Revenue") is not None
+        ):
+            q = {**q, "Gross Profit": q["Revenue"] - q["Cost of Revenue"]}
 
         # Derive Operating Income when absent.
         # Identity: Operating Income = Pretax Income - Non-Operating Income.
         # Some XBRL filers (e.g. LLY, banks) omit the OperatingIncomeLoss tag
         # but always report Pretax. When Non-Operating Income is also absent we
         # treat it as zero — a minor approximation but avoids NaN propagation.
-        if (q.get('Operating Income (Loss)') is None
-                and q.get('Pretax Income (Loss)') is not None):
-            non_op = q.get('Non-Operating Income (Loss)') or 0.0
-            q = {**q, 'Operating Income (Loss)': q['Pretax Income (Loss)'] - non_op}
+        if q.get("Operating Income (Loss)") is None and q.get("Pretax Income (Loss)") is not None:
+            non_op = q.get("Non-Operating Income (Loss)") or 0.0
+            q = {**q, "Operating Income (Loss)": q["Pretax Income (Loss)"] - non_op}
 
         for name, val in q.items():
-            if name.startswith('_') or val is None:
+            if name.startswith("_") or val is None:
                 continue
-            kind = kind_map.get(name, 'Flow')
-            if kind == 'Stock':
-                ltm[name] = val          # later quarter overwrites — sorted asc, so last = most recent
-                if name == 'Shares (Basic)':
+            kind = kind_map.get(name, "Flow")
+            if kind == "Stock":
+                ltm[name] = val  # later quarter overwrites — sorted asc, so last = most recent
+                if name == "Shares (Basic)":
                     # Record the publish date of the quarter supplying the share
                     # count so the market-cap path can split-adjust it to the
                     # current basis (matching split-adjusted returns.db prices).
-                    ltm['_shares_asof'] = q.get('_publish_date')
+                    ltm["_shares_asof"] = q.get("_shares_observation_date") or q.get(
+                        "_publish_date"
+                    )
             else:
                 ltm[name] = ltm.get(name, 0.0) + val
                 flow_counts[name] = flow_counts.get(name, 0) + 1
@@ -854,7 +971,9 @@ def _build_ltm(quarters: list, kind_map: dict, min_flow_quarters: int) -> dict:
 
 
 def _available_quarters(
-    sid_data: dict, kind_map: dict, snapshot: date,
+    sid_data: dict,
+    kind_map: dict,
+    snapshot: date,
 ) -> tuple[list, bool]:
     """Sorted (ascending) PIT quarters that contain a Flow item, plus the
     annual-only flag. Shared by select_ltm_data and select_growth_series so the
@@ -863,22 +982,16 @@ def _available_quarters(
 
     def _has_flow(bucket: dict) -> bool:
         return any(
-            not k.startswith('_') and v is not None and kind_map.get(k, 'Flow') == 'Flow'
+            not k.startswith("_") and v is not None and kind_map.get(k, "Flow") == "Flow"
             for k, v in bucket.items()
         )
 
-    available = [
-        q for q in sid_data.values()
-        if q['_publish_date'] <= snap_ts and _has_flow(q)
-    ]
-    available.sort(key=lambda q: q['_sort_key'])
+    available = [q for q in sid_data.values() if q["_publish_date"] <= snap_ts and _has_flow(q)]
+    available.sort(key=lambda q: q["_sort_key"])
 
-    is_annual_only = (
-        len(available) >= 2 and
-        all(
-            available[i + 1]['_sort_key'] - available[i]['_sort_key'] >= 10
-            for i in range(len(available) - 1)
-        )
+    is_annual_only = len(available) >= 2 and all(
+        available[i + 1]["_sort_key"] - available[i]["_sort_key"] >= 10
+        for i in range(len(available) - 1)
     )
     return available, is_annual_only
 
@@ -922,22 +1035,23 @@ def select_ltm_data(
     # summing multiple annual Q4 periods would overstate by N×.
     if is_annual_only:
         recent_4 = available[-1:]
-        prior_4  = available[-2:-1] if len(available) >= 2 else []
+        prior_4 = available[-2:-1] if len(available) >= 2 else []
         min_flow = 1
     else:
         recent_4 = available[-4:]
-        prior_4  = available[-8:-4] if len(available) >= 8 else []
+        prior_4 = available[-8:-4] if len(available) >= 8 else []
         min_flow = 4
 
-    return (_build_ltm(recent_4, kind_map, min_flow),
-            _build_ltm(prior_4,  kind_map, min_flow))
+    return (_build_ltm(recent_4, kind_map, min_flow), _build_ltm(prior_4, kind_map, min_flow))
 
 
 # Flow metrics whose multi-year trend feeds the growth factors. EBITDA is
 # derived per-window from Operating Income + |D&A|.
 _GROWTH_TREND_FIELDS = (
-    'Revenue', 'Net Income', 'Net Cash from Operating Activities',
-    'Operating Income (Loss)',
+    "Revenue",
+    "Net Income",
+    "Net Cash from Operating Activities",
+    "Operating Income (Loss)",
 )
 
 
@@ -968,7 +1082,7 @@ def select_growth_series(
     windows: list[dict] = []
     end = len(available)
     while end - step >= 0 and len(windows) < n_years:
-        windows.append(_build_ltm(available[end - step:end], kind_map, min_flow))
+        windows.append(_build_ltm(available[end - step : end], kind_map, min_flow))
         end -= step
     windows.reverse()  # oldest → newest
 
@@ -979,25 +1093,25 @@ def select_growth_series(
             series[field] = vals
 
     ebitda = [
-        _ebitda(w.get('Operating Income (Loss)'), w.get('Depreciation & Amortization'))
+        _ebitda(w.get("Operating Income (Loss)"), w.get("Depreciation & Amortization"))
         for w in windows
     ]
     if all(v is not None for v in ebitda) and len(ebitda) >= 2:
-        series['EBITDA'] = ebitda
+        series["EBITDA"] = ebitda
 
     # FFO = Net Income + |D&A| per window (REIT growth, sector_type='reit').
     ffo = [
-        (w['Net Income'] + abs(w['Depreciation & Amortization']))
-        if w.get('Net Income') is not None and w.get('Depreciation & Amortization') is not None
+        (w["Net Income"] + abs(w["Depreciation & Amortization"]))
+        if w.get("Net Income") is not None and w.get("Depreciation & Amortization") is not None
         else None
         for w in windows
     ]
     if all(v is not None for v in ffo) and len(ffo) >= 2:
-        series['FFO'] = ffo
+        series["FFO"] = ffo
 
     # Stock-item annual series (latest-in-window balance-sheet value) — feeds the
     # earnings-stability factor (cross-time ROA volatility), not the growth trends.
-    for stock_field in ('Total Assets',):
+    for stock_field in ("Total Assets",):
         vals = [w.get(stock_field) for w in windows]
         if all(v is not None for v in vals) and len(vals) >= 2:
             series[stock_field] = vals
@@ -1008,6 +1122,7 @@ def select_growth_series(
 # ---------------------------------------------------------------------------
 # Price lookup
 # ---------------------------------------------------------------------------
+
 
 def get_close(
     prices: dict,
@@ -1036,6 +1151,7 @@ def get_close(
 # Factor computation helpers
 # ---------------------------------------------------------------------------
 
+
 def _ebitda(op_income: float | None, da: float | None) -> float | None:
     """EBITDA = Operating Income + |D&A|. Returns None if either input is missing."""
     if op_income is None or da is None:
@@ -1058,67 +1174,86 @@ def _enterprise_value(
 # Factor computation
 # ---------------------------------------------------------------------------
 
+
+def factor_zscore_inputs(frame: pd.DataFrame, log_transform_ids: set[str]) -> pd.Series:
+    """Keep the existing log transform without allowing log(0) to spoil peer scores.
+
+    Zero remains in the raw factor value but has no logarithmic score. Scoring
+    zero leverage requires a separate model-definition decision.
+    """
+    values = frame["factor_value"].copy()
+    for factor_id in log_transform_ids:
+        mask = frame["factor_id"] == factor_id
+        raw = frame.loc[mask, "factor_value"]
+        values.loc[mask] = np.log(raw.where(raw > 0))
+    return values
+
+
 def compute_quality_factors(cdata: dict) -> dict:
     """19 quality factors from income, balance, and cash flow data."""
     f = {}
-    revenue      = cdata.get('Revenue')
-    cost_rev     = cdata.get('Cost of Revenue')
-    gross_p      = cdata.get('Gross Profit') or (
+    revenue = cdata.get("Revenue")
+    cost_rev = cdata.get("Cost of Revenue")
+    gross_p = cdata.get("Gross Profit") or (
         (revenue - cost_rev) if (revenue is not None and cost_rev is not None) else None
     )
-    op_income    = cdata.get('Operating Income (Loss)')
-    net_income   = cdata.get('Net Income')
-    equity       = cdata.get('Total Equity')
-    assets       = cdata.get('Total Assets')
-    op_cf        = cdata.get('Net Cash from Operating Activities')
-    capex        = cdata.get('Change in Fixed Assets & Intangibles')
-    cur_assets   = cdata.get('Total Current Assets')
-    cur_liab     = cdata.get('Total Current Liabilities')
-    short_debt   = cdata.get('Short Term Debt') or 0  # many firms report no ST debt; treat as zero
-    long_debt    = cdata.get('Long Term Debt')
-    total_liab   = cdata.get('Total Liabilities')
-    wc_change    = cdata.get('Change in Working Capital')
-    interest_exp = cdata.get('Interest Expense, Net')
-    invest_inc   = cdata.get('Investment Income, Interest')
-    pretax       = cdata.get('Pretax Income (Loss)')
-    tax_exp      = cdata.get('Income Tax (Expense) Benefit, Net')
-    cash         = cdata.get('Cash, Cash Equivalents & Short Term Investments') or 0
-    retained     = cdata.get('Retained Earnings')
+    op_income = cdata.get("Operating Income (Loss)")
+    net_income = cdata.get("Net Income")
+    equity = cdata.get("Total Equity")
+    assets = cdata.get("Total Assets")
+    op_cf = cdata.get("Net Cash from Operating Activities")
+    capex = cdata.get("Change in Fixed Assets & Intangibles")
+    cur_assets = cdata.get("Total Current Assets")
+    cur_liab = cdata.get("Total Current Liabilities")
+    short_debt = cdata.get("Short Term Debt") or 0  # many firms report no ST debt; treat as zero
+    long_debt = cdata.get("Long Term Debt")
+    total_liab = cdata.get("Total Liabilities")
+    wc_change = cdata.get("Change in Working Capital")
+    interest_exp = cdata.get("Interest Expense, Net")
+    invest_inc = cdata.get("Investment Income, Interest")
+    pretax = cdata.get("Pretax Income (Loss)")
+    tax_exp = cdata.get("Income Tax (Expense) Benefit, Net")
+    cash = cdata.get("Cash, Cash Equivalents & Short Term Investments") or 0
+    retained = cdata.get("Retained Earnings")
 
     if revenue is not None and gross_p is not None and revenue != 0:
-        f['Gross Margin'] = gross_p / revenue
+        f["Gross Margin"] = gross_p / revenue
     if revenue is not None and op_income is not None and revenue != 0:
-        f['Operating Margin'] = op_income / revenue
+        f["Operating Margin"] = op_income / revenue
     if revenue is not None and net_income is not None and revenue != 0:
         nm = net_income / revenue
-        if abs(nm) <= 2:  # >200% signals bad SimFin revenue data (e.g. REITs with near-zero reported revenue)
-            f['Net Margin'] = nm
+        if (
+            abs(nm) <= 2
+        ):  # >200% signals bad SimFin revenue data (e.g. REITs with near-zero reported revenue)
+            f["Net Margin"] = nm
     if net_income is not None and equity is not None and equity > 0:
-        f['ROE'] = net_income / equity
+        f["ROE"] = net_income / equity
     if net_income is not None and assets is not None and assets != 0:
-        f['ROA'] = net_income / assets
+        f["ROA"] = net_income / assets
     if op_cf is not None and net_income is not None and net_income != 0:
-        f['Operating Cash Flow Ratio'] = op_cf / net_income
+        f["Operating Cash Flow Ratio"] = op_cf / net_income
     if op_cf is not None and capex is not None and revenue is not None and revenue != 0:
         # capex (Change in Fixed Assets & Intangibles) is stored as negative (cash outflow);
         # op_cf + capex correctly subtracts it (op_cf - |capex|).
-        f['FCF Margin'] = (op_cf + capex) / revenue
+        f["FCF Margin"] = (op_cf + capex) / revenue
     if op_cf is not None and revenue is not None and revenue != 0:
-        f['Cash Conversion Quality'] = op_cf / revenue
+        f["Cash Conversion Quality"] = op_cf / revenue
     if cur_assets is not None and cur_liab is not None and cur_liab != 0:
-        f['Current Ratio'] = cur_assets / cur_liab
+        f["Current Ratio"] = cur_assets / cur_liab
     if long_debt is not None and equity is not None and equity > 0:
-        f['Leverage'] = (short_debt + long_debt) / equity
+        f["Leverage"] = (short_debt + long_debt) / equity
     if total_liab is not None and assets is not None and assets != 0:
-        f['Debt-to-Assets'] = total_liab / assets
+        f["Debt-to-Assets"] = total_liab / assets
     if equity is not None and assets is not None and assets != 0:
-        f['Equity Ratio'] = equity / assets
+        f["Equity Ratio"] = equity / assets
     if revenue is not None and assets is not None and assets != 0:
-        f['Asset Turnover'] = revenue / assets
+        f["Asset Turnover"] = revenue / assets
     if wc_change is not None and revenue is not None and revenue != 0:
-        f['Working Capital Efficiency'] = wc_change / revenue
+        f["Working Capital Efficiency"] = wc_change / revenue
     if capex is not None and revenue is not None and revenue > 0 and abs(capex) > 0:
-        f['Capex Intensity'] = float(np.log(abs(capex) / revenue))  # log-transform; lower = capital-light
+        f["Capex Intensity"] = float(
+            np.log(abs(capex) / revenue)
+        )  # log-transform; lower = capital-light
 
     # Interest Coverage: edgartools stores InterestExpense as negative (expense sign, weight=-1).
     # SimFin stores it as a positive net expense (already nets against interest income).
@@ -1132,10 +1267,10 @@ def compute_quality_factors(cdata: dict) -> dict:
             # SimFin path: already net, positive = expense
             net_interest = interest_exp
         if net_interest > 0:
-            f['Interest Coverage'] = op_income / net_interest
+            f["Interest Coverage"] = op_income / net_interest
 
     # ROIC = NOPAT / Invested Capital; Invested Capital = equity + debt - cash
-    if (op_income is not None and equity is not None and long_debt is not None):
+    if op_income is not None and equity is not None and long_debt is not None:
         if pretax is not None and pretax > 0 and tax_exp is not None:
             # tax_exp is negative when it's an expense; clamp effective rate to [0, 0.5]
             t_rate = max(0.0, min(0.5, -tax_exp / pretax))
@@ -1144,15 +1279,15 @@ def compute_quality_factors(cdata: dict) -> dict:
         nopat = op_income * (1.0 - t_rate)
         invested_capital = equity + short_debt + long_debt - cash
         if invested_capital > 0:
-            f['ROIC'] = nopat / invested_capital
+            f["ROIC"] = nopat / invested_capital
 
     # Accruals Ratio (Sloan 1996): high accruals = earnings not backed by cash = lower quality
     if net_income is not None and op_cf is not None and assets is not None and assets > 0:
-        f['Accruals Ratio'] = (net_income - op_cf) / assets
+        f["Accruals Ratio"] = (net_income - op_cf) / assets
 
     # Gross Profit to Assets (Novy-Marx 2013): gross profitability
     if gross_p is not None and assets is not None and assets > 0:
-        f['Gross Profit to Assets'] = gross_p / assets
+        f["Gross Profit to Assets"] = gross_p / assets
 
     # Altman Z''-score (1995 non-manufacturer / emerging-market variant): a
     # distress/safety composite that drops the Sales/Assets term of the original
@@ -1161,11 +1296,19 @@ def compute_quality_factors(cdata: dict) -> dict:
     # cross-sectional z-score is invariant to it. Not meaningful for banks/REITs —
     # gated to general companies via the DEF001 model override.
     #   Z'' = 6.56·(WC/TA) + 3.26·(RE/TA) + 6.72·(EBIT/TA) + 1.05·(BookEquity/TL)
-    if (assets is not None and assets > 0 and total_liab is not None and total_liab > 0
-            and retained is not None and op_income is not None and equity is not None
-            and cur_assets is not None and cur_liab is not None):
+    if (
+        assets is not None
+        and assets > 0
+        and total_liab is not None
+        and total_liab > 0
+        and retained is not None
+        and op_income is not None
+        and equity is not None
+        and cur_assets is not None
+        and cur_liab is not None
+    ):
         working_capital = cur_assets - cur_liab
-        f['Altman Z-Score'] = (
+        f["Altman Z-Score"] = (
             6.56 * (working_capital / assets)
             + 3.26 * (retained / assets)
             + 6.72 * (op_income / assets)
@@ -1186,82 +1329,85 @@ def compute_stability_factors(growth_series: dict) -> dict:
     aligned annual points (else NULL — matches the growth-trend minimum).
     """
     f = {}
-    ni = growth_series.get('Net Income')
-    ta = growth_series.get('Total Assets')
-    if (ni and ta and len(ni) == len(ta) and len(ni) >= 3
-            and all(a is not None and a > 0 for a in ta)):
+    ni = growth_series.get("Net Income")
+    ta = growth_series.get("Total Assets")
+    if (
+        ni
+        and ta
+        and len(ni) == len(ta)
+        and len(ni) >= 3
+        and all(a is not None and a > 0 for a in ta)
+    ):
         roa = [n / a for n, a in zip(ni, ta)]
-        f['Earnings Stability'] = float(np.std(roa, ddof=1))
+        f["Earnings Stability"] = float(np.std(roa, ddof=1))
     return f
 
 
-def compute_value_factors(
-    cdata: dict, isin: str, prices: dict, ref_date: date = None
-) -> dict:
+def compute_value_factors(cdata: dict, isin: str, prices: dict, ref_date: date = None) -> dict:
     """7 value factors expressed as ratios to market cap."""
     f = {}
-    shares = cdata.get('Shares (Basic)')
-    price  = get_close(prices, isin, ref_date=ref_date)
+    shares = cdata.get("Shares (Basic)")
+    price = get_close(prices, isin, ref_date=ref_date)
     if not (price and shares and price > 0 and shares > 0):
         return f
     market_cap = price * shares
-    net_income = cdata.get('Net Income')
-    equity     = cdata.get('Total Equity')
-    revenue    = cdata.get('Revenue')
-    op_cf      = cdata.get('Net Cash from Operating Activities')
-    capex      = cdata.get('Change in Fixed Assets & Intangibles')  # negative cash outflow
-    op_income  = cdata.get('Operating Income (Loss)')
-    short_debt = cdata.get('Short Term Debt')
-    long_debt  = cdata.get('Long Term Debt')
-    cash       = cdata.get('Cash, Cash Equivalents & Short Term Investments')
+    net_income = cdata.get("Net Income")
+    equity = cdata.get("Total Equity")
+    revenue = cdata.get("Revenue")
+    op_cf = cdata.get("Net Cash from Operating Activities")
+    capex = cdata.get("Change in Fixed Assets & Intangibles")  # negative cash outflow
+    op_income = cdata.get("Operating Income (Loss)")
+    short_debt = cdata.get("Short Term Debt")
+    long_debt = cdata.get("Long Term Debt")
+    cash = cdata.get("Cash, Cash Equivalents & Short Term Investments")
     # D&A may come from CF statement (+) or IS (-) depending on which was stored last;
     # abs() makes EV/EBITDA robust to either sign convention.
-    da         = cdata.get('Depreciation & Amortization')
-    dividends  = cdata.get('Dividends Paid')
+    da = cdata.get("Depreciation & Amortization")
+    dividends = cdata.get("Dividends Paid")
 
     if net_income is not None:
-        f['Earnings Yield'] = net_income / market_cap
+        f["Earnings Yield"] = net_income / market_cap
     # Book-to-Price only when equity is positive: negative book equity (buyback-heavy
     # names like ABBV/MCD/SBUX) is not "expensive" — B/M is undefined there (the
     # Fama-French convention excludes negative-BE firms rather than ranking them).
     if equity is not None and equity > 0:
-        f['Book-to-Price'] = equity / market_cap
+        f["Book-to-Price"] = equity / market_cap
     if revenue is not None and revenue != 0:
-        f['Sales-to-Price'] = revenue / market_cap
+        f["Sales-to-Price"] = revenue / market_cap
     if op_cf is not None:
-        f['Cash Yield'] = op_cf / market_cap
+        f["Cash Yield"] = op_cf / market_cap
     # FCF Yield: free cash flow (OCF − capex) over market cap. capex is stored as a
     # negative cash outflow, so op_cf + capex = OCF − |capex| (matches FCF Margin).
     if op_cf is not None and capex is not None:
-        f['FCF Yield'] = (op_cf + capex) / market_cap
+        f["FCF Yield"] = (op_cf + capex) / market_cap
     if cash is not None and op_income is not None and op_income > 0:
         ev = _enterprise_value(market_cap, short_debt, long_debt, cash)
         if ev is not None:
-            f['EV-to-EBIT'] = ev / op_income
+            f["EV-to-EBIT"] = ev / op_income
 
     if cash is not None:
         ebitda = _ebitda(op_income, da)
         if ebitda is not None and ebitda > 0:
             ev = _enterprise_value(market_cap, short_debt, long_debt, cash)
             if ev is not None:
-                f['EV/EBITDA'] = ev / ebitda
+                f["EV/EBITDA"] = ev / ebitda
 
     # Dividend Yield: only for companies that actually paid cash dividends (Dividends Paid < 0)
     if dividends is not None and dividends < 0:
-        f['Dividend Yield'] = abs(dividends) / market_cap
+        f["Dividend Yield"] = abs(dividends) / market_cap
 
     return f
 
 
-_GROWTH_MIN_YEARS = 3   # least-squares trend needs ≥3 annual points
+_GROWTH_MIN_YEARS = 3  # least-squares trend needs ≥3 annual points
 
 # Map each growth factor to the series key produced by select_growth_series.
 _GROWTH_FACTOR_FIELDS = (
-    ('Revenue Growth',          'Revenue'),
-    ('Earnings Growth',         'Net Income'),
-    ('Cash Flow Growth',        'Net Cash from Operating Activities'),
-    ('Operating Income Growth', 'Operating Income (Loss)'),
-    ('EBITDA Growth',           'EBITDA'),
+    ("Revenue Growth", "Revenue"),
+    ("Earnings Growth", "Net Income"),
+    ("Cash Flow Growth", "Net Cash from Operating Activities"),
+    ("Operating Income Growth", "Operating Income (Loss)"),
+    ("EBITDA Growth", "EBITDA"),
 )
 
 
@@ -1307,9 +1453,7 @@ def compute_growth_factors(growth_series: dict) -> dict:
     return f
 
 
-def compute_momentum_factors(
-    isin: str, prices: dict, ref_date: date = None
-) -> dict:
+def compute_momentum_factors(isin: str, prices: dict, ref_date: date = None) -> dict:
     """Risk-adjusted momentum and reversal factors.
 
     All factors share the same computation: compounded total return over the
@@ -1328,52 +1472,50 @@ def compute_momentum_factors(
 
     if ref_date is None:
         ref_idx = len(dates) - 1
-        ref_dt  = pd.Timestamp(dates[-1]).date()
+        ref_dt = pd.Timestamp(dates[-1]).date()
     else:
-        ref_np  = np.datetime64(ref_date, "D").astype("datetime64[ns]")
+        ref_np = np.datetime64(ref_date, "D").astype("datetime64[ns]")
         ref_idx = int(np.searchsorted(dates, ref_np, side="right")) - 1
-        ref_dt  = ref_date
+        ref_dt = ref_date
     if ref_idx < 1:
         return f
 
     for start_months, end_months, name, min_obs in [
-        (1,  0,  "ST Reversal",  15),
-        (6,  1,  "6M Momentum",  20),
-        (12, 1,  "12M Momentum", 20),
-        (36, 13, "LT Reversal",  20),
+        (1, 0, "ST Reversal", 15),
+        (6, 1, "6M Momentum", 20),
+        (12, 1, "12M Momentum", 20),
+        (36, 13, "LT Reversal", 20),
     ]:
-        end_dt    = ref_dt - relativedelta(months=end_months)
-        end_np    = np.datetime64(end_dt, "D").astype("datetime64[ns]")
-        end_idx   = int(np.searchsorted(dates, end_np, side="right")) - 1
+        end_dt = ref_dt - relativedelta(months=end_months)
+        end_np = np.datetime64(end_dt, "D").astype("datetime64[ns]")
+        end_idx = int(np.searchsorted(dates, end_np, side="right")) - 1
 
-        start_dt  = ref_dt - relativedelta(months=start_months)
-        start_np  = np.datetime64(start_dt, "D").astype("datetime64[ns]")
+        start_dt = ref_dt - relativedelta(months=start_months)
+        start_np = np.datetime64(start_dt, "D").astype("datetime64[ns]")
         start_idx = int(np.searchsorted(dates, start_np, side="right"))
 
         if end_idx < 1 or start_idx > end_idx:
             continue
-        window   = total_rets[start_idx : end_idx + 1]
-        valid    = window[np.isfinite(window)]
+        window = total_rets[start_idx : end_idx + 1]
+        valid = window[np.isfinite(window)]
         if len(valid) < min_obs:
             continue
-        ret      = float(np.prod(1.0 + valid) - 1.0)
+        ret = float(np.prod(1.0 + valid) - 1.0)
         log_rets = np.log(1.0 + valid)
         log_rets = log_rets[np.isfinite(log_rets)]
-        vol      = float(np.std(log_rets) * np.sqrt(252))
+        vol = float(np.std(log_rets) * np.sqrt(252))
         if vol <= 0:
             continue
-        f[name]  = ret / vol
+        f[name] = ret / vol
     return f
 
 
-def compute_size_factor(
-    cdata: dict, isin: str, prices: dict, ref_date: date = None
-) -> dict:
+def compute_size_factor(cdata: dict, isin: str, prices: dict, ref_date: date = None) -> dict:
     """Log market cap — natural log of price × basic shares."""
-    shares = cdata.get('Shares (Basic)')
-    price  = get_close(prices, isin, ref_date=ref_date)
+    shares = cdata.get("Shares (Basic)")
+    price = get_close(prices, isin, ref_date=ref_date)
     if price and shares and price > 0 and shares > 0:
-        return {'Log Market Cap': np.log(price * shares)}
+        return {"Log Market Cap": np.log(price * shares)}
     return {}
 
 
@@ -1390,24 +1532,26 @@ def compute_low_vol_factors(
     if ref_date is None:
         ref_idx = len(dates) - 1
     else:
-        ref_np  = np.datetime64(ref_date, "D").astype("datetime64[ns]")
+        ref_np = np.datetime64(ref_date, "D").astype("datetime64[ns]")
         ref_idx = int(np.searchsorted(dates, ref_np, side="right")) - 1
     if ref_idx < 1:
         return f
 
-    start_idx  = max(0, ref_idx - lookback)
-    win_rets   = total_rets[start_idx : ref_idx + 1]
+    start_idx = max(0, ref_idx - lookback)
+    win_rets = total_rets[start_idx : ref_idx + 1]
 
     if len(win_rets) < 64:
         return f
 
     # Realized volatility from log(1 + total_return), stored as log(vol) for normality
     log_rets = np.log(1.0 + win_rets)
-    valid    = log_rets[np.isfinite(log_rets)]
+    valid = log_rets[np.isfinite(log_rets)]
     if len(valid) >= 20:
         vol = float(np.std(valid, ddof=1) * np.sqrt(252))
         if vol > 0:
-            f["Realized Volatility"] = float(np.log(vol))  # log-transform compresses extreme outliers
+            f["Realized Volatility"] = float(
+                np.log(vol)
+            )  # log-transform compresses extreme outliers
 
     # 52-week high ratio via cumulative returns (split-invariant)
     # ratio = current_cum_level / max_cum_level over the window
@@ -1433,20 +1577,20 @@ def compute_liquidity_factors(
     if ref_date is None:
         ref_idx = len(dates) - 1
     else:
-        ref_np  = np.datetime64(ref_date, "D").astype("datetime64[ns]")
+        ref_np = np.datetime64(ref_date, "D").astype("datetime64[ns]")
         ref_idx = int(np.searchsorted(dates, ref_np, side="right")) - 1
     if ref_idx < 1:
         return f
 
-    start_idx   = max(0, ref_idx - lookback)
-    win_rets    = total_rets[start_idx : ref_idx + 1]
-    win_closes  = closes[start_idx : ref_idx + 1]
+    start_idx = max(0, ref_idx - lookback)
+    win_rets = total_rets[start_idx : ref_idx + 1]
+    win_closes = closes[start_idx : ref_idx + 1]
     win_volumes = volumes[start_idx : ref_idx + 1]
 
     if len(win_rets) < 64:
         return f
 
-    abs_rets    = np.abs(win_rets)
+    abs_rets = np.abs(win_rets)
     dollar_vols = win_closes * win_volumes
     mask = np.isfinite(abs_rets) & (dollar_vols > 0)
     if mask.sum() < 20:
@@ -1476,15 +1620,15 @@ def compute_svr_factors(
     if ref_date is None:
         ref_idx = len(dates) - 1
     else:
-        ref_np  = np.datetime64(ref_date, "D").astype("datetime64[ns]")
+        ref_np = np.datetime64(ref_date, "D").astype("datetime64[ns]")
         ref_idx = int(np.searchsorted(dates, ref_np, side="right")) - 1
     if ref_idx < 1:
         return {}
 
     # 20-day trailing window
-    start_20  = max(0, ref_idx - window_20 + 1)
-    win_20    = svrs[start_20 : ref_idx + 1]
-    valid_20  = win_20[np.isfinite(win_20)]
+    start_20 = max(0, ref_idx - window_20 + 1)
+    win_20 = svrs[start_20 : ref_idx + 1]
+    valid_20 = win_20[np.isfinite(win_20)]
     if len(valid_20) < 10:
         return {}
     svr_20 = float(np.mean(valid_20))
@@ -1493,7 +1637,7 @@ def compute_svr_factors(
 
     # 90-day trailing window for rank
     start_90 = max(0, ref_idx - window_90 + 1)
-    win_90   = svrs[start_90 : ref_idx + 1]
+    win_90 = svrs[start_90 : ref_idx + 1]
     valid_90 = win_90[np.isfinite(win_90)]
     if len(valid_90) >= 45:
         # percentile of current 20-day SVR within the 90-day history
@@ -1548,45 +1692,43 @@ def compute_reit_factors(
     (slope of the annual FFO series ÷ mean(|FFO|)) — see _trend_growth.
     """
     f = {}
-    net_income = cdata.get('Net Income')
-    da         = cdata.get('Depreciation & Amortization')
-    revenue    = cdata.get('Revenue')
+    net_income = cdata.get("Net Income")
+    da = cdata.get("Depreciation & Amortization")
+    revenue = cdata.get("Revenue")
 
     if net_income is None or da is None:
         return f
 
-    ffo = net_income + abs(da)   # abs() handles any sign convention
+    ffo = net_income + abs(da)  # abs() handles any sign convention
 
-    shares = cdata.get('Shares (Basic)')
-    price  = get_close(prices, isin, ref_date=ref_date)
+    shares = cdata.get("Shares (Basic)")
+    price = get_close(prices, isin, ref_date=ref_date)
     if price and shares and price > 0 and shares > 0:
         market_cap = price * shares
-        f['FFO Yield'] = ffo / market_cap
+        f["FFO Yield"] = ffo / market_cap
 
     if revenue is not None and revenue > 0:
         ratio = ffo / revenue
         if abs(ratio) <= 10:  # cap at 1000%; higher means SimFin revenue data is unreliable
-            f['FFO Margin'] = ratio
+            f["FFO Margin"] = ratio
 
     # FFO Growth — multi-year trend of the annual FFO series.
-    ffo_growth = _trend_growth(growth_series.get('FFO'))
+    ffo_growth = _trend_growth(growth_series.get("FFO"))
     if ffo_growth is not None:
-        f['FFO Growth'] = ffo_growth
+        f["FFO Growth"] = ffo_growth
 
     # FFO Payout = distributions paid / FFO. Lower payout = bigger coverage cushion
     # = safer (direction −1). Dividends Paid is stored negative (cash outflow).
-    dividends = cdata.get('Dividends Paid')
+    dividends = cdata.get("Dividends Paid")
     if dividends is not None and dividends < 0 and ffo > 0:
         payout = abs(dividends) / ffo
-        if payout <= 5:   # cap at 500%; higher = unreliable FFO/dividend data
-            f['FFO Payout'] = payout
+        if payout <= 5:  # cap at 500%; higher = unreliable FFO/dividend data
+            f["FFO Payout"] = payout
 
     return f
 
 
-def compute_bank_factors(
-    cdata: dict, isin: str, prices: dict, ref_date: date = None
-) -> dict:
+def compute_bank_factors(cdata: dict, isin: str, prices: dict, ref_date: date = None) -> dict:
     """
     Bank-specific factors for sector_type == 'bank' (depository banks + consumer
     lenders). Built from EDGAR bank line items ingested 2026-06 (Net Interest
@@ -1605,50 +1747,56 @@ def compute_bank_factors(
       Tangible Book-to-Price (equity − goodwill − intang) / market cap (+1; value)
     """
     f = {}
-    nii    = cdata.get('Net Interest Income')
-    nonii  = cdata.get('Noninterest Income')
-    nonie  = cdata.get('Noninterest Expense')
-    niiap  = cdata.get('Net Interest Income After Provision')
-    prov   = cdata.get('Provision for Credit Losses')
-    loans  = cdata.get('Loans Receivable')
-    gw     = cdata.get('Goodwill')
-    intang = cdata.get('Intangible Assets')
-    assets = cdata.get('Total Assets')
-    equity = cdata.get('Total Equity')
+    nii = cdata.get("Net Interest Income")
+    nonii = cdata.get("Noninterest Income")
+    nonie = cdata.get("Noninterest Expense")
+    niiap = cdata.get("Net Interest Income After Provision")
+    prov = cdata.get("Provision for Credit Losses")
+    loans = cdata.get("Loans Receivable")
+    gw = cdata.get("Goodwill")
+    intang = cdata.get("Intangible Assets")
+    assets = cdata.get("Total Assets")
+    equity = cdata.get("Total Equity")
 
     # Pre-provision operating profit (pre-provision, pre-tax).
-    ppop = (nii + nonii - nonie) if (nii is not None and nonii is not None
-                                     and nonie is not None) else None
+    ppop = (
+        (nii + nonii - nonie)
+        if (nii is not None and nonii is not None and nonie is not None)
+        else None
+    )
 
     if nii is not None and assets is not None and assets > 0:
-        f['Net Interest Margin'] = nii / assets
+        f["Net Interest Margin"] = nii / assets
 
     if nii is not None and nonii is not None and nonie is not None:
         total_rev = nii + nonii
         if total_rev > 0:
-            f['Efficiency Ratio'] = nonie / total_rev
+            f["Efficiency Ratio"] = nonie / total_rev
 
     if ppop is not None and assets is not None and assets > 0:
-        f['PPOP Return on Assets'] = ppop / assets
+        f["PPOP Return on Assets"] = ppop / assets
 
     # Credit Cost: prefer the direct provision; else derive NII − NII-after-provision.
-    provision = prov if prov is not None else (
-        (nii - niiap) if (nii is not None and niiap is not None) else None)
+    provision = (
+        prov
+        if prov is not None
+        else ((nii - niiap) if (nii is not None and niiap is not None) else None)
+    )
     if provision is not None and loans is not None and loans > 0:
-        f['Credit Cost'] = provision / loans
+        f["Credit Cost"] = provision / loans
 
-    shares = cdata.get('Shares (Basic)')
-    price  = get_close(prices, isin, ref_date=ref_date)
+    shares = cdata.get("Shares (Basic)")
+    price = get_close(prices, isin, ref_date=ref_date)
     if price and shares and price > 0 and shares > 0:
         market_cap = price * shares
         if ppop is not None:
-            f['PPOP Yield'] = ppop / market_cap
+            f["PPOP Yield"] = ppop / market_cap
         # Tangible book only when positive (mirrors the Book-to-Price equity gate):
         # goodwill/intangibles default to 0 when a bank doesn't break them out.
         if equity is not None and equity > 0:
             tangible = equity - (gw or 0) - (intang or 0)
             if tangible > 0:
-                f['Tangible Book-to-Price'] = tangible / market_cap
+                f["Tangible Book-to-Price"] = tangible / market_cap
 
     return f
 
@@ -1657,51 +1805,100 @@ def compute_bank_factors(
 # Database setup and writing
 # ---------------------------------------------------------------------------
 
+
 def setup_factors_db(conn: sqlite3.Connection, clean: bool = False) -> None:
-    conn.execute("PRAGMA journal_mode=WAL")
-    existing = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='factors'"
-    ).fetchone()
-    if existing:
-        cols = [r[1] for r in conn.execute("PRAGMA table_info(factors)").fetchall()]
-        if 'fiscal_year' in cols or clean:
-            reason = "old schema (had fiscal_year column)" if 'fiscal_year' in cols else "--clean flag"
-            log.info("Dropping factors table (%s) — will rebuild from scratch", reason)
-            conn.execute("DROP TABLE factors")
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS factors (
-            data_date        TEXT    NOT NULL,
-            factor_id        TEXT    NOT NULL,
-            security_id      TEXT    NOT NULL,
-            factor_value     REAL    NOT NULL,
-            factor_value_z   REAL,
-            update_date      TEXT    NOT NULL,
-            computation_date TEXT    NOT NULL,
-            PRIMARY KEY (data_date, factor_id, security_id)
-        )
-    """)
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_f_date_fid ON factors (data_date, factor_id)"
-    )
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS snapshot_dates (
-            data_date  TEXT PRIMARY KEY,
-            created_at TEXT NOT NULL
-        )
-    """)
+    with atomic_write(conn):
+        if clean:
+            log.info("Dropping factors table (--clean flag) — will rebuild from scratch")
+            conn.execute("DROP TABLE IF EXISTS factors")
+        ensure_analytical_schema(conn, "factors", "snapshot_dates")
     conn.commit()
+    conn.execute("PRAGMA journal_mode=WAL")
+
+
+def existing_factor_dates() -> list[date]:
+    """All previously built dates, including ad-hoc dates outside the schedule."""
+    with get_db(FACTORS_DB, read_only=True) as conn:
+        rows = conn.execute(
+            "SELECT data_date FROM factors UNION SELECT data_date FROM snapshot_dates "
+            "ORDER BY data_date"
+        ).fetchall()
+    if not rows:
+        raise ValueError("No existing factor dates to restate")
+    return [date.fromisoformat(row[0]) for row in rows]
+
+
+@contextmanager
+def factor_build_db(output_db: Path | None = None) -> Iterator[sqlite3.Connection]:
+    """Build live, or publish a new SQLite copy only after every date succeeds.
+
+    Staging retains unselected dates and uses SQLite backup to include WAL data.
+    A failed staged build leaves both the source and destination untouched.
+    """
+    if output_db is None:
+        with get_db(FACTORS_DB) as conn:
+            yield conn
+        return
+    output_db = output_db.resolve()
+    if output_db.exists():
+        raise FileExistsError(f"Refusing to overwrite factor output: {output_db}")
+    output_db.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".factor-build-", dir=output_db.parent) as directory:
+        staged = Path(directory) / "factors.db"
+        with get_db(staged) as conn:
+            if FACTORS_DB.exists():
+                with get_db(FACTORS_DB, read_only=True) as source:
+                    source.backup(conn)
+            yield conn
+        # Closing the last connection checkpoints the staged WAL. Linking is
+        # atomic and fails if another process has created the requested output.
+        output_db.hardlink_to(staged)
 
 
 # ---------------------------------------------------------------------------
 # Single-date snapshot
 # ---------------------------------------------------------------------------
 
+
+def _validated_active_universe(snapshot: date, universe: dict, isin_to_sid: dict) -> dict:
+    """Resolve membership and require dated classifications before any writes."""
+    date_str = snapshot.isoformat()
+    snapshot_isins = load_snapshot_isins(snapshot)
+    if snapshot_isins is not None:
+        unresolved = snapshot_isins - isin_to_sid.keys()
+        if unresolved:
+            raise ValueError(
+                f"{date_str}: unresolved snapshot identifiers {sorted(unresolved)[:10]}"
+            )
+        snapshot_sids = {isin_to_sid[isin] for isin in snapshot_isins}
+        active_universe = {sid: meta for sid, meta in universe.items() if sid in snapshot_sids}
+        missing_sids = snapshot_sids - active_universe.keys()
+        if missing_sids:
+            raise ValueError(
+                f"{date_str}: missing dated metadata for SIDs {sorted(missing_sids)[:10]}"
+            )
+    else:
+        active_universe = universe
+
+    missing = [
+        isin for isin, meta in active_universe.items() if meta.get("sector_type", "general") is None
+    ]
+    if missing:
+        raise ValueError(
+            f"{date_str}: missing dated company classification for {len(missing)} securities "
+            f"(examples: {missing[:10]}). Import evidenced company_attributes_history first."
+        )
+    return active_universe
+
+
 def run_for_date(
     snapshot: date,
     market_asof: date,
+    svr_asof: date | None,
     universe: dict,
     ticker_map: dict,
     constituent_data: dict,
+    isin_to_sid: dict,
     kind_map: dict,
     prices: dict,
     splits: dict,
@@ -1713,31 +1910,26 @@ def run_for_date(
     conn: sqlite3.Connection,
 ) -> int:
     """Compute and write all factor rows for one snapshot date. Returns row count."""
-    date_str      = snapshot.strftime('%Y-%m-%d')
-    market_str    = market_asof.strftime('%Y-%m-%d')
-    today         = datetime.now().strftime('%Y-%m-%d')
-    rows          = []
+    date_str = snapshot.strftime("%Y-%m-%d")
+    market_str = market_asof.strftime("%Y-%m-%d")
+    today = datetime.now().strftime("%Y-%m-%d")
+    rows = []
     unknown_names: set = set()
 
     if market_asof != snapshot:
         log.info("%s: market-data factors use prior close %s", date_str, market_str)
 
-    snapshot_isins = load_snapshot_isins(snapshot)
-    if snapshot_isins is not None:
-        active_universe = {isin: meta for isin, meta in universe.items()
-                           if isin in snapshot_isins}
-    else:
-        active_universe = universe
+    active_universe = _validated_active_universe(snapshot, universe, isin_to_sid)
 
     no_constituents = 0
     no_ltm = 0
     price_only = 0
 
-    for isin, meta in active_universe.items():
-        ticker = meta.get('ticker') or ticker_map.get(isin)
+    for sid, meta in active_universe.items():
+        ticker = meta.get("ticker") or ticker_map.get(meta.get("isin"))
         if not ticker:
             continue
-        sid_data = constituent_data.get(isin)
+        sid_data = constituent_data.get(sid)
 
         # Growth factors use the multi-year trend series, not the prior-year LTM.
         if sid_data:
@@ -1753,30 +1945,33 @@ def run_for_date(
         # Restate point-in-time shares onto the current split-adjusted basis so
         # market cap (split-adjusted price × shares) is continuous through splits.
         if cdata:
-            _apply_split_adjustment(cdata, isin, splits)
+            _apply_split_adjustment(cdata, sid, splits)
 
-        sector_type = meta.get('sector_type', 'general')
+        sector_type = meta.get("sector_type", "general")
 
         factors: dict = {}
         factors.update(compute_quality_factors(cdata))
-        factors.update(compute_value_factors(cdata, isin, prices, ref_date=market_asof))
+        factors.update(compute_value_factors(cdata, sid, prices, ref_date=market_asof))
         factors.update(compute_growth_factors(growth_series))
         factors.update(compute_stability_factors(growth_series))
-        factors.update(compute_momentum_factors(isin, prices, ref_date=market_asof))
-        factors.update(compute_size_factor(cdata, isin, prices, ref_date=market_asof))
-        factors.update(compute_low_vol_factors(isin, prices, ref_date=market_asof))
-        factors.update(compute_liquidity_factors(isin, prices, ref_date=market_asof))
-        factors.update(compute_svr_factors(isin, svr_data, ref_date=market_asof))
-        factors.update(compute_short_interest_factor(isin, si_data, ref_date=snapshot))
-        if sector_type == 'reit':
-            factors.update(compute_reit_factors(cdata, growth_series, isin, prices, ref_date=market_asof))
-        if sector_type == 'bank':
-            factors.update(compute_bank_factors(cdata, isin, prices, ref_date=market_asof))
+        factors.update(compute_momentum_factors(sid, prices, ref_date=market_asof))
+        factors.update(compute_size_factor(cdata, sid, prices, ref_date=market_asof))
+        factors.update(compute_low_vol_factors(sid, prices, ref_date=market_asof))
+        factors.update(compute_liquidity_factors(sid, prices, ref_date=market_asof))
+        if svr_asof is not None:
+            factors.update(compute_svr_factors(sid, svr_data, ref_date=svr_asof))
+        factors.update(compute_short_interest_factor(sid, si_data, ref_date=snapshot))
+        if sector_type == "reit":
+            factors.update(
+                compute_reit_factors(cdata, growth_series, sid, prices, ref_date=market_asof)
+            )
+        if sector_type == "bank":
+            factors.update(compute_bank_factors(cdata, sid, prices, ref_date=market_asof))
 
         if factors and not cdata:
             price_only += 1
 
-        allowed = _ALLOWED_FACTOR_SECTORS.get(sector_type, {'all', 'general'})
+        allowed = _ALLOWED_FACTOR_SECTORS.get(sector_type, {"all", "general"})
 
         for name, value in factors.items():
             if value is None or (isinstance(value, float) and (np.isnan(value) or np.isinf(value))):
@@ -1786,21 +1981,30 @@ def run_for_date(
                 unknown_names.add(name)
                 continue
             # Skip factors not applicable to this company's sector type
-            if factor_sector_types.get(name, 'all') not in allowed:
+            if factor_sector_types.get(name, "all") not in allowed:
                 continue
-            rows.append((date_str, factor_id, isin, float(value), today, today))
+            rows.append((date_str, factor_id, sid, float(value), today, today))
 
     if unknown_names:
-        log.warning("factor names not in factors_reference.csv (skipped): %s", sorted(unknown_names))
+        log.warning(
+            "factor names not in factors_reference.csv (skipped): %s", sorted(unknown_names)
+        )
 
     # A snapshot rebuild is authoritative for that date. Delete existing rows
     # first so factors that no longer pass data-quality gates do not linger from
     # an older, more permissive run.
     conn.execute("DELETE FROM factors WHERE data_date = ?", (date_str,))
-    conn.executemany(
-        "INSERT OR REPLACE INTO factors "
-        "(data_date, factor_id, security_id, factor_value, update_date, computation_date) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
+    write_research_rows(
+        conn,
+        "factors",
+        [
+            "data_date",
+            "factor_id",
+            "sid",
+            "factor_value",
+            "update_date",
+            "computation_date",
+        ],
         rows,
     )
 
@@ -1808,23 +2012,19 @@ def run_for_date(
     # update land in one atomic transaction (same connection sees uncommitted rows).
     df = pd.read_sql_query(
         "SELECT rowid, factor_id, factor_value FROM factors WHERE data_date = ?",
-        conn, params=(date_str,)
+        conn,
+        params=(date_str,),
     )
     # For heavily right-skewed always-positive factors (EV/EBITDA, EV-to-EBIT, Leverage),
     # z-score on log(value) so the distribution is near-normal before winsorization.
     # Raw factor_value is preserved unchanged in the DB.
-    z_input = df['factor_value'].copy()
-    z_input[df['factor_id'].isin(log_transform_ids)] = np.log(
-        df.loc[df['factor_id'].isin(log_transform_ids), 'factor_value']
-    )
-    df['factor_value_z'] = (
-        df.assign(_z=z_input)
-        .groupby('factor_id')['_z']
-        .transform(winsorized_zscore)
+    z_input = factor_zscore_inputs(df, log_transform_ids)
+    df["factor_value_z"] = (
+        df.assign(_z=z_input).groupby("factor_id")["_z"].transform(winsorized_zscore)
     )
     conn.executemany(
         "UPDATE factors SET factor_value_z = ? WHERE rowid = ?",
-        df[['factor_value_z', 'rowid']].itertuples(index=False, name=None),
+        df[["factor_value_z", "rowid"]].itertuples(index=False, name=None),
     )
     conn.commit()
 
@@ -1832,7 +2032,10 @@ def run_for_date(
     if no_constituents or no_ltm or price_only:
         log.info(
             "%s: price-only coverage for %s names; %s missing constituents, %s missing usable LTM",
-            date_str, f"{price_only:,}", f"{no_constituents:,}", f"{no_ltm:,}",
+            date_str,
+            f"{price_only:,}",
+            f"{no_constituents:,}",
+            f"{no_ltm:,}",
         )
     log.info("%s: %s companies, %s factor rows", date_str, f"{n_companies:,}", f"{len(rows):,}")
     return len(rows)
@@ -1842,69 +2045,120 @@ def run_for_date(
 # Main
 # ---------------------------------------------------------------------------
 
+
 def main():
     parser = argparse.ArgumentParser(
         description="Compute point-in-time factor snapshots and write to factors.db"
     )
     grp = parser.add_mutually_exclusive_group()
-    grp.add_argument('--date',              metavar='YYYY-MM-DD', action='append', dest='dates',
-                     help='Snapshot date (repeatable: --date D1 --date D2)')
-    grp.add_argument('--schedule',          action='store_true',
-                     help='Compute all scheduled dates not yet computed (the snapshot_schedule '
-                          'table in universe.db is the single source of truth)')
-    grp.add_argument('--schedule-all',      action='store_true',
-                     help='Recompute EVERY date in the schedule (full restatement)')
-    grp.add_argument('--backfill',          action='store_true',
-                     help='[deprecated alias for --schedule]')
-    grp.add_argument('--quarterly-backfill', action='store_true',
-                     help='[deprecated alias for --schedule]')
-    parser.add_argument('--clean', action='store_true',
-                        help='Drop and rebuild the factors table before running')
+    grp.add_argument(
+        "--date",
+        metavar="YYYY-MM-DD",
+        action="append",
+        dest="dates",
+        help="Snapshot date (repeatable: --date D1 --date D2)",
+    )
+    grp.add_argument(
+        "--schedule",
+        action="store_true",
+        help="Compute all scheduled dates not yet computed (the snapshot_schedule "
+        "table in universe.db is the single source of truth)",
+    )
+    grp.add_argument(
+        "--schedule-all",
+        action="store_true",
+        help="Recompute EVERY date in the schedule (full restatement)",
+    )
+    grp.add_argument(
+        "--restate-existing",
+        action="store_true",
+        help="Recompute every previously built date, including dates outside the schedule",
+    )
+    grp.add_argument("--backfill", action="store_true", help="[deprecated alias for --schedule]")
+    grp.add_argument(
+        "--quarterly-backfill", action="store_true", help="[deprecated alias for --schedule]"
+    )
+    parser.add_argument(
+        "--clean", action="store_true", help="Drop and rebuild the factors table before running"
+    )
+    parser.add_argument(
+        "--output-db",
+        type=Path,
+        help="Build a new factors.db copy for review; do not write live factors or schedule stamps",
+    )
     args = parser.parse_args()
 
-    if args.schedule_all:
+    if args.output_db is not None and args.output_db.exists():
+        parser.error(f"Refusing to overwrite factor output: {args.output_db}")
+
+    if args.restate_existing:
+        dates_to_run = existing_factor_dates()
+    elif args.schedule_all:
         scheduled = get_snapshot_schedule()
-        dates_to_run = [datetime.strptime(d, '%Y-%m-%d').date() for d in scheduled]
+        dates_to_run = [datetime.strptime(d, "%Y-%m-%d").date() for d in scheduled]
     elif args.schedule or args.backfill or args.quarterly_backfill:
         # Pending = scheduled but factors not yet computed (single source of truth).
         computed = set(get_snapshot_schedule(computed_only=True))
-        pending  = [d for d in get_snapshot_schedule() if d not in computed]
-        dates_to_run = [datetime.strptime(d, '%Y-%m-%d').date() for d in pending]
-        log.info("Schedule: %d pending date(s) of %d total", len(pending), len(get_snapshot_schedule()))
+        pending = [d for d in get_snapshot_schedule() if d not in computed]
+        dates_to_run = [datetime.strptime(d, "%Y-%m-%d").date() for d in pending]
+        log.info(
+            "Schedule: %d pending date(s) of %d total", len(pending), len(get_snapshot_schedule())
+        )
     elif args.dates:
-        dates_to_run = sorted({datetime.strptime(d, '%Y-%m-%d').date() for d in args.dates})
+        dates_to_run = sorted({datetime.strptime(d, "%Y-%m-%d").date() for d in args.dates})
     else:
         dates_to_run = [date.today()]
 
     log.info("Loading reference data ...")
-    universe            = load_universe()
-    ticker_map          = load_ticker_map()
-    factor_name_to_id   = load_factor_name_to_id()
+    ticker_map = load_ticker_map()
+    factor_name_to_id = load_factor_name_to_id()
     factor_sector_types = load_factor_sector_types()
-    log_transform_ids   = load_log_transform_factor_ids()
-    kind_map            = load_kind_map()
+    log_transform_ids = load_log_transform_factor_ids()
+    kind_map = load_kind_map()
 
     log.info("Loading constituent data from constituents.db ...")
     constituent_data = load_constituent_data()
+    isin_to_sid = isin_to_sid_map()
 
-    prices   = load_price_data()
+    prices = load_price_data()
     trading_calendar = load_trading_calendar(prices)
     snapshot_cadences = load_snapshot_cadences()
-    splits   = load_splits()
+    splits = load_splits()
     svr_data = load_svr_data()
-    si_data  = load_short_interest_data()
+    si_data = load_short_interest_data()
 
-    with get_db(FACTORS_DB) as conn:
+    # Check every date before --clean can drop the old table or an earlier date
+    # can commit a partial restatement. Retain the same guard for direct callers.
+    universes = {snapshot: load_universe(str(snapshot)) for snapshot in dates_to_run}
+    for snapshot, universe in universes.items():
+        _validated_active_universe(snapshot, universe, isin_to_sid)
+
+    with factor_build_db(args.output_db) as conn:
         setup_factors_db(conn, clean=args.clean)
 
         total_rows = 0
         log.info("Processing %d date(s): %s", len(dates_to_run), [str(d) for d in dates_to_run])
         for snapshot in dates_to_run:
+            universe = universes[snapshot]
             market_asof = market_data_asof_date(snapshot, trading_calendar, snapshot_cadences)
+            svr_asof = svr_data_asof_date(snapshot, market_asof, trading_calendar)
             total_rows += run_for_date(
-                snapshot, market_asof, universe, ticker_map,
-                constituent_data, kind_map, prices, splits, svr_data, si_data,
-                factor_name_to_id, factor_sector_types, log_transform_ids, conn,
+                snapshot,
+                market_asof,
+                svr_asof,
+                universe,
+                ticker_map,
+                constituent_data,
+                isin_to_sid,
+                kind_map,
+                prices,
+                splits,
+                svr_data,
+                si_data,
+                factor_name_to_id,
+                factor_sector_types,
+                log_transform_ids,
+                conn,
             )
             conn.execute(
                 "INSERT OR REPLACE INTO snapshot_dates (data_date, created_at) "
@@ -1913,7 +2167,8 @@ def main():
             )
             conn.commit()
             # Stamp the single source of truth (universe.db snapshot_schedule).
-            mark_snapshot_computed(str(snapshot))
+            if args.output_db is None:
+                mark_snapshot_computed(str(snapshot))
 
     log.info("Done — %s total factor rows across %d date(s)", f"{total_rows:,}", len(dates_to_run))
 

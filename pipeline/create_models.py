@@ -19,21 +19,34 @@ import csv
 import math
 import sqlite3
 import sys
-from datetime import datetime
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config import (
-    FACTORS_DB, MODELS_DB, UNIVERSE_DB,
-    MODELS_REF as MODELS_CSV, FACTORS_REF as FACTORS_CSV,
+    FACTORS_DB,
+    MODELS_DB,
+    UNIVERSE_DB,
+)
+from config import (
+    FACTORS_REF as FACTORS_CSV,
+)
+from config import (
+    MODELS_REF as MODELS_CSV,
+)
+from pipeline.security_storage import (
+    atomic_write,
+    ensure_analytical_schema,
+    master_sids,
+    write_research_rows,
 )
 from utils import (
-    get_db, get_logger, winsorized_zscore,
-    classify_sector, factor_applies_to_company,
+    factor_applies_to_company,
+    get_db,
+    get_logger,
+    winsorized_zscore,
 )
 
 log = get_logger("create_models")
@@ -49,10 +62,11 @@ log = get_logger("create_models")
 # Reference loading
 # ---------------------------------------------------------------------------
 
+
 def load_factor_directions() -> dict:
     """Returns {factor_id: direction (1 or -1)} from factors_reference.csv."""
     df = pd.read_csv(FACTORS_CSV)
-    return dict(zip(df['factor_id'], df['direction'].astype(int)))
+    return dict(zip(df["factor_id"], df["direction"].astype(int)))
 
 
 def load_models_reference() -> dict:
@@ -71,89 +85,101 @@ def load_models_reference() -> dict:
     external_ids: set = set()
     with open(MODELS_CSV) as f:
         for row in csv.DictReader(f):
-            name         = row['Model']
-            model_id     = row['ModelID']
-            factor_id    = row['Factors']
+            name = row["Model"]
+            model_id = row["ModelID"]
+            factor_id = row["Factors"]
             # Externally-computed models (e.g. FMOM001, built in create_barra from
             # risk.db) carry the EXTERNAL sentinel — never build them here.
-            if factor_id == 'EXTERNAL':
+            if factor_id == "EXTERNAL":
                 external_ids.add(model_id)
                 continue
-            weight       = float(row['Weights'])
-            is_composite = bool(int(row['IsComposite']))
-            override_raw = (row.get('sector_type') or '').strip()
-            override     = frozenset(s.strip() for s in override_raw.split('|')) if override_raw else None
+            weight = float(row["Weights"])
+            is_composite = bool(int(row["IsComposite"]))
+            override_raw = (row.get("sector_type") or "").strip()
+            override = (
+                frozenset(s.strip() for s in override_raw.split("|")) if override_raw else None
+            )
             if name not in models:
-                models[name] = {'model_id': model_id, 'is_composite': is_composite,
-                                'weights': {}, 'sectors': {}}
-            models[name]['weights'][factor_id] = weight
-            models[name]['sectors'][factor_id] = override
+                models[name] = {
+                    "model_id": model_id,
+                    "is_composite": is_composite,
+                    "weights": {},
+                    "sectors": {},
+                }
+            models[name]["weights"][factor_id] = weight
+            models[name]["sectors"][factor_id] = override
     # Strip EXTERNAL-sourced legs (e.g. FMOM001) from any composite: they are
     # finalised in create_barra AFTER the Barra factor returns they depend on exist.
     # create_models builds only a provisional FM-less composite, which create_barra
     # ._rebuild_alpha_with_fm then overwrites with the authoritative version.
     for info in models.values():
         for ext in external_ids:
-            info['weights'].pop(ext, None)
-            info['sectors'].pop(ext, None)
+            info["weights"].pop(ext, None)
+            info["sectors"].pop(ext, None)
     return models
 
 
 def load_factor_sector_types() -> dict:
     """{factor_id: factor-layer sector_type} from factors_reference.csv (default 'all')."""
     df = pd.read_csv(FACTORS_CSV)
-    return dict(zip(df['factor_id'], df['sector_type'].fillna('all')))
+    return dict(zip(df["factor_id"], df["sector_type"].fillna("all")))
 
 
-def load_security_sector_types() -> dict:
-    """{security_id (isin): company sector_type} via universe.db + classify_sector."""
+def load_security_sector_types(as_of: str) -> dict:
+    """Date-correct classification keyed by integer SID."""
+    from securities.data import metadata_by_sid
+
     with get_db(UNIVERSE_DB) as conn:
-        rows = conn.execute(
-            "SELECT isin, simfin_sector, simfin_industry FROM companies"
-        ).fetchall()
-    return {isin: classify_sector(sec, ind) for isin, sec, ind in rows}
+        frame = metadata_by_sid(conn, as_of=as_of)
+    return frame.set_index("sid")["sector_type"].to_dict()
 
 
 def get_base_models(models: dict) -> dict:
-    model_ids = {info['model_id'] for info in models.values()}
-    return {n: m for n, m in models.items()
-            if not any(f in model_ids for f in m['weights'])}
+    model_ids = {info["model_id"] for info in models.values()}
+    return {n: m for n, m in models.items() if not any(f in model_ids for f in m["weights"])}
 
 
 def get_alpha_models(models: dict) -> dict:
-    model_ids = {info['model_id'] for info in models.values()}
-    return {n: m for n, m in models.items()
-            if any(f in model_ids for f in m['weights'])}
+    model_ids = {info["model_id"] for info in models.values()}
+    return {n: m for n, m in models.items() if any(f in model_ids for f in m["weights"])}
 
 
 # ---------------------------------------------------------------------------
 # Factor data loading
 # ---------------------------------------------------------------------------
 
+
 def load_factors_zscores(date_filter: list[str] | str | None = None) -> dict:
     """
-    Returns {data_date: {security_id: {factor_id: z_score}}}.
+    Returns {data_date: {sid: {factor_id: z_score}}}.
 
     date_filter — if provided, only load rows for that specific date or list of dates.
     """
     with get_db(FACTORS_DB) as conn:
         if date_filter:
             dates = [date_filter] if isinstance(date_filter, str) else list(date_filter)
-            placeholders = ','.join('?' * len(dates))
+            placeholders = ",".join("?" * len(dates))
             rows = conn.execute(
-                f"SELECT data_date, security_id, factor_id, factor_value_z "
+                f"SELECT data_date, sid, factor_id, factor_value_z "
                 f"FROM factors WHERE factor_value_z IS NOT NULL AND data_date IN ({placeholders})",
-                dates
+                dates,
             ).fetchall()
         else:
             rows = conn.execute(
-                "SELECT data_date, security_id, factor_id, factor_value_z "
+                "SELECT data_date, sid, factor_id, factor_value_z "
                 "FROM factors WHERE factor_value_z IS NOT NULL"
             ).fetchall()
 
+    from securities.data import validate_research_rows
+
+    frame = validate_research_rows(
+        pd.DataFrame(rows, columns=["data_date", "sid", "factor_id", "factor_value_z"]),
+        ["data_date", "factor_id", "sid"],
+        master_sids(),
+        context="model factor inputs",
+    )
     data: dict = {}
-    for data_date, security_id, factor_id, z in rows:
-        security_id = str(security_id)
+    for data_date, security_id, factor_id, z in frame.itertuples(index=False, name=None):
         data.setdefault(data_date, {}).setdefault(security_id, {})[factor_id] = z
     return data
 
@@ -162,34 +188,28 @@ def load_factors_zscores(date_filter: list[str] | str | None = None) -> dict:
 # Database setup
 # ---------------------------------------------------------------------------
 
+
 def setup_models_db(conn: sqlite3.Connection, clean: bool = False) -> None:
-    conn.execute("PRAGMA journal_mode=WAL")
-    existing = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='models'"
-    ).fetchone()
-    if existing:
-        cols = [r[1] for r in conn.execute("PRAGMA table_info(models)").fetchall()]
-        if 'fiscal_year' in cols or clean:
-            reason = "old schema (had fiscal_year column)" if 'fiscal_year' in cols else "--clean flag"
-            log.info("Dropping models table (%s) — will rebuild from scratch", reason)
-            conn.execute("DROP TABLE models")
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS models (
-            data_date     TEXT    NOT NULL,
-            model_id      TEXT    NOT NULL,
-            security_id   TEXT    NOT NULL,
-            model_value   REAL    NOT NULL,
-            model_value_z REAL,
-            is_composite  INTEGER NOT NULL DEFAULT 0,
-            PRIMARY KEY (data_date, model_id, security_id)
-        )
-    """)
+    with atomic_write(conn):
+        if clean:
+            log.info("Dropping models table (--clean flag) — will rebuild from scratch")
+            conn.execute("DROP TABLE IF EXISTS models")
+        ensure_analytical_schema(conn, "models")
     conn.commit()
+    conn.execute("PRAGMA journal_mode=WAL")
 
 
 # ---------------------------------------------------------------------------
 # Model computation
 # ---------------------------------------------------------------------------
+
+
+def _validate_sector_types(data_date: str, securities: dict, sector_types: dict) -> None:
+    """Require classifications before replacing any model snapshot."""
+    missing = [key for key in securities if sector_types.get(key) is None]
+    if missing:
+        raise ValueError(f"{data_date}: missing dated company classification: {missing[:10]}")
+
 
 def compute_base_models(
     conn: sqlite3.Connection,
@@ -209,15 +229,18 @@ def compute_base_models(
     """
     rows = []
     for data_date, securities in factors_data.items():
+        # Classifications change independently of identifiers; resolve per date.
+        sector_types = security_sector_types[data_date]
+        _validate_sector_types(data_date, securities, sector_types)
         for model_name, model_info in base_models.items():
-            model_id     = model_info['model_id']
-            is_composite = int(model_info['is_composite'])
-            weights      = model_info['weights']
-            overrides    = model_info['sectors']
+            model_id = model_info["model_id"]
+            is_composite = int(model_info["is_composite"])
+            weights = model_info["weights"]
+            overrides = model_info["sectors"]
             for security_id, factor_zscores in securities.items():
-                ctype = security_sector_types.get(security_id, 'general')
-                score             = 0.0
-                valid_weight      = 0.0
+                ctype = sector_types[security_id]
+                score = 0.0
+                valid_weight = 0.0
                 applicable_weight = 0.0
                 for factor_id, weight in weights.items():
                     override = overrides.get(factor_id)
@@ -225,24 +248,32 @@ def compute_base_models(
                         applies = ctype in override
                     else:
                         applies = factor_applies_to_company(
-                            factor_sector_types.get(factor_id, 'all'), ctype)
+                            factor_sector_types.get(factor_id, "all"), ctype
+                        )
                     if not applies:
                         continue
                     applicable_weight += weight
                     z = factor_zscores.get(factor_id)
                     if z is not None and not math.isnan(z):
-                        direction     = factor_directions.get(factor_id, 1)
-                        score        += z * weight * direction
+                        direction = factor_directions.get(factor_id, 1)
+                        score += z * weight * direction
                         valid_weight += weight
                 if applicable_weight > 0 and valid_weight > 0:
                     coverage = valid_weight / applicable_weight
-                    rows.append((data_date, model_id, security_id,
-                                 (score / applicable_weight) * coverage, is_composite))
+                    rows.append(
+                        (
+                            data_date,
+                            model_id,
+                            security_id,
+                            (score / applicable_weight) * coverage,
+                            is_composite,
+                        )
+                    )
 
-    conn.executemany(
-        "INSERT OR REPLACE INTO models "
-        "(data_date, model_id, security_id, model_value, is_composite) "
-        "VALUES (?, ?, ?, ?, ?)",
+    write_research_rows(
+        conn,
+        "models",
+        ["data_date", "model_id", "sid", "model_value", "is_composite"],
         rows,
     )
     # No commit here — caller commits after alpha models and z-scores are also written,
@@ -265,36 +296,42 @@ def compute_alpha_models(
     for data_date, securities in factors_data.items():
         base_scores: dict = {}
         for sid, model_id, model_value in conn.execute(
-            "SELECT security_id, model_id, model_value FROM models "
+            "SELECT sid, model_id, model_value FROM models "
             "WHERE data_date = ? AND is_composite = 0",
             (data_date,),
         ).fetchall():
-            sid = str(sid)
             base_scores.setdefault(sid, {})[model_id] = model_value
 
         for model_name, model_info in alpha_models.items():
-            model_id     = model_info['model_id']
-            is_composite = int(model_info['is_composite'])
-            weights      = model_info['weights']
+            model_id = model_info["model_id"]
+            is_composite = int(model_info["is_composite"])
+            weights = model_info["weights"]
             for security_id in securities:
-                sid_scores        = base_scores.get(security_id, {})
-                score             = 0.0
-                valid_weight      = 0.0
+                sid_scores = base_scores.get(security_id, {})
+                score = 0.0
+                valid_weight = 0.0
                 applicable_weight = sum(weights.values())  # all base models apply to all names
                 for base_model_id, weight in weights.items():
                     v = sid_scores.get(base_model_id)
                     if v is not None and not math.isnan(v):
-                        score        += v * weight
+                        score += v * weight
                         valid_weight += weight
                 if valid_weight > 0:
                     coverage = valid_weight / applicable_weight
-                    rows.append((data_date, model_id, security_id,
-                                 (score / applicable_weight) * coverage, is_composite))
+                    rows.append(
+                        (
+                            data_date,
+                            model_id,
+                            security_id,
+                            (score / applicable_weight) * coverage,
+                            is_composite,
+                        )
+                    )
 
-    conn.executemany(
-        "INSERT OR REPLACE INTO models "
-        "(data_date, model_id, security_id, model_value, is_composite) "
-        "VALUES (?, ?, ?, ?, ?)",
+    write_research_rows(
+        conn,
+        "models",
+        ["data_date", "model_id", "sid", "model_value", "is_composite"],
         rows,
     )
     # No commit here — caller commits once after z-scores are written.
@@ -307,16 +344,13 @@ def compute_model_zscores(conn: sqlite3.Connection) -> None:
     Grouped by (data_date, model_id) so each snapshot's scores are normalised
     within their own peer group.
     """
-    df = pd.read_sql_query(
-        "SELECT rowid, data_date, model_id, model_value FROM models", conn
-    )
-    df['model_value_z'] = (
-        df.groupby(['data_date', 'model_id'])['model_value']
-        .transform(winsorized_zscore)
+    df = pd.read_sql_query("SELECT rowid, data_date, model_id, model_value FROM models", conn)
+    df["model_value_z"] = df.groupby(["data_date", "model_id"])["model_value"].transform(
+        winsorized_zscore
     )
     conn.executemany(
         "UPDATE models SET model_value_z = ? WHERE rowid = ?",
-        df[['model_value_z', 'rowid']].itertuples(index=False, name=None),
+        df[["model_value_z", "rowid"]].itertuples(index=False, name=None),
     )
     conn.commit()
 
@@ -325,22 +359,28 @@ def compute_model_zscores(conn: sqlite3.Connection) -> None:
 # Main
 # ---------------------------------------------------------------------------
 
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Compute model scores from factor z-scores and write to models.db"
     )
-    parser.add_argument('--date', metavar='YYYY-MM-DD', action='append', dest='dates',
-                        help='Process a specific date (repeatable: --date D1 --date D2); default: all dates in factors.db')
-    parser.add_argument('--clean', action='store_true',
-                        help='Drop and rebuild the models table before running')
+    parser.add_argument(
+        "--date",
+        metavar="YYYY-MM-DD",
+        action="append",
+        dest="dates",
+        help="Process a specific date (repeatable: --date D1 --date D2); default: all dates in factors.db",
+    )
+    parser.add_argument(
+        "--clean", action="store_true", help="Drop and rebuild the models table before running"
+    )
     args = parser.parse_args()
 
-    models                = load_models_reference()
-    base_models           = get_base_models(models)
-    alpha_models          = get_alpha_models(models)
-    factor_directions     = load_factor_directions()
-    factor_sector_types   = load_factor_sector_types()
-    security_sector_types = load_security_sector_types()
+    models = load_models_reference()
+    base_models = get_base_models(models)
+    alpha_models = get_alpha_models(models)
+    factor_directions = load_factor_directions()
+    factor_sector_types = load_factor_sector_types()
 
     log.info("Models to create : %s", list(models.keys()))
     log.info("Base models      : %s", list(base_models.keys()))
@@ -349,7 +389,10 @@ def main() -> None:
     log.info("Loading pre-computed z-scores from factors.db ...")
     factors_data = load_factors_zscores(date_filter=args.dates)
     dates = sorted(factors_data.keys())
+    security_sector_types = {day: load_security_sector_types(day) for day in dates}
     log.info("Loaded z-scores for %d date(s): %s", len(dates), dates)
+    for day in dates:
+        _validate_sector_types(day, factors_data[day], security_sector_types[day])
 
     with get_db(MODELS_DB) as conn:
         setup_models_db(conn, clean=args.clean)
@@ -359,8 +402,14 @@ def main() -> None:
             log.info("Cleared existing model rows for %d date(s)", len(dates))
 
         log.info("=== Stage 1: Base models from factor z-scores ===")
-        n1 = compute_base_models(conn, base_models, factors_data, factor_directions,
-                                 factor_sector_types, security_sector_types)
+        n1 = compute_base_models(
+            conn,
+            base_models,
+            factors_data,
+            factor_directions,
+            factor_sector_types,
+            security_sector_types,
+        )
         log.info("  %s base model records written", f"{n1:,}")
 
         if alpha_models:
@@ -373,7 +422,9 @@ def main() -> None:
         log.info("Computing cross-sectional z-scores for model scores ...")
         compute_model_zscores(conn)  # commits inside here
 
-    log.info("Done — %s total records | %d models × %d date(s)", f"{n1 + n2:,}", len(models), len(dates))
+    log.info(
+        "Done — %s total records | %d models × %d date(s)", f"{n1 + n2:,}", len(models), len(dates)
+    )
 
 
 if __name__ == "__main__":
